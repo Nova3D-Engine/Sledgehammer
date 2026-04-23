@@ -246,7 +246,7 @@ static NSString* clip_mode_label(ViewerClipMode mode) {
 @property(nonatomic, assign) VmfViewportEditorTool editorTool;
 @property(nonatomic, assign) FileIndex fileIndex;
 @property(nonatomic, assign) ViewerMesh mesh;
-@property(nonatomic, assign) NovaSceneWorld sceneWorld;
+@property(nonatomic, assign) NovaSceneWorld* sceneWorld;
 @property(nonatomic, copy) NSString* currentPath;
 @property(nonatomic, copy) NSString* brushMaterialName;
 @property(nonatomic, strong) NSPanel* materialBrowserPanel;
@@ -340,14 +340,16 @@ static NSString* clip_mode_label(ViewerClipMode mode) {
     _ignoreGroupSelection = NO;
     _textureApplicationModeActive = NO;
     _textureLockEnabled = YES;
-    nova_scene_world_initialize(&_sceneWorld);
-    nova_scene_world_register_editor_tags(&_sceneWorld);
+    _sceneWorld = nova_scene_world_create();
+    if (_sceneWorld != NULL) {
+        nova_scene_world_register_editor_tags(_sceneWorld);
+    }
     return self;
 }
 
 - (void)dealloc {
     [self stopWatchingMaterialsDirectory];
-    nova_scene_world_shutdown(&_sceneWorld);
+    nova_scene_world_destroy(_sceneWorld);
     file_index_free(&_fileIndex);
     vmf_scene_free(&_scene);
     viewer_mesh_free(&_mesh);
@@ -543,7 +545,7 @@ static NSString* clip_mode_label(ViewerClipMode mode) {
     for (VmfViewport* viewport in self.viewports) {
         viewport.delegate = self;
         viewport.gridSize = self.gridSize;
-        [viewport setSceneWorld:&_sceneWorld];
+        [viewport setSceneWorld:_sceneWorld];
     }
 
     [self.topSplitView addSubview:self.topViewport];
@@ -3488,7 +3490,7 @@ static NSString* clip_mode_label(ViewerClipMode mode) {
         lightCount += 1u;
     }
 
-    nova_scene_world_sync_lights(&_sceneWorld, records, lightCount);
+    nova_scene_world_sync_lights(_sceneWorld, records, lightCount);
 
     Vec3 primaryPosition = vec3_make(256.0f, 256.0f, 512.0f);
     Vec3 primaryColor = vec3_make(1.0f, 0.95f, 0.8f);
