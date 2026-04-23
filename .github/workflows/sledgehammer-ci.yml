@@ -1,0 +1,67 @@
+name: Sledgehammer CI
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      nova_sdk_workflow:
+        description: Nova3D workflow filename to source the SDK artifact from
+        required: false
+        default: nova3d-ci.yml
+      nova_sdk_artifact:
+        description: Nova3D artifact name containing the SDK payload
+        required: false
+        default: nova3d-sdk-macos
+
+permissions:
+  contents: read
+
+jobs:
+  build-macos:
+    runs-on: macos-14
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: 1
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install cglm vulkan-loader
+
+      - name: Download Nova SDK artifact
+        uses: dawidd6/action-download-artifact@v6
+        with:
+          github_token: ${{ secrets.NOVA3D_ARTIFACT_TOKEN }}
+          repo: ${{ vars.NOVA3D_REPOSITORY }}
+          workflow: ${{ github.event.inputs.nova_sdk_workflow || 'nova3d-ci.yml' }}
+          branch: main
+          workflow_conclusion: success
+          name: ${{ github.event.inputs.nova_sdk_artifact || 'nova3d-sdk-macos' }}
+          path: .nova-sdk
+          if_no_artifact_found: fail
+
+      - name: Build Sledgehammer against Nova SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          make clean
+          make NOVA_SDK_ROOT="$PWD/.nova-sdk"
+
+      - name: Upload Sledgehammer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sledgehammer-macos
+          path: |
+            build/Sledgehammer
+            build/default.metallib
+            build/MaterialSymbolsOutlined.ttf
+            build/content
+            build/shaders
+            build/*.dylib
+          if-no-files-found: error
+          retention-days: 14

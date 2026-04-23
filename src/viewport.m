@@ -1551,6 +1551,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     NSMutableArray<NSDictionary<NSString*, id>*>* importedTextures = [NSMutableArray array];
     uint32_t objectCount = 0u;
     uint32_t materialCount = 0u;
+    NovaSceneImportedRuntime* importedRuntime = nova_scene_world_imported_runtime(self.sceneWorld);
 
     for (uint32_t index = 0u; index < UI_MAX_LIGHTS; ++index) {
         materialTextureIndices[index] = -1;
@@ -1561,10 +1562,10 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
 
     if (self.sceneWorld == NULL || mesh == NULL || mesh->vertices == NULL || mesh->vertexCount == 0 || mesh->faceRanges == NULL || mesh->faceRangeCount == 0 || mesh->faceRangeCount > UI_MAX_SCENE_OBJECTS) {
         _fullRendererUiState.importedSceneActive = 0;
-        if (self.sceneWorld != NULL) {
-            self.sceneWorld->imported.active = 0u;
-            self.sceneWorld->imported.materialCount = 0u;
-            self.sceneWorld->imported.textureCount = 0u;
+        if (importedRuntime != NULL) {
+            importedRuntime->active = 0u;
+            importedRuntime->materialCount = 0u;
+            importedRuntime->textureCount = 0u;
             nova_scene_world_sync_objects(self.sceneWorld, objectRecords, 0u);
         }
         return;
@@ -1742,24 +1743,24 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         }
     }
 
-    self.sceneWorld->imported.active = objectCount > 0u ? 1u : 0u;
-    self.sceneWorld->imported.materialCount = materialCount;
-    self.sceneWorld->imported.textureCount = _importedSceneData.textureCount;
-    self.sceneWorld->imported.usesBuiltinMaterialSet = 0u;
-    self.sceneWorld->imported.rtAsUpdatePending = 1u;
-    memset(self.sceneWorld->imported.materialsCpu, 0, sizeof(self.sceneWorld->imported.materialsCpu));
-    memset(self.sceneWorld->imported.materialRecords, 0, sizeof(self.sceneWorld->imported.materialRecords));
-    memset(self.sceneWorld->imported.blasPrimitiveOffset, 0, sizeof(self.sceneWorld->imported.blasPrimitiveOffset));
-    memset(self.sceneWorld->imported.blasVertexOffset, 0, sizeof(self.sceneWorld->imported.blasVertexOffset));
-    memset(self.sceneWorld->imported.blasVertexCount, 0, sizeof(self.sceneWorld->imported.blasVertexCount));
-    memset(self.sceneWorld->imported.blasFlags, 0, sizeof(self.sceneWorld->imported.blasFlags));
-    memset(self.sceneWorld->imported.instanceBlasIndex, 0, sizeof(self.sceneWorld->imported.instanceBlasIndex));
+    importedRuntime->active = objectCount > 0u ? 1u : 0u;
+    importedRuntime->materialCount = materialCount;
+    importedRuntime->textureCount = _importedSceneData.textureCount;
+    importedRuntime->usesBuiltinMaterialSet = 0u;
+    importedRuntime->rtAsUpdatePending = 1u;
+    memset(importedRuntime->materialsCpu, 0, sizeof(importedRuntime->materialsCpu));
+    memset(importedRuntime->materialRecords, 0, sizeof(importedRuntime->materialRecords));
+    memset(importedRuntime->blasPrimitiveOffset, 0, sizeof(importedRuntime->blasPrimitiveOffset));
+    memset(importedRuntime->blasVertexOffset, 0, sizeof(importedRuntime->blasVertexOffset));
+    memset(importedRuntime->blasVertexCount, 0, sizeof(importedRuntime->blasVertexCount));
+    memset(importedRuntime->blasFlags, 0, sizeof(importedRuntime->blasFlags));
+    memset(importedRuntime->instanceBlasIndex, 0, sizeof(importedRuntime->instanceBlasIndex));
 
     for (uint32_t materialIndex = 0u; materialIndex < materialCount; ++materialIndex) {
         float sampleCount = materialSamples[materialIndex] > 0u ? (float)materialSamples[materialIndex] : 1.0f;
         NovaSceneMaterial* material = &_importedSceneData.materials[materialIndex];
-        NovaSceneGpuMaterial* materialGpu = &self.sceneWorld->imported.materialsCpu[materialIndex];
-        NovaSceneImportedMaterialRecord* materialRecord = &self.sceneWorld->imported.materialRecords[materialIndex];
+        NovaSceneGpuMaterial* materialGpu = &importedRuntime->materialsCpu[materialIndex];
+        NovaSceneImportedMaterialRecord* materialRecord = &importedRuntime->materialRecords[materialIndex];
         int32_t textureIndex = materialTextureIndices[materialIndex];
         float logicalTextureSize = -1.0f;
         float baseColorR = materialColors[materialIndex][0] / sampleCount;
@@ -1811,11 +1812,11 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     }
 
     for (uint32_t objectIndex = 0u; objectIndex < objectCount; ++objectIndex) {
-        self.sceneWorld->imported.instanceBlasIndex[objectIndex] = objectIndex;
-        self.sceneWorld->imported.blasPrimitiveOffset[objectIndex] = objectRecords[objectIndex].primitiveOffset;
-        self.sceneWorld->imported.blasVertexOffset[objectIndex] = objectRecords[objectIndex].vertexOffset;
-        self.sceneWorld->imported.blasVertexCount[objectIndex] = objectRecords[objectIndex].vertexCount;
-        self.sceneWorld->imported.blasFlags[objectIndex] = objectRecords[objectIndex].flags;
+        importedRuntime->instanceBlasIndex[objectIndex] = objectIndex;
+        importedRuntime->blasPrimitiveOffset[objectIndex] = objectRecords[objectIndex].primitiveOffset;
+        importedRuntime->blasVertexOffset[objectIndex] = objectRecords[objectIndex].vertexOffset;
+        importedRuntime->blasVertexCount[objectIndex] = objectRecords[objectIndex].vertexCount;
+        importedRuntime->blasFlags[objectIndex] = objectRecords[objectIndex].flags;
     }
 
     nova_scene_world_sync_objects(self.sceneWorld, objectRecords, objectCount);
