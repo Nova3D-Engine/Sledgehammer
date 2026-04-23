@@ -5,6 +5,10 @@
 
 #include "math3d.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef enum VmfEntityKind {
     VmfEntityKindRoot = 0,
     VmfEntityKindBrush = 1,
@@ -73,5 +77,9 @@ typedef struct VmfScene {
 
 int vmf_scene_load(const char* path, VmfScene* outScene, char* errorBuffer, size_t errorBufferSize);
 void vmf_scene_free(VmfScene* scene);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

@@ -91,27 +91,27 @@ static inline Vec3 bounds3_size(Bounds3 bounds) {
     return vec3_sub(bounds.max, bounds.min);
 }
 
-static inline Mat4 mat4_identity(void) {
+static inline Mat4 cglm_mat4_identity(void) {
     return glms_mat4_identity();
 }
 
-static inline Mat4 mat4_mul(Mat4 a, Mat4 b) {
+static inline Mat4 cglm_mat4_mul(Mat4 a, Mat4 b) {
     return glms_mat4_mul(a, b);
 }
 
-static inline Mat4 mat4_translate(Vec3 t) {
+static inline Mat4 cglm_mat4_translate(Vec3 t) {
     return glms_translate_make(t);
 }
 
-static inline Mat4 mat4_perspective(float fovYRadians, float aspect, float nearZ, float farZ) {
+static inline Mat4 cglm_mat4_perspective(float fovYRadians, float aspect, float nearZ, float farZ) {
     return glms_perspective(fovYRadians, aspect, nearZ, farZ);
 }
 
-static inline Mat4 mat4_ortho(float left, float right, float bottom, float top, float nearZ, float farZ) {
+static inline Mat4 cglm_mat4_ortho(float left, float right, float bottom, float top, float nearZ, float farZ) {
     return glms_ortho(left, right, bottom, top, nearZ, farZ);
 }
 
-static inline Mat4 mat4_look_at(Vec3 eye, Vec3 target, Vec3 up) {
+static inline Mat4 cglm_mat4_look_at(Vec3 eye, Vec3 target, Vec3 up) {
     return glms_lookat(eye, target, up);
 }
 

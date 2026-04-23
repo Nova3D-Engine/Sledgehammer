@@ -3,6 +3,10 @@
 
 #include <stddef.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct FileIndex {
     char** paths;
     size_t count;
@@ -15,5 +19,9 @@ void file_index_free(FileIndex* index);
 const char* file_index_current(const FileIndex* index);
 const char* file_index_next(FileIndex* index);
 const char* file_index_previous(FileIndex* index);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

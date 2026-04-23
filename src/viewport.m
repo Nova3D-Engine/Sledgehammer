@@ -1895,12 +1895,12 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
 
 - (Mat4)projectionMatrixForAspect:(float)aspect {
     if (self.dimension == VmfViewportDimension3D) {
-        return mat4_perspective(0.75f, aspect, 1.0f, 131072.0f);
+        return cglm_mat4_perspective(0.75f, aspect, 1.0f, 131072.0f);
     }
 
     float halfHeight = self.orthoSize * 0.5f;
     float halfWidth = halfHeight * aspect;
-    return mat4_ortho(-halfWidth, halfWidth, -halfHeight, halfHeight, -131072.0f, 131072.0f);
+    return cglm_mat4_ortho(-halfWidth, halfWidth, -halfHeight, halfHeight, -131072.0f, 131072.0f);
 }
 
 - (Mat4)viewMatrixWithCameraPosition:(Vec3*)outCameraPosition {
@@ -1909,7 +1909,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         if (outCameraPosition) {
             *outCameraPosition = eye;
         }
-        return mat4_look_at(eye, [self cameraTarget], world_up());
+        return cglm_mat4_look_at(eye, [self cameraTarget], world_up());
     }
 
     Vec3 forward = plane_forward(self.plane);
@@ -1918,7 +1918,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     if (outCameraPosition) {
         *outCameraPosition = eye;
     }
-    return mat4_look_at(eye, self.orthoCenter, up);
+    return cglm_mat4_look_at(eye, self.orthoCenter, up);
 }
 
 - (Uniforms)uniformsForAspect:(float)aspect {
@@ -1926,7 +1926,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     Mat4 projection = [self projectionMatrixForAspect:aspect];
     Mat4 viewMatrix = [self viewMatrixWithCameraPosition:&eye];
     Uniforms uniforms = {0};
-    copy_mat4_to_uniform(uniforms.viewProjection, mat4_mul(projection, viewMatrix));
+    copy_mat4_to_uniform(uniforms.viewProjection, cglm_mat4_mul(projection, viewMatrix));
     uniforms.cameraPosition[0] = eye.raw[0];
     uniforms.cameraPosition[1] = eye.raw[1];
     uniforms.cameraPosition[2] = eye.raw[2];

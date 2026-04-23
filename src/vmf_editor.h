@@ -6,6 +6,10 @@
 #include "math3d.h"
 #include "vmf_parser.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef enum VmfBrushAxis {
     VmfBrushAxisX = 0,
     VmfBrushAxisY = 1,
@@ -305,5 +309,9 @@ int vmf_scene_pick_ray(const VmfScene* scene,
                        Vec3* outHitPoint,
                        char* errorBuffer,
                        size_t errorBufferSize);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

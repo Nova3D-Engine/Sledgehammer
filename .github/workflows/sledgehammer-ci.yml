@@ -6,14 +6,14 @@ on:
       - main
   workflow_dispatch:
     inputs:
-      nova_sdk_workflow:
-        description: Nova3D workflow filename to source the SDK artifact from
+      nova_release_tag:
+        description: Nova3D release tag to source the SDK payload from
         required: false
-        default: nova3d-ci.yml
-      nova_sdk_artifact:
-        description: Nova3D artifact name containing the SDK payload
+        default: nova3d-sdk-latest
+      nova_sdk_asset:
+        description: Nova3D release asset containing the SDK payload
         required: false
-        default: nova3d-sdk-macos
+        default: nova3d-sdk-macos.tar.gz
 
 permissions:
   contents: read
@@ -33,17 +33,18 @@ jobs:
           set -euo pipefail
           brew install cglm vulkan-loader
 
-      - name: Download Nova SDK artifact
-        uses: dawidd6/action-download-artifact@v6
-        with:
-          github_token: ${{ secrets.NOVA3D_ARTIFACT_TOKEN }}
-          repo: ${{ vars.NOVA3D_REPOSITORY }}
-          workflow: ${{ github.event.inputs.nova_sdk_workflow || 'nova3d-ci.yml' }}
-          branch: main
-          workflow_conclusion: success
-          name: ${{ github.event.inputs.nova_sdk_artifact || 'nova3d-sdk-macos' }}
-          path: .nova-sdk
-          if_no_artifact_found: fail
+      - name: Download Nova SDK release asset
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.NOVA3D_RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p .nova-sdk-download .nova-sdk
+          gh release download "${{ github.event.inputs.nova_release_tag || 'nova3d-sdk-latest' }}" \
+            --repo "${{ vars.NOVA3D_REPOSITORY }}" \
+            --pattern "${{ github.event.inputs.nova_sdk_asset || 'nova3d-sdk-macos.tar.gz' }}" \
+            --dir .nova-sdk-download
+          tar -C .nova-sdk -xzf ".nova-sdk-download/${{ github.event.inputs.nova_sdk_asset || 'nova3d-sdk-macos.tar.gz' }}" --strip-components=1
 
       - name: Build Sledgehammer against Nova SDK
         shell: bash
@@ -52,16 +53,49 @@ jobs:
           make clean
           make NOVA_SDK_ROOT="$PWD/.nova-sdk"
 
+      - name: Import signing certificate
+        if: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 != '' && secrets.MACOS_CERTIFICATE_PASSWORD != '' }}
+        shell: bash
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          keychain_path="$RUNNER_TEMP/app-signing.keychain-db"
+          cert_path="$RUNNER_TEMP/macos-signing.p12"
+          echo "$MACOS_CERTIFICATE_P12_BASE64" | base64 --decode > "$cert_path"
+          security create-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$MACOS_KEYCHAIN_PASSWORD" "$keychain_path"
+          security import "$cert_path" -P "$MACOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain_path"
+          security list-keychains -d user -s "$keychain_path" $(security list-keychains -d user | tr -d '"')
+
+      - name: Package Sledgehammer app bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x scripts/ci/package_macos_app.sh scripts/ci/sign_macos_bundle.sh
+          mkdir -p .artifacts/apps
+          ./scripts/ci/package_macos_app.sh \
+            Sledgehammer \
+            "$PWD/build/Sledgehammer" \
+            "$PWD/.artifacts/apps/Sledgehammer.app" \
+            "$PWD/build" \
+            "$PWD/build/default.metallib" \
+            "$PWD/build/MaterialSymbolsOutlined.ttf" \
+            "$PWD/build/content" \
+            "$PWD/build/shaders"
+          MACOS_SIGNING_IDENTITY="${{ secrets.MACOS_SIGNING_IDENTITY || '-' }}" ./scripts/ci/sign_macos_bundle.sh "$PWD/.artifacts/apps/Sledgehammer.app"
+          ditto -c -k --keepParent "$PWD/.artifacts/apps/Sledgehammer.app" "$PWD/.artifacts/Sledgehammer-macos-app.zip"
+
       - name: Upload Sledgehammer artifact
         uses: actions/upload-artifact@v4
         with:
           name: sledgehammer-macos
           path: |
-            build/Sledgehammer
-            build/default.metallib
-            build/MaterialSymbolsOutlined.ttf
-            build/content
-            build/shaders
+            .artifacts/apps/Sledgehammer.app
+            .artifacts/Sledgehammer-macos-app.zip
             build/*.dylib
           if-no-files-found: error
           retention-days: 14

@@ -10,6 +10,7 @@ NOVA_RENDERER_MTL_DIR := $(NOVA_ROOT)/NovaRendererMTL
 NOVA_RENDERER_VK_DIR := $(NOVA_ROOT)/NovaRendererVK
 CGLM_PREFIX := $(shell brew --prefix cglm 2>/dev/null)
 USE_NOVA_SDK := $(if $(strip $(NOVA_SDK_ROOT)),1,0)
+SDK_OBJC_SOURCES :=
 
 LOCAL_OBJC_SOURCES := \
 	$(SRC_DIR)/main.m \
@@ -56,10 +57,13 @@ CFLAGS += -I$(CGLM_PREFIX)/include
 endif
 
 ifeq ($(USE_NOVA_SDK),1)
+SDK_OBJC_SOURCES := $(BUILD_DIR)/imgui_impl_osx.mm
 CFLAGS += \
-	-I$(NOVA_SDK_ROOT)/include/NovaCore \
-	-I$(NOVA_SDK_ROOT)/include/NovaRendererMTL
-SDK_LINK_FLAGS := -L$(NOVA_SDK_ROOT)/lib -Wl,-rpath,@executable_path -Wl,-rpath,$(abspath $(NOVA_SDK_ROOT)/lib)
+	-I"$(NOVA_SDK_ROOT)/include" \
+	-I"$(NOVA_SDK_ROOT)/include/backends" \
+	-I"$(NOVA_SDK_ROOT)/include/NovaCore" \
+	-I"$(NOVA_SDK_ROOT)/include/NovaRendererMTL"
+SDK_LINK_FLAGS := -L"$(NOVA_SDK_ROOT)/lib" -Wl,-rpath,@executable_path
 SDK_LIBS := -lNovaRendererMTL -lNovaCore
 SDK_RUNTIME_DEPS := $(BUILD_DIR)/.nova-sdk-runtime
 else
@@ -74,7 +78,7 @@ SDK_RUNTIME_DEPS :=
 endif
 
 OBJCFLAGS := -fobjc-arc
-FRAMEWORKS := -framework Cocoa -framework Metal -framework MetalKit -framework QuartzCore -framework UniformTypeIdentifiers
+FRAMEWORKS := -framework Cocoa -framework CoreText -framework Foundation -framework GameController -framework Metal -framework MetalKit -framework QuartzCore -framework UniformTypeIdentifiers
 
 CONTENT_DIR := content
 
@@ -100,15 +104,18 @@ $(BUILD_DIR)/.nova-sdk-runtime: | $(BUILD_DIR)
 	fi
 	rm -rf $(BUILD_DIR)/shaders
 	mkdir -p $(BUILD_DIR)/shaders
-	cp -R $(NOVA_SDK_ROOT)/runtime/shaders/. $(BUILD_DIR)/shaders/
-	@for dylib in $(NOVA_SDK_ROOT)/lib/*.dylib; do \
-		[ -e "$$dylib" ] || continue; \
-		cp "$$dylib" $(BUILD_DIR)/; \
+	cp -R "$(NOVA_SDK_ROOT)/runtime/shaders/." "$(BUILD_DIR)/shaders/"
+	cp "$(NOVA_SDK_ROOT)/sources/imgui_impl_osx.mm" "$(BUILD_DIR)/imgui_impl_osx.mm"
+	@find "$(NOVA_SDK_ROOT)/lib" -maxdepth 1 -type f -name '*.dylib' -print0 | while IFS= read -r -d '' dylib; do \
+		cp "$$dylib" "$(BUILD_DIR)/"; \
 	done
 	@touch $@
 
-$(BUILD_DIR)/$(APP_NAME): $(OBJC_SOURCES) $(C_SOURCES) $(BUILD_DIR)/default.metallib $(BUILD_DIR)/MaterialSymbolsOutlined.ttf $(BUILD_DIR)/content $(SDK_RUNTIME_DEPS) | $(BUILD_DIR)
-	clang $(CFLAGS) $(OBJCFLAGS) $(OBJC_SOURCES) $(C_SOURCES) $(FRAMEWORKS) $(SDK_LINK_FLAGS) $(SDK_LIBS) -o $@
+$(BUILD_DIR)/imgui_impl_osx.mm: $(BUILD_DIR)/.nova-sdk-runtime
+	@test -f "$@"
+
+$(BUILD_DIR)/$(APP_NAME): $(OBJC_SOURCES) $(SDK_OBJC_SOURCES) $(C_SOURCES) $(BUILD_DIR)/default.metallib $(BUILD_DIR)/MaterialSymbolsOutlined.ttf $(BUILD_DIR)/content $(SDK_RUNTIME_DEPS) | $(BUILD_DIR)
+	clang++ $(CFLAGS) $(OBJCFLAGS) -x objective-c++ $(OBJC_SOURCES) $(SDK_OBJC_SOURCES) -x c $(C_SOURCES) $(FRAMEWORKS) $(SDK_LINK_FLAGS) $(SDK_LIBS) -o $@
 
 run: all
 	./$(BUILD_DIR)/$(APP_NAME)

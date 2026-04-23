@@ -6,6 +6,10 @@
 #include "math3d.h"
 #include "vmf_parser.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct ViewerVertex {
     Vec3 position;
     Vec3 normal;
@@ -38,5 +42,9 @@ typedef struct ViewerMesh {
 
 int vmf_build_mesh(const VmfScene* scene, ViewerMesh* outMesh, char* errorBuffer, size_t errorBufferSize);
 void viewer_mesh_free(ViewerMesh* mesh);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
