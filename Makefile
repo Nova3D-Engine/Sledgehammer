@@ -52,6 +52,7 @@ CFLAGS := -Wall -Wextra -Wpedantic -O2 -g \
 	-I$(SRC_DIR) \
 	-I/opt/homebrew/include \
 	-I/usr/local/include
+CXXFLAGS := -std=c++17
 ifneq ($(strip $(CGLM_PREFIX)),)
 CFLAGS += -I$(CGLM_PREFIX)/include
 endif
@@ -115,7 +116,7 @@ $(BUILD_DIR)/imgui_impl_osx.mm: $(BUILD_DIR)/.nova-sdk-runtime
 	@test -f "$@"
 
 $(BUILD_DIR)/$(APP_NAME): $(OBJC_SOURCES) $(SDK_OBJC_SOURCES) $(C_SOURCES) $(BUILD_DIR)/default.metallib $(BUILD_DIR)/MaterialSymbolsOutlined.ttf $(BUILD_DIR)/content $(SDK_RUNTIME_DEPS) | $(BUILD_DIR)
-	clang++ $(CFLAGS) $(OBJCFLAGS) -x objective-c++ $(OBJC_SOURCES) $(SDK_OBJC_SOURCES) -x c $(C_SOURCES) $(FRAMEWORKS) $(SDK_LINK_FLAGS) $(SDK_LIBS) -o $@
+	clang++ $(CFLAGS) $(CXXFLAGS) $(OBJCFLAGS) -x objective-c++ $(OBJC_SOURCES) $(SDK_OBJC_SOURCES) -x c $(C_SOURCES) $(FRAMEWORKS) $(SDK_LINK_FLAGS) $(SDK_LIBS) -o $@
 
 run: all
 	./$(BUILD_DIR)/$(APP_NAME)

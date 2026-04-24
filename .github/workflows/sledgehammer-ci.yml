@@ -37,11 +37,20 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.NOVA3D_RELEASE_TOKEN }}
+          NOVA3D_REPOSITORY: ${{ vars.NOVA3D_REPOSITORY }}
         run: |
           set -euo pipefail
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "NOVA3D_RELEASE_TOKEN is not configured. Add it as a repository secret so this workflow can download the private Nova3D release asset." >&2
+            exit 1
+          fi
+          if [[ -z "$NOVA3D_REPOSITORY" ]]; then
+            echo "NOVA3D_REPOSITORY is not configured. Add it as a repository variable in OWNER/Nova3D format." >&2
+            exit 1
+          fi
           mkdir -p .nova-sdk-download .nova-sdk
           gh release download "${{ github.event.inputs.nova_release_tag || 'nova3d-sdk-latest' }}" \
-            --repo "${{ vars.NOVA3D_REPOSITORY }}" \
+            --repo "$NOVA3D_REPOSITORY" \
             --pattern "${{ github.event.inputs.nova_sdk_asset || 'nova3d-sdk-macos.tar.gz' }}" \
             --dir .nova-sdk-download
           tar -C .nova-sdk -xzf ".nova-sdk-download/${{ github.event.inputs.nova_sdk_asset || 'nova3d-sdk-macos.tar.gz' }}" --strip-components=1
