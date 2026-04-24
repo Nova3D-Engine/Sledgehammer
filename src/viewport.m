@@ -732,7 +732,10 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     _commandQueue = [_device newCommandQueue];
 
     NSString* executableDir = [[[NSProcessInfo processInfo] arguments][0] stringByDeletingLastPathComponent];
-    NSString* metallibPath = [executableDir stringByAppendingPathComponent:@"default.metallib"];
+    NSString* metallibPath = [[NSBundle mainBundle] pathForResource:@"default" ofType:@"metallib"];
+    if (metallibPath == nil) {
+        metallibPath = [executableDir stringByAppendingPathComponent:@"default.metallib"];
+    }
     NSError* error = nil;
     id<MTLLibrary> library = [_device newLibraryWithURL:[NSURL fileURLWithPath:metallibPath] error:&error];
     if (!library) {
