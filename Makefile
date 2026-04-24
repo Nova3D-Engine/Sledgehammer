@@ -52,7 +52,6 @@ CFLAGS := -Wall -Wextra -Wpedantic -O2 -g \
 	-I$(SRC_DIR) \
 	-I/opt/homebrew/include \
 	-I/usr/local/include
-CXXFLAGS := -std=c++17
 ifneq ($(strip $(CGLM_PREFIX)),)
 CFLAGS += -I$(CGLM_PREFIX)/include
 endif
@@ -77,6 +76,11 @@ SDK_LINK_FLAGS :=
 SDK_LIBS :=
 SDK_RUNTIME_DEPS :=
 endif
+
+OBJC_ALL_SOURCES := $(OBJC_SOURCES) $(SDK_OBJC_SOURCES)
+C_ALL_SOURCES := $(C_SOURCES)
+OBJC_OBJECTS := $(addprefix $(BUILD_DIR)/,$(addsuffix .o,$(basename $(notdir $(OBJC_ALL_SOURCES)))))
+C_OBJECTS := $(addprefix $(BUILD_DIR)/,$(addsuffix .o,$(basename $(notdir $(C_ALL_SOURCES)))))
 
 OBJCFLAGS := -fobjc-arc
 FRAMEWORKS := -framework Cocoa -framework CoreText -framework Foundation -framework GameController -framework Metal -framework MetalKit -framework QuartzCore -framework UniformTypeIdentifiers
@@ -115,8 +119,21 @@ $(BUILD_DIR)/.nova-sdk-runtime: | $(BUILD_DIR)
 $(BUILD_DIR)/imgui_impl_osx.mm: $(BUILD_DIR)/.nova-sdk-runtime
 	@test -f "$@"
 
-$(BUILD_DIR)/$(APP_NAME): $(OBJC_SOURCES) $(SDK_OBJC_SOURCES) $(C_SOURCES) $(BUILD_DIR)/default.metallib $(BUILD_DIR)/MaterialSymbolsOutlined.ttf $(BUILD_DIR)/content $(SDK_RUNTIME_DEPS) | $(BUILD_DIR)
-	clang++ $(CFLAGS) $(CXXFLAGS) $(OBJCFLAGS) -x objective-c++ $(OBJC_SOURCES) $(SDK_OBJC_SOURCES) -x c $(C_SOURCES) $(FRAMEWORKS) $(SDK_LINK_FLAGS) $(SDK_LIBS) -o $@
+define COMPILE_OBJC_OBJECT
+$(BUILD_DIR)/$(basename $(notdir $1)).o: $1 | $(BUILD_DIR)
+	clang++ $(CFLAGS) $(OBJCFLAGS) -x objective-c++ -std=c++17 -c $$< -o $$@
+endef
+
+define COMPILE_C_OBJECT
+$(BUILD_DIR)/$(basename $(notdir $1)).o: $1 | $(BUILD_DIR)
+	clang $(CFLAGS) -std=gnu11 -x c -c $$< -o $$@
+endef
+
+$(foreach source,$(OBJC_ALL_SOURCES),$(eval $(call COMPILE_OBJC_OBJECT,$(source))))
+$(foreach source,$(C_ALL_SOURCES),$(eval $(call COMPILE_C_OBJECT,$(source))))
+
+$(BUILD_DIR)/$(APP_NAME): $(OBJC_OBJECTS) $(C_OBJECTS) $(BUILD_DIR)/default.metallib $(BUILD_DIR)/MaterialSymbolsOutlined.ttf $(BUILD_DIR)/content $(SDK_RUNTIME_DEPS) | $(BUILD_DIR)
+	clang++ $(OBJC_OBJECTS) $(C_OBJECTS) $(FRAMEWORKS) $(SDK_LINK_FLAGS) $(SDK_LIBS) -o $@
 
 run: all
 	./$(BUILD_DIR)/$(APP_NAME)
