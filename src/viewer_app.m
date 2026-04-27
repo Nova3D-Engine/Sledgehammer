@@ -2,6 +2,7 @@
 
 #include <fcntl.h>
 #include <float.h>
+#include <dlfcn.h>
 
 #import <CoreText/CoreText.h>
 #import <Metal/Metal.h>
@@ -11,10 +12,40 @@
 #include "nova_scene_ecs.h"
 
 #import "file_index.h"
+#import "sledgehammer_plugin_api.h"
 #import "viewport.h"
 #import "vmf_editor.h"
 #import "vmf_geometry.h"
 #import "vmf_parser.h"
+
+@class ViewerAppDelegate;
+
+@interface SledgehammerLoadedPluginRecord : NSObject
+
+@property(nonatomic, copy) NSString* sourcePath;
+@property(nonatomic, copy) NSString* runtimePath;
+@property(nonatomic, copy) NSString* modificationToken;
+@property(nonatomic, copy) NSString* pluginIdentifier;
+@property(nonatomic, copy) NSString* displayName;
+@property(nonatomic, assign) void* handle;
+@property(nonatomic, assign) void* userData;
+@property(nonatomic, assign) SledgehammerPluginApiV1 api;
+
+@end
+
+@implementation SledgehammerLoadedPluginRecord
+
+@end
+
+@interface SledgehammerPluginCommandTarget : NSObject
+
+@property(nonatomic, weak) ViewerAppDelegate* appDelegate;
+@property(nonatomic, weak) SledgehammerLoadedPluginRecord* pluginRecord;
+@property(nonatomic, assign) NSUInteger commandIndex;
+
+- (void)invoke:(id)sender;
+
+@end
 
 @interface StyledSplitView : NSSplitView
 
@@ -108,6 +139,34 @@ typedef NS_ENUM(NSUInteger, ViewerClipMode) {
 };
 
 static NSString* const kAppDisplayName = @"Sledgehammer";
+
+static size_t sledgehammer_copy_utf8_string(NSString* value, char* buffer, size_t buffer_size) {
+    const char* utf8 = value.length > 0 ? value.UTF8String : "";
+    size_t required = strlen(utf8);
+    if (buffer != NULL && buffer_size > 0) {
+        size_t copy_count = required < (buffer_size - 1) ? required : (buffer_size - 1);
+        memcpy(buffer, utf8, copy_count);
+        buffer[copy_count] = '\0';
+    }
+    return required;
+}
+
+static NSEventModifierFlags sledgehammer_menu_flags_for_plugin_modifiers(uint32_t modifiers) {
+    NSEventModifierFlags flags = 0;
+    if ((modifiers & SledgehammerPluginKeyModifierCommand) != 0u) {
+        flags |= NSEventModifierFlagCommand;
+    }
+    if ((modifiers & SledgehammerPluginKeyModifierShift) != 0u) {
+        flags |= NSEventModifierFlagShift;
+    }
+    if ((modifiers & SledgehammerPluginKeyModifierOption) != 0u) {
+        flags |= NSEventModifierFlagOption;
+    }
+    if ((modifiers & SledgehammerPluginKeyModifierControl) != 0u) {
+        flags |= NSEventModifierFlagControl;
+    }
+    return flags;
+}
 
 static NSString* light_type_label(int lightType) {
     switch (lightType) {
@@ -232,6 +291,7 @@ static NSString* clip_mode_label(ViewerClipMode mode) {
 @property(nonatomic, assign) BOOL textureLockEnabled;
 @property(nonatomic, strong) NSMenu* editMenu;
 @property(nonatomic, strong) NSMenu* historyMenu;
+@property(nonatomic, strong) NSMenu* pluginsMenu;
 @property(nonatomic, strong) NSMenuItem* undoMenuItem;
 @property(nonatomic, strong) NSMenuItem* redoMenuItem;
 @property(nonatomic, copy) NSString* startupPath;
@@ -291,6 +351,165 @@ static NSString* clip_mode_label(ViewerClipMode mode) {
 @property(nonatomic, assign) int activeGroupEntityId;
 @property(nonatomic, assign) BOOL ignoreGroupSelection;
 @property(nonatomic, assign) BOOL textureApplicationModeActive;
+@property(nonatomic, copy) NSString* pluginsDirectory;
+@property(nonatomic, assign) NSInteger pluginMenuDynamicStartIndex;
+@property(nonatomic, strong) NSMutableDictionary<NSString*, SledgehammerLoadedPluginRecord*>* loadedPluginsBySourcePath;
+@property(nonatomic, strong) NSMutableArray<SledgehammerPluginCommandTarget*>* pluginCommandTargets;
+
+- (void)showError:(NSString*)message;
+- (void)frameAllViewports;
+- (BOOL)rebuildMeshFromScene;
+- (void)reloadDocument:(id)sender;
+- (void)invokePluginRecord:(SledgehammerLoadedPluginRecord*)plugin commandIndex:(NSUInteger)commandIndex;
+
+@end
+
+static ViewerAppDelegate* sledgehammer_plugin_host_delegate(void* app_context) {
+    return (__bridge ViewerAppDelegate*)app_context;
+}
+
+static void sledgehammer_plugin_host_log(void* app_context, const char* plugin_identifier, const char* message) {
+    ViewerAppDelegate* delegate = sledgehammer_plugin_host_delegate(app_context);
+    NSString* pluginLabel = plugin_identifier != NULL && plugin_identifier[0] != '\0' ? [NSString stringWithUTF8String:plugin_identifier] : @"unknown";
+    NSString* text = message != NULL && message[0] != '\0' ? [NSString stringWithUTF8String:message] : @"";
+    (void)delegate;
+    NSLog(@"[plugin:%@] %@", pluginLabel, text);
+}
+
+static void sledgehammer_plugin_host_show_message(void* app_context,
+                                                  const char* plugin_identifier,
+                                                  const char* title,
+                                                  const char* message) {
+    ViewerAppDelegate* delegate = sledgehammer_plugin_host_delegate(app_context);
+    NSString* pluginLabel = plugin_identifier != NULL && plugin_identifier[0] != '\0' ? [NSString stringWithUTF8String:plugin_identifier] : @"plugin";
+    NSString* alertTitle = title != NULL && title[0] != '\0' ? [NSString stringWithUTF8String:title] : @"Plugin";
+    NSString* alertMessage = message != NULL && message[0] != '\0' ? [NSString stringWithUTF8String:message] : @"";
+    void (^present_alert)(void) = ^{
+        NSAlert* alert = [[NSAlert alloc] init];
+        alert.messageText = [NSString stringWithFormat:@"%@ (%@)", alertTitle, pluginLabel];
+        alert.informativeText = alertMessage;
+        [alert beginSheetModalForWindow:delegate.window completionHandler:nil];
+    };
+    if ([NSThread isMainThread]) {
+        present_alert();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), present_alert);
+    }
+}
+
+static size_t sledgehammer_plugin_host_copy_current_document_path(void* app_context, char* buffer, size_t buffer_size) {
+    ViewerAppDelegate* delegate = sledgehammer_plugin_host_delegate(app_context);
+    return sledgehammer_copy_utf8_string(delegate.currentPath ?: @"", buffer, buffer_size);
+}
+
+static size_t sledgehammer_plugin_host_copy_current_material_name(void* app_context, char* buffer, size_t buffer_size) {
+    ViewerAppDelegate* delegate = sledgehammer_plugin_host_delegate(app_context);
+    return sledgehammer_copy_utf8_string(delegate.brushMaterialName ?: @"", buffer, buffer_size);
+}
+
+static size_t sledgehammer_plugin_host_copy_materials_directory(void* app_context, char* buffer, size_t buffer_size) {
+    ViewerAppDelegate* delegate = sledgehammer_plugin_host_delegate(app_context);
+    return sledgehammer_copy_utf8_string(delegate.materialsDirectory ?: @"", buffer, buffer_size);
+}
+
+static size_t sledgehammer_plugin_host_copy_plugins_directory(void* app_context, char* buffer, size_t buffer_size) {
+    ViewerAppDelegate* delegate = sledgehammer_plugin_host_delegate(app_context);
+    return sledgehammer_copy_utf8_string(delegate.pluginsDirectory ?: @"", buffer, buffer_size);
+}
+
+static void sledgehammer_plugin_host_frame_scene(void* app_context) {
+    ViewerAppDelegate* delegate = sledgehammer_plugin_host_delegate(app_context);
+    void (^frame_scene)(void) = ^{
+        [delegate frameAllViewports];
+    };
+    if ([NSThread isMainThread]) {
+        frame_scene();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), frame_scene);
+    }
+}
+
+static bool sledgehammer_plugin_host_rebuild_mesh(void* app_context) {
+    ViewerAppDelegate* delegate = sledgehammer_plugin_host_delegate(app_context);
+    if ([NSThread isMainThread]) {
+        return [delegate rebuildMeshFromScene];
+    }
+
+    __block BOOL rebuild_result = NO;
+    dispatch_sync(dispatch_get_main_queue(), ^{
+        rebuild_result = [delegate rebuildMeshFromScene];
+    });
+    return rebuild_result;
+}
+
+static Vec3 sledgehammer_plugin_vec3_to_vec3(SledgehammerPluginVec3 value) {
+    return vec3_make(value.x, value.y, value.z);
+}
+
+static void sledgehammer_plugin_host_set_debug_bounds(void* app_context,
+                                                      SledgehammerPluginVec3 min,
+                                                      SledgehammerPluginVec3 max,
+                                                      bool visible) {
+    ViewerAppDelegate* delegate = sledgehammer_plugin_host_delegate(app_context);
+    Bounds3 bounds = bounds3_empty();
+    bounds.min = sledgehammer_plugin_vec3_to_vec3(min);
+    bounds.max = sledgehammer_plugin_vec3_to_vec3(max);
+
+    void (^apply_bounds)(void) = ^{
+        for (VmfViewport* viewport in delegate.viewports) {
+            [viewport setPluginDebugBounds:bounds visible:visible ? YES : NO];
+        }
+    };
+    if ([NSThread isMainThread]) {
+        apply_bounds();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), apply_bounds);
+    }
+}
+
+static bool sledgehammer_plugin_host_get_editor_stats(void* app_context,
+                                                      SledgehammerPluginEditorStatsV1* out_stats) {
+    if (out_stats == NULL) {
+        return false;
+    }
+
+    ViewerAppDelegate* delegate = sledgehammer_plugin_host_delegate(app_context);
+    memset(out_stats, 0, sizeof(*out_stats));
+    out_stats->struct_size = (uint32_t)sizeof(*out_stats);
+    out_stats->has_document = delegate.hasDocument ? 1u : 0u;
+    out_stats->document_dirty = delegate.documentDirty ? 1u : 0u;
+
+    if (!delegate.hasDocument) {
+        return true;
+    }
+
+    VmfScene scene = delegate.scene;
+    out_stats->entity_count = (uint32_t)scene.entityCount;
+
+    for (size_t entity_index = 0; entity_index < scene.entityCount; ++entity_index) {
+        const VmfEntity* entity = &scene.entities[entity_index];
+        if (entity->kind == VmfEntityKindLight) {
+            out_stats->light_entity_count += 1u;
+        }
+        if (entity->solidCount > 0) {
+            out_stats->brush_entity_count += 1u;
+        }
+
+        out_stats->solid_count += (uint32_t)entity->solidCount;
+        for (size_t solid_index = 0; solid_index < entity->solidCount; ++solid_index) {
+            out_stats->side_count += (uint32_t)entity->solids[solid_index].sideCount;
+        }
+    }
+
+    return true;
+}
+
+@implementation SledgehammerPluginCommandTarget
+
+- (void)invoke:(id)sender {
+    (void)sender;
+    [self.appDelegate invokePluginRecord:self.pluginRecord commandIndex:self.commandIndex];
+}
 
 @end
 
@@ -298,6 +517,8 @@ static NSString* clip_mode_label(ViewerClipMode mode) {
     // Materials directory watcher
     dispatch_source_t _directoryWatchSource;
     int _directoryWatchFd;
+    dispatch_source_t _pluginDirectoryWatchSource;
+    int _pluginDirectoryWatchFd;
     // Vertex edit session state
     BOOL _hasVertexEditSession;
     size_t _vertexEditEntityIndex;
@@ -340,6 +561,10 @@ static NSString* clip_mode_label(ViewerClipMode mode) {
     _ignoreGroupSelection = NO;
     _textureApplicationModeActive = NO;
     _textureLockEnabled = YES;
+    _directoryWatchFd = -1;
+    _pluginDirectoryWatchFd = -1;
+    _loadedPluginsBySourcePath = [NSMutableDictionary dictionary];
+    _pluginCommandTargets = [NSMutableArray array];
     _sceneWorld = nova_scene_world_create();
     if (_sceneWorld != NULL) {
         nova_scene_world_register_editor_tags(_sceneWorld);
@@ -348,6 +573,8 @@ static NSString* clip_mode_label(ViewerClipMode mode) {
 }
 
 - (void)dealloc {
+    [self stopWatchingPluginsDirectory];
+    [self unloadAllPlugins];
     [self stopWatchingMaterialsDirectory];
     nova_scene_world_destroy(_sceneWorld);
     file_index_free(&_fileIndex);
@@ -359,6 +586,7 @@ static NSString* clip_mode_label(ViewerClipMode mode) {
     (void)notification;
     [self createMenu];
     [self createWindow];
+    [self configurePlugins];
     [self.window makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
 
@@ -443,7 +671,9 @@ static NSString* clip_mode_label(ViewerClipMode mode) {
     NSMenu* viewMenu = [[NSMenu alloc] initWithTitle:@"View"];
     [viewMenu addItemWithTitle:@"Shaded" action:@selector(setShadedMode:) keyEquivalent:@"1"];
     [viewMenu addItemWithTitle:@"Wireframe" action:@selector(setWireframeMode:) keyEquivalent:@"2"];
-    [viewMenu addItemWithTitle:@"Frame Scene" action:@selector(frameScene:) keyEquivalent:@"f"];
+    [viewMenu addItemWithTitle:@"Frame Scene" action:@selector(frameScene:) keyEquivalent:@"k"];
+    [viewMenu addItemWithTitle:@"Bake Preview Lighting (1 Bounce GI)" action:@selector(bakePreviewLighting:) keyEquivalent:@"j"];
+    [viewMenu addItemWithTitle:@"Show Lightmap Debug" action:@selector(showLightmapDebugWindow:) keyEquivalent:@""];
     [viewMenu addItemWithTitle:@"Next File" action:@selector(nextDocument:) keyEquivalent:@"n"];
     [viewMenu addItemWithTitle:@"Previous File" action:@selector(previousDocument:) keyEquivalent:@"p"];
     [viewItem setSubmenu:viewMenu];
@@ -462,6 +692,14 @@ static NSString* clip_mode_label(ViewerClipMode mode) {
     [toolsMenu addItem:[NSMenuItem separatorItem]];
     [toolsMenu addItemWithTitle:@"Add Light" action:@selector(addLightEntity:) keyEquivalent:@"l"];
     [toolsItem setSubmenu:toolsMenu];
+
+    NSMenuItem* pluginsItem = [[NSMenuItem alloc] initWithTitle:@"Plugins" action:nil keyEquivalent:@""];
+    [mainMenu addItem:pluginsItem];
+    self.pluginsMenu = [[NSMenu alloc] initWithTitle:@"Plugins"];
+    [self.pluginsMenu addItemWithTitle:@"Reload Plugins" action:@selector(reloadPlugins:) keyEquivalent:@""];
+    [self.pluginsMenu addItem:[NSMenuItem separatorItem]];
+    self.pluginMenuDynamicStartIndex = self.pluginsMenu.numberOfItems;
+    [pluginsItem setSubmenu:self.pluginsMenu];
 
     NSMenuItem* groupsItem = [[NSMenuItem alloc] initWithTitle:@"Groups" action:nil keyEquivalent:@""];
     [mainMenu addItem:groupsItem];
@@ -502,6 +740,373 @@ static NSString* clip_mode_label(ViewerClipMode mode) {
     [self updateChrome];
 }
 
+- (NSString*)defaultPluginsDirectory {
+    const char* override_path = getenv("SLEDGEHAMMER_PLUGIN_DIR");
+    if (override_path != NULL && override_path[0] != '\0') {
+        return [NSString stringWithUTF8String:override_path];
+    }
+    NSString* executable_directory = [NSBundle.mainBundle.executablePath stringByDeletingLastPathComponent];
+    return [executable_directory stringByAppendingPathComponent:@"plugins"];
+}
+
+- (NSString*)pluginRuntimeDirectory {
+    NSString* executable_name = NSBundle.mainBundle.executablePath.lastPathComponent;
+    NSString* runtime_root = [NSTemporaryDirectory() stringByAppendingPathComponent:@"SledgehammerPluginRuntime"];
+    return [runtime_root stringByAppendingPathComponent:executable_name.length > 0 ? executable_name : @"Sledgehammer"];
+}
+
+- (SledgehammerPluginHostV1)pluginHost {
+    SledgehammerPluginHostV1 host = { 0 };
+    host.struct_size = sizeof(host);
+    host.api_version = SLEDGEHAMMER_PLUGIN_API_VERSION;
+    host.app_context = (__bridge void*)self;
+    host.log = sledgehammer_plugin_host_log;
+    host.show_message = sledgehammer_plugin_host_show_message;
+    host.copy_current_document_path = sledgehammer_plugin_host_copy_current_document_path;
+    host.copy_current_material_name = sledgehammer_plugin_host_copy_current_material_name;
+    host.copy_materials_directory = sledgehammer_plugin_host_copy_materials_directory;
+    host.copy_plugins_directory = sledgehammer_plugin_host_copy_plugins_directory;
+    host.frame_scene = sledgehammer_plugin_host_frame_scene;
+    host.rebuild_mesh = sledgehammer_plugin_host_rebuild_mesh;
+    host.set_debug_bounds = sledgehammer_plugin_host_set_debug_bounds;
+    host.get_editor_stats = sledgehammer_plugin_host_get_editor_stats;
+    return host;
+}
+
+- (void)configurePlugins {
+    self.pluginsDirectory = [self defaultPluginsDirectory];
+    if (self.pluginsDirectory.length == 0) {
+        return;
+    }
+
+    NSFileManager* file_manager = [NSFileManager defaultManager];
+    NSError* directory_error = nil;
+    if (![file_manager createDirectoryAtPath:self.pluginsDirectory withIntermediateDirectories:YES attributes:nil error:&directory_error]) {
+        NSLog(@"[plugin] failed to create plugins directory %@: %@", self.pluginsDirectory, directory_error.localizedDescription);
+        return;
+    }
+
+    NSString* runtime_directory = [self pluginRuntimeDirectory];
+    [file_manager removeItemAtPath:runtime_directory error:nil];
+    [file_manager createDirectoryAtPath:runtime_directory withIntermediateDirectories:YES attributes:nil error:nil];
+
+    [self startWatchingPluginsDirectory:self.pluginsDirectory];
+    [self reloadPlugins:nil];
+}
+
+- (NSArray<NSString*>*)pluginCandidatePathsInDirectory:(NSString*)directory {
+    NSError* list_error = nil;
+    NSArray<NSString*>* contents = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:directory error:&list_error];
+    if (contents == nil) {
+        NSLog(@"[plugin] failed to list %@: %@", directory, list_error.localizedDescription);
+        return @[];
+    }
+
+    NSMutableArray<NSString*>* dylib_paths = [NSMutableArray array];
+    for (NSString* entry in contents) {
+        if (![entry.pathExtension.lowercaseString isEqualToString:@"dylib"]) {
+            continue;
+        }
+        [dylib_paths addObject:[directory stringByAppendingPathComponent:entry]];
+    }
+    [dylib_paths sortUsingSelector:@selector(localizedStandardCompare:)];
+    return dylib_paths;
+}
+
+- (NSString*)pluginModificationTokenForPath:(NSString*)path {
+    NSDictionary<NSFileAttributeKey, id>* attributes = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
+    NSDate* modified = attributes[NSFileModificationDate];
+    NSNumber* file_size = attributes[NSFileSize];
+    long long modified_millis = modified != nil ? (long long)llround(modified.timeIntervalSince1970 * 1000.0) : 0ll;
+    unsigned long long size_value = file_size != nil ? file_size.unsignedLongLongValue : 0ull;
+    return [NSString stringWithFormat:@"%lld:%llu", modified_millis, size_value];
+}
+
+- (BOOL)validatePluginApi:(const SledgehammerPluginApiV1*)api errorMessage:(NSString* __autoreleasing *)errorMessage {
+    if (api == NULL) {
+        if (errorMessage != NULL) {
+            *errorMessage = @"plugin query returned no API";
+        }
+        return NO;
+    }
+    if (api->api_version != SLEDGEHAMMER_PLUGIN_API_VERSION) {
+        if (errorMessage != NULL) {
+            *errorMessage = [NSString stringWithFormat:@"unsupported plugin API version %u", api->api_version];
+        }
+        return NO;
+    }
+    if (api->plugin_identifier == NULL || api->plugin_identifier[0] == '\0') {
+        if (errorMessage != NULL) {
+            *errorMessage = @"plugin is missing plugin_identifier";
+        }
+        return NO;
+    }
+    if (api->display_name == NULL || api->display_name[0] == '\0') {
+        if (errorMessage != NULL) {
+            *errorMessage = @"plugin is missing display_name";
+        }
+        return NO;
+    }
+    if (api->command_count > 0u && api->commands == NULL) {
+        if (errorMessage != NULL) {
+            *errorMessage = @"plugin declared commands without a command table";
+        }
+        return NO;
+    }
+    for (uint32_t index = 0; index < api->command_count; ++index) {
+        const SledgehammerPluginCommandV1* command = &api->commands[index];
+        if (command->identifier == NULL || command->identifier[0] == '\0' ||
+            command->display_name == NULL || command->display_name[0] == '\0' ||
+            command->invoke == NULL) {
+            if (errorMessage != NULL) {
+                *errorMessage = [NSString stringWithFormat:@"plugin command %u is incomplete", index];
+            }
+            return NO;
+        }
+    }
+    return YES;
+}
+
+- (SledgehammerLoadedPluginRecord*)loadPluginRecordFromSourcePath:(NSString*)sourcePath
+                                                 modificationToken:(NSString*)modificationToken
+                                                      errorMessage:(NSString* __autoreleasing *)errorMessage {
+    NSString* runtime_directory = [self pluginRuntimeDirectory];
+    NSString* runtime_name = [NSString stringWithFormat:@"%@-%@.dylib",
+                              sourcePath.lastPathComponent.stringByDeletingPathExtension,
+                              NSUUID.UUID.UUIDString];
+    NSString* runtime_path = [runtime_directory stringByAppendingPathComponent:runtime_name];
+    NSFileManager* file_manager = [NSFileManager defaultManager];
+    NSError* copy_error = nil;
+    if (![file_manager copyItemAtPath:sourcePath toPath:runtime_path error:&copy_error]) {
+        if (errorMessage != NULL) {
+            *errorMessage = [NSString stringWithFormat:@"failed to stage %@: %@", sourcePath.lastPathComponent, copy_error.localizedDescription];
+        }
+        return nil;
+    }
+
+    void* handle = dlopen(runtime_path.fileSystemRepresentation, RTLD_NOW | RTLD_LOCAL);
+    if (handle == NULL) {
+        NSString* dlerror_message = dlerror() != NULL ? [NSString stringWithUTF8String:dlerror()] : @"unknown dlopen failure";
+        [file_manager removeItemAtPath:runtime_path error:nil];
+        if (errorMessage != NULL) {
+            *errorMessage = dlerror_message;
+        }
+        return nil;
+    }
+
+    SledgehammerPluginQueryFn query = (SledgehammerPluginQueryFn)dlsym(handle, SLEDGEHAMMER_PLUGIN_QUERY_SYMBOL);
+    if (query == NULL) {
+        if (errorMessage != NULL) {
+            *errorMessage = [NSString stringWithFormat:@"%@ does not export %s", sourcePath.lastPathComponent, SLEDGEHAMMER_PLUGIN_QUERY_SYMBOL];
+        }
+        dlclose(handle);
+        [file_manager removeItemAtPath:runtime_path error:nil];
+        return nil;
+    }
+
+    SledgehammerPluginHostV1 host = [self pluginHost];
+    SledgehammerPluginApiV1 api = { 0 };
+    char error_buffer[512] = { 0 };
+    if (!query(&host, &api, error_buffer, sizeof(error_buffer))) {
+        if (errorMessage != NULL) {
+            *errorMessage = error_buffer[0] != '\0' ? [NSString stringWithUTF8String:error_buffer] : @"plugin query failed";
+        }
+        dlclose(handle);
+        [file_manager removeItemAtPath:runtime_path error:nil];
+        return nil;
+    }
+
+    NSString* validation_error = nil;
+    if (![self validatePluginApi:&api errorMessage:&validation_error]) {
+        if (errorMessage != NULL) {
+            *errorMessage = validation_error;
+        }
+        dlclose(handle);
+        [file_manager removeItemAtPath:runtime_path error:nil];
+        return nil;
+    }
+
+    void* plugin_user_data = NULL;
+    if (api.startup != NULL && !api.startup(&plugin_user_data, &host, error_buffer, sizeof(error_buffer))) {
+        if (errorMessage != NULL) {
+            *errorMessage = error_buffer[0] != '\0' ? [NSString stringWithUTF8String:error_buffer] : @"plugin startup failed";
+        }
+        dlclose(handle);
+        [file_manager removeItemAtPath:runtime_path error:nil];
+        return nil;
+    }
+
+    SledgehammerLoadedPluginRecord* record = [[SledgehammerLoadedPluginRecord alloc] init];
+    record.sourcePath = sourcePath;
+    record.runtimePath = runtime_path;
+    record.modificationToken = modificationToken;
+    record.pluginIdentifier = [NSString stringWithUTF8String:api.plugin_identifier];
+    record.displayName = [NSString stringWithUTF8String:api.display_name];
+    record.handle = handle;
+    record.userData = plugin_user_data;
+    record.api = api;
+    return record;
+}
+
+- (void)refreshPluginsMenu {
+    if (self.pluginsMenu == nil) {
+        return;
+    }
+
+    while (self.pluginsMenu.numberOfItems > self.pluginMenuDynamicStartIndex) {
+        [self.pluginsMenu removeItemAtIndex:self.pluginMenuDynamicStartIndex];
+    }
+    [self.pluginCommandTargets removeAllObjects];
+
+    NSArray<SledgehammerLoadedPluginRecord*>* plugins = [[self.loadedPluginsBySourcePath allValues] sortedArrayUsingComparator:^NSComparisonResult(SledgehammerLoadedPluginRecord* lhs, SledgehammerLoadedPluginRecord* rhs) {
+        return [lhs.displayName localizedStandardCompare:rhs.displayName];
+    }];
+
+    BOOL added_command = NO;
+    for (SledgehammerLoadedPluginRecord* plugin in plugins) {
+        for (uint32_t index = 0; index < plugin.api.command_count; ++index) {
+            const SledgehammerPluginCommandV1* command = &plugin.api.commands[index];
+            NSString* title = [NSString stringWithFormat:@"%@: %s", plugin.displayName, command->display_name];
+            NSMenuItem* item = [[NSMenuItem alloc] initWithTitle:title action:@selector(invoke:) keyEquivalent:command->key_equivalent != NULL ? [NSString stringWithUTF8String:command->key_equivalent] : @""];
+            item.keyEquivalentModifierMask = sledgehammer_menu_flags_for_plugin_modifiers(command->key_modifiers);
+            SledgehammerPluginCommandTarget* target = [[SledgehammerPluginCommandTarget alloc] init];
+            target.appDelegate = self;
+            target.pluginRecord = plugin;
+            target.commandIndex = index;
+            item.target = target;
+            [self.pluginCommandTargets addObject:target];
+            [self.pluginsMenu addItem:item];
+            added_command = YES;
+        }
+    }
+
+    if (!added_command) {
+        NSMenuItem* placeholder = [[NSMenuItem alloc] initWithTitle:@"No Plugin Commands Loaded" action:nil keyEquivalent:@""];
+        placeholder.enabled = NO;
+        [self.pluginsMenu addItem:placeholder];
+    }
+}
+
+- (void)unloadPluginRecord:(SledgehammerLoadedPluginRecord*)record reason:(NSString*)reason {
+    if (record == nil) {
+        return;
+    }
+
+    SledgehammerPluginHostV1 host = [self pluginHost];
+    if (record.api.shutdown != NULL) {
+        record.api.shutdown(record.userData, &host);
+    }
+    if (record.handle != NULL) {
+        dlclose(record.handle);
+        record.handle = NULL;
+    }
+    if (record.runtimePath.length > 0) {
+        [[NSFileManager defaultManager] removeItemAtPath:record.runtimePath error:nil];
+    }
+    NSLog(@"[plugin] unloaded %@ (%@)", record.displayName ?: record.sourcePath.lastPathComponent, reason ?: @"update");
+}
+
+- (void)unloadAllPlugins {
+    NSArray<SledgehammerLoadedPluginRecord*>* records = [self.loadedPluginsBySourcePath.allValues copy];
+    [self.loadedPluginsBySourcePath removeAllObjects];
+    for (SledgehammerLoadedPluginRecord* record in records) {
+        [self unloadPluginRecord:record reason:@"shutdown"];
+    }
+    [self refreshPluginsMenu];
+}
+
+- (void)reloadPlugins:(id)sender {
+    (void)sender;
+    if (self.pluginsDirectory.length == 0) {
+        return;
+    }
+
+    NSArray<NSString*>* source_paths = [self pluginCandidatePathsInDirectory:self.pluginsDirectory];
+    NSMutableSet<NSString*>* live_paths = [NSMutableSet setWithArray:source_paths];
+    NSArray<NSString*>* existing_paths = [self.loadedPluginsBySourcePath.allKeys copy];
+    for (NSString* existing_path in existing_paths) {
+        if ([live_paths containsObject:existing_path]) {
+            continue;
+        }
+        SledgehammerLoadedPluginRecord* removed = self.loadedPluginsBySourcePath[existing_path];
+        [self.loadedPluginsBySourcePath removeObjectForKey:existing_path];
+        [self unloadPluginRecord:removed reason:@"removed from plugin directory"];
+    }
+
+    for (NSString* source_path in source_paths) {
+        NSString* modification_token = [self pluginModificationTokenForPath:source_path];
+        SledgehammerLoadedPluginRecord* existing = self.loadedPluginsBySourcePath[source_path];
+        if (existing != nil && [existing.modificationToken isEqualToString:modification_token]) {
+            continue;
+        }
+
+        NSString* load_error = nil;
+        SledgehammerLoadedPluginRecord* replacement = [self loadPluginRecordFromSourcePath:source_path
+                                                                         modificationToken:modification_token
+                                                                              errorMessage:&load_error];
+        if (replacement == nil) {
+            NSLog(@"[plugin] failed to load %@: %@", source_path.lastPathComponent, load_error ?: @"unknown error");
+            continue;
+        }
+
+        if (existing != nil) {
+            [self unloadPluginRecord:existing reason:@"hot reload"];
+        }
+        self.loadedPluginsBySourcePath[source_path] = replacement;
+        NSLog(@"[plugin] loaded %@ from %@", replacement.displayName, source_path.lastPathComponent);
+    }
+
+    [self refreshPluginsMenu];
+}
+
+- (void)startWatchingPluginsDirectory:(NSString*)path {
+    [self stopWatchingPluginsDirectory];
+    if (path.length == 0) {
+        return;
+    }
+
+    int fd = open(path.fileSystemRepresentation, O_EVTONLY);
+    if (fd < 0) {
+        return;
+    }
+
+    _pluginDirectoryWatchFd = fd;
+    __weak __typeof__(self) weakSelf = self;
+    _pluginDirectoryWatchSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_VNODE,
+                                                         (uintptr_t)fd,
+                                                         DISPATCH_VNODE_WRITE | DISPATCH_VNODE_DELETE | DISPATCH_VNODE_RENAME | DISPATCH_VNODE_ATTRIB,
+                                                         dispatch_get_main_queue());
+    dispatch_source_set_event_handler(_pluginDirectoryWatchSource, ^{
+        [weakSelf pluginsDirectoryDidChange];
+    });
+    dispatch_source_set_cancel_handler(_pluginDirectoryWatchSource, ^{
+        close(fd);
+    });
+    dispatch_resume(_pluginDirectoryWatchSource);
+    NSLog(@"[plugin] watching %@", path);
+}
+
+- (void)stopWatchingPluginsDirectory {
+    if (_pluginDirectoryWatchSource != nil) {
+        dispatch_source_cancel(_pluginDirectoryWatchSource);
+        _pluginDirectoryWatchSource = nil;
+        _pluginDirectoryWatchFd = -1;
+    }
+}
+
+- (void)pluginsDirectoryDidChange {
+    NSLog(@"[plugin] directory changed — reloading plugins");
+    [self reloadPlugins:nil];
+}
+
+- (void)invokePluginRecord:(SledgehammerLoadedPluginRecord*)plugin commandIndex:(NSUInteger)commandIndex {
+    if (plugin == nil || commandIndex >= plugin.api.command_count) {
+        return;
+    }
+    SledgehammerPluginHostV1 host = [self pluginHost];
+    plugin.api.commands[commandIndex].invoke(plugin.userData, &host);
+}
+
 - (StyledSplitView*)newSplitViewVertical:(BOOL)vertical {
     StyledSplitView* splitView = [[StyledSplitView alloc] initWithFrame:NSZeroRect];
     splitView.vertical = vertical;
@@ -509,6 +1114,29 @@ static NSString* clip_mode_label(ViewerClipMode mode) {
     splitView.autosaveName = @"";
     splitView.dividerStyle = NSSplitViewDividerStyleThin;
     return splitView;
+}
+
+- (void)layoutViewportSplitsEqually {
+    [self.rootView layoutSubtreeIfNeeded];
+
+    CGFloat horizontalDivider = self.topSplitView.dividerThickness;
+    CGFloat verticalDivider = self.verticalSplitView.dividerThickness;
+    CGFloat topWidth = NSWidth(self.topSplitView.bounds);
+    CGFloat bottomWidth = NSWidth(self.bottomSplitView.bounds);
+    CGFloat verticalHeight = NSHeight(self.verticalSplitView.bounds);
+
+    if (topWidth > horizontalDivider) {
+        CGFloat midTop = floor((topWidth - horizontalDivider) * 0.5);
+        [self.topSplitView setPosition:midTop ofDividerAtIndex:0];
+    }
+    if (bottomWidth > horizontalDivider) {
+        CGFloat midBottom = floor((bottomWidth - horizontalDivider) * 0.5);
+        [self.bottomSplitView setPosition:midBottom ofDividerAtIndex:0];
+    }
+    if (verticalHeight > verticalDivider) {
+        CGFloat midVertical = floor((verticalHeight - verticalDivider) * 0.5);
+        [self.verticalSplitView setPosition:midVertical ofDividerAtIndex:0];
+    }
 }
 
 - (void)buildViewportLayoutWithDevice:(id<MTLDevice>)device {
@@ -564,12 +1192,7 @@ static NSString* clip_mode_label(ViewerClipMode mode) {
         [self.verticalSplitView.bottomAnchor constraintEqualToAnchor:self.rootView.bottomAnchor constant:-12.0],
     ]];
 
-    [self.rootView layoutSubtreeIfNeeded];
-    CGFloat midX = NSWidth(self.rootView.bounds) * 0.5 - self.topSplitView.dividerThickness * 0.5;
-    CGFloat midY = NSHeight(self.rootView.bounds) * 0.5 - self.verticalSplitView.dividerThickness * 0.5;
-    [self.topSplitView setPosition:midX ofDividerAtIndex:0];
-    [self.bottomSplitView setPosition:midX ofDividerAtIndex:0];
-    [self.verticalSplitView setPosition:midY ofDividerAtIndex:0];
+    [self layoutViewportSplitsEqually];
 }
 
 - (void)registerMaterialSymbolsFont {
@@ -2066,13 +2689,91 @@ static NSString* clip_mode_label(ViewerClipMode mode) {
     [self refreshGenericInspector];
 }
 
+- (BOOL)currentMeshContainsMaterialNamed:(NSString*)materialName {
+    if (materialName.length == 0 || self.mesh.faceRanges == NULL) {
+        return NO;
+    }
+
+    for (size_t rangeIndex = 0; rangeIndex < self.mesh.faceRangeCount; ++rangeIndex) {
+        const ViewerFaceRange* range = &self.mesh.faceRanges[rangeIndex];
+        if (strcmp(range->material, materialName.UTF8String) == 0) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+- (void)refreshViewportsFromCurrentMeshClearingMaterialMisses:(BOOL)clearMaterialMisses {
+    for (VmfViewport* viewport in self.viewports) {
+        [viewport updateMesh:&_mesh];
+        if (self.materialsDirectory) {
+            if (clearMaterialMisses) {
+                [viewport clearTextureMissCache];
+            }
+            [viewport setTextureDirectory:self.materialsDirectory];
+        }
+    }
+    [self syncSceneWorldLightsFromScene];
+    [self syncSelectionOverlay];
+    [self updateMaterialBrowser];
+    [self updateWindowTitle];
+    [self updateChrome];
+}
+
+- (void)applyMaterialToCurrentMesh:(NSString*)materialName entityIndex:(size_t)entityIndex solidIndex:(size_t)solidIndex sideIndex:(size_t)sideIndex wholeSolid:(BOOL)wholeSolid {
+    if (materialName.length == 0 || self.mesh.faceRanges == NULL) {
+        return;
+    }
+
+    for (size_t rangeIndex = 0; rangeIndex < self.mesh.faceRangeCount; ++rangeIndex) {
+        ViewerFaceRange* range = &self.mesh.faceRanges[rangeIndex];
+        if (range->entityIndex != entityIndex || range->solidIndex != solidIndex) {
+            continue;
+        }
+        if (!wholeSolid && range->sideIndex != sideIndex) {
+            continue;
+        }
+        snprintf(range->material, sizeof(range->material), "%s", materialName.UTF8String);
+    }
+}
+
+- (void)applyMaterialToCurrentMeshForEntity:(size_t)entityIndex materialName:(NSString*)materialName {
+    if (materialName.length == 0 || self.mesh.faceRanges == NULL) {
+        return;
+    }
+
+    for (size_t rangeIndex = 0; rangeIndex < self.mesh.faceRangeCount; ++rangeIndex) {
+        ViewerFaceRange* range = &self.mesh.faceRanges[rangeIndex];
+        if (range->entityIndex != entityIndex) {
+            continue;
+        }
+        snprintf(range->material, sizeof(range->material), "%s", materialName.UTF8String);
+    }
+}
+
 - (void)commitImmediateLightEditWithEntry:(SceneHistoryEntry*)entry label:(NSString*)label {
     if (!entry) {
         return;
     }
     [self pushUndoEntry:entry];
     [self markDocumentChangedWithLabel:label];
-    [self rebuildMeshFromScene];
+    [self syncSceneWorldLightsFromScene];
+    [self refreshInspector];
+    [self updateWindowTitle];
+    [self updateChrome];
+}
+
+- (void)commitMaterialOnlyEditWithEntry:(SceneHistoryEntry*)entry
+                                 label:(NSString*)label
+                 introducedNewMaterial:(BOOL)introducedNewMaterial {
+    if (!entry) {
+        return;
+    }
+
+    [self pushUndoEntry:entry];
+    [self markDocumentChangedWithLabel:label];
+    [self refreshViewportsFromCurrentMeshClearingMaterialMisses:introducedNewMaterial];
+    [self refreshInspector];
 }
 
 - (void)commitFaceTextureEditWithLabel:(NSString*)label
@@ -2737,6 +3438,7 @@ static NSString* clip_mode_label(ViewerClipMode mode) {
     [self updateHistoryMenuTitles];
     [self updateToolbarLayout];
     self.emptyStateView.hidden = self.hasDocument;
+    self.inspectorPanel.hidden = !self.hasDocument;
     self.saveButton.enabled = self.hasDocument;
     self.undoButton.enabled = self.undoStack.count > 0;
     self.redoButton.enabled = self.redoStack.count > 0;
@@ -2809,6 +3511,18 @@ static NSString* clip_mode_label(ViewerClipMode mode) {
     }
     if (action == @selector(jumpToHistoryState:)) {
         return self.hasDocument;
+    }
+    if (action == @selector(bakePreviewLighting:)) {
+        VmfViewport* viewport = self.activeViewport ? self.activeViewport : self.perspectiveViewport;
+        return self.hasDocument && viewport != nil && viewport.dimension == VmfViewportDimension3D;
+    }
+    if (action == @selector(showLightmapDebugWindow:)) {
+        VmfViewport* viewport = self.activeViewport ? self.activeViewport : self.perspectiveViewport;
+        if (viewport.dimension != VmfViewportDimension3D) {
+            viewport = self.perspectiveViewport;
+        }
+        menuItem.state = (viewport != nil && [viewport isLightmapDebugWindowVisible]) ? NSControlStateValueOn : NSControlStateValueOff;
+        return self.hasDocument && viewport != nil && viewport.dimension == VmfViewportDimension3D;
     }
     return YES;
 }
@@ -2892,7 +3606,7 @@ static NSString* clip_mode_label(ViewerClipMode mode) {
         [self nextDocument:nil];
     } else if ([key isEqualToString:@"p"]) {
         [self previousDocument:nil];
-    } else if ([key isEqualToString:@"f"]) {
+    } else if ([key isEqualToString:@"k"]) {
         [self frameScene:nil];
     } else if ([key isEqualToString:@"r"]) {
         [self reloadDocument:nil];
@@ -3781,6 +4495,24 @@ static NSString* clip_mode_label(ViewerClipMode mode) {
     [self frameAllViewports];
 }
 
+- (void)bakePreviewLighting:(id)sender {
+    (void)sender;
+    VmfViewport* viewport = self.activeViewport ? self.activeViewport : self.perspectiveViewport;
+    if (viewport.dimension != VmfViewportDimension3D) {
+        viewport = self.perspectiveViewport;
+    }
+    [viewport startPreviewLightingBake];
+}
+
+- (void)showLightmapDebugWindow:(id)sender {
+    (void)sender;
+    VmfViewport* viewport = self.activeViewport ? self.activeViewport : self.perspectiveViewport;
+    if (viewport.dimension != VmfViewportDimension3D) {
+        viewport = self.perspectiveViewport;
+    }
+    [viewport setLightmapDebugWindowVisible:YES];
+}
+
 - (void)setEditorTool:(VmfViewportEditorTool)editorTool {
     if (editorTool != VmfViewportEditorToolVertex) {
         // Leaving vertex tool — commit if valid, revert if not.
@@ -4142,6 +4874,7 @@ static NSString* clip_mode_label(ViewerClipMode mode) {
 
     char errorBuffer[256] = { 0 };
     BOOL ok = NO;
+    BOOL introducedNewMaterial = ![self currentMeshContainsMaterialNamed:self.brushMaterialName];
     if ([self selectionActsAsGroupedBrushEntity]) {
         ok = YES;
         const VmfEntity* entity = &self.scene.entities[self.selectedEntityIndex];
@@ -4177,9 +4910,25 @@ static NSString* clip_mode_label(ViewerClipMode mode) {
         return;
     }
 
-    [self pushUndoEntry:entry];
-    [self markDocumentChangedWithLabel:[self selectionActsAsGroupedBrushEntity] ? @"Apply Group Material" : (self.hasFaceSelection ? @"Apply Face Material" : @"Apply Brush Material")];
-    [self rebuildMeshFromScene];
+    if ([self selectionActsAsGroupedBrushEntity]) {
+        [self applyMaterialToCurrentMeshForEntity:self.selectedEntityIndex materialName:self.brushMaterialName];
+    } else if (self.hasFaceSelection) {
+        [self applyMaterialToCurrentMesh:self.brushMaterialName
+                            entityIndex:self.selectedEntityIndex
+                             solidIndex:self.selectedSolidIndex
+                              sideIndex:self.selectedSideIndex
+                             wholeSolid:NO];
+    } else {
+        [self applyMaterialToCurrentMesh:self.brushMaterialName
+                            entityIndex:self.selectedEntityIndex
+                             solidIndex:self.selectedSolidIndex
+                              sideIndex:0
+                             wholeSolid:YES];
+    }
+
+    [self commitMaterialOnlyEditWithEntry:entry
+                                    label:[self selectionActsAsGroupedBrushEntity] ? @"Apply Group Material" : (self.hasFaceSelection ? @"Apply Face Material" : @"Apply Brush Material")
+                    introducedNewMaterial:introducedNewMaterial];
 }
 
 // ---------------------------------------------------------------------------
@@ -4486,6 +5235,7 @@ static NSString* clip_mode_label(ViewerClipMode mode) {
 
 - (void)windowDidResize:(NSNotification*)notification {
     (void)notification;
+    [self layoutViewportSplitsEqually];
     [self updateToolbarLayout];
     [self updateChrome];
 }
@@ -4721,15 +5471,19 @@ static NSString* clip_mode_label(ViewerClipMode mode) {
     }
     SceneHistoryEntry* entry = [self captureHistoryEntry];
     if (!entry) return;
+    BOOL introducedNewMaterial = ![self currentMeshContainsMaterialNamed:self.brushMaterialName];
     if (!vmf_scene_set_side_material(&_scene, entityIndex, solidIndex, sideIndex,
                                       self.brushMaterialName.UTF8String,
                                       errorBuffer, sizeof(errorBuffer))) {
         [self showError:[NSString stringWithUTF8String:errorBuffer]];
         return;
     }
-    [self pushUndoEntry:entry];
-    [self markDocumentChangedWithLabel:@"Paint Face"];
-    [self rebuildMeshFromScene];
+    [self applyMaterialToCurrentMesh:self.brushMaterialName
+                        entityIndex:entityIndex
+                         solidIndex:solidIndex
+                          sideIndex:sideIndex
+                         wholeSolid:NO];
+    [self commitMaterialOnlyEditWithEntry:entry label:@"Paint Face" introducedNewMaterial:introducedNewMaterial];
 }
 
 - (void)viewport:(VmfViewport*)viewport requestPaintAlignRayOrigin:(Vec3)origin direction:(Vec3)direction {

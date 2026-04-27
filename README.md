@@ -28,6 +28,30 @@ make
 
 If no path is passed, use `Cmd+O` from the app to open a file or directory.
 
+## Plugins
+
+Sledgehammer now exposes a public C plugin ABI in `include/sledgehammer_plugin_api.h`.
+
+- On the CMake build, plugins are loaded from `build/bin/plugins` by default.
+- You can override the directory with the `SLEDGEHAMMER_PLUGIN_DIR` environment variable.
+- The app watches the plugins directory and hot-reloads rebuilt `.dylib` files automatically.
+- Reloads are done from a copied runtime image, so recompiling a plugin does not fight with an already loaded binary.
+
+The current API is command-oriented: plugins can register menu commands and use a host service surface for logging, alerts, current document/material/path queries, lightweight editor stats, debug overlay bounds, `Frame Scene`, and mesh rebuilds.
+
+The bundled sample plugin now includes practical commands:
+
+- `Run Practical Diagnostics`: quick map/setup checks (unsaved state, light count, brush complexity, texture directory setup).
+- `Spawn Debug Box` / `Clear Debug Box`: visual overlay checks for plugin-driven viewport annotations.
+
+The root CMake build includes a sample target named `SledgehammerSamplePlugin`. Rebuilding just that target is the intended hot-reload loop during development:
+
+```sh
+cmake --build build --target SledgehammerSamplePlugin
+```
+
+After the build finishes, use the `Plugins` menu inside Sledgehammer to invoke the sample command or trigger a manual reload.
+
 ## Controls
 
 - `Cmd+O`: Open file or directory
@@ -38,7 +62,7 @@ If no path is passed, use `Cmd+O` from the app to open a file or directory.
 - `1`: Set the focused viewport to shaded mode
 - `2`: Set the focused viewport to wireframe mode
 - `R`: Reload current VMF
-- `F`: Frame scene bounds
+- `K`: Frame scene bounds
 - Left drag in perspective: Orbit camera in Source-style `Z-up`
 - Left drag in `XY`, `XZ`, `ZY`: Pan the orthographic viewport
 - Hold right mouse in perspective: Lock and hide the cursor for free-look

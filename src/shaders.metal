@@ -49,7 +49,9 @@ fragment float4 viewerFragment(RasterData in [[stage_in]],
                                texture2d<float> colorTexture [[texture(0)]],
                                sampler textureSampler [[sampler(0)]]) {
     const uint lightEnabled = uniforms.flags.x;
-    const uint useTint = uniforms.flags.y;
+    const uint shadeMode = uniforms.flags.y;
+    const uint useTint = shadeMode == 1u;
+    const uint bakedLightingEnabled = shadeMode == 2u;
     const uint lightingEnabled = uniforms.flags.z;
     const uint useTexture = uniforms.flags.w;
     float3 baseColor;
@@ -74,6 +76,9 @@ fragment float4 viewerFragment(RasterData in [[stage_in]],
         float3 col = in.color;
         baseColor = mix(col, col * 0.72f, pattern * 0.35f);
         alpha = 1.0;
+    }
+    if (bakedLightingEnabled != 0) {
+        return float4(baseColor * in.color, alpha);
     }
     if (lightingEnabled == 0) {
         return float4(baseColor, alpha);

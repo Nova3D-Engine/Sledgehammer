@@ -106,6 +106,9 @@ typedef NS_ENUM(NSUInteger, VmfViewportSelectionEdge) {
 - (void)setTextureDirectory:(NSString*)path;
 - (void)clearTextureMissCache;
 - (void)clearTextureCache;
+- (void)startPreviewLightingBake;
+- (void)setLightmapDebugWindowVisible:(BOOL)visible;
+- (BOOL)isLightmapDebugWindowVisible;
 - (void)frameScene;
 - (void)setMovementForward:(BOOL)forward backward:(BOOL)backward left:(BOOL)left right:(BOOL)right;
 - (void)setSelectionBounds:(Bounds3)bounds visible:(BOOL)visible;
@@ -116,6 +119,7 @@ typedef NS_ENUM(NSUInteger, VmfViewportSelectionEdge) {
 - (void)setHighlightedFaceEntityIndex:(size_t)entityIndex solidIndex:(size_t)solidIndex sideIndex:(size_t)sideIndex visible:(BOOL)visible;
 - (void)setPrimaryLightPosition:(Vec3)position color:(Vec3)color intensity:(float)intensity range:(float)range enabled:(BOOL)enabled;
 - (void)setCreationBounds:(Bounds3)bounds visible:(BOOL)visible;
+- (void)setPluginDebugBounds:(Bounds3)bounds visible:(BOOL)visible;
 - (void)setVertexEditIsInvalid:(BOOL)invalid;
 - (void)setVertexEditPreviewEdges:(const ViewerVertex*)vertices count:(size_t)count;
 - (void)clearVertexEditPreview;
