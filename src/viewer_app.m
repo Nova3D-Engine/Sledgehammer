@@ -10,6 +10,7 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 
 #include "nova_scene_ecs.h"
+#include "gltf_loader.h"
 
 #import "file_index.h"
 #import "sledgehammer_plugin_api.h"
@@ -139,6 +140,17 @@ typedef NS_ENUM(NSUInteger, ViewerClipMode) {
 };
 
 static NSString* const kAppDisplayName = @"Sledgehammer";
+static NSString* const kSledgehammerModelAssetExtension = @"novamodel";
+
+@interface ContentBrowserAssetButton : NSButton
+
+@property(nonatomic, copy) NSString* assetPath;
+
+@end
+
+@implementation ContentBrowserAssetButton
+
+@end
 
 static size_t sledgehammer_copy_utf8_string(NSString* value, char* buffer, size_t buffer_size) {
     const char* utf8 = value.length > 0 ? value.UTF8String : "";
@@ -215,6 +227,7 @@ static NSString* clip_mode_label(ViewerClipMode mode) {
 @property(nonatomic, strong) NSWindow* window;
 @property(nonatomic, strong) NSView* rootView;
 @property(nonatomic, strong) StyledSplitView* verticalSplitView;
+@property(nonatomic, strong) NSLayoutConstraint* verticalSplitBottomConstraint;
 @property(nonatomic, strong) StyledSplitView* topSplitView;
 @property(nonatomic, strong) StyledSplitView* bottomSplitView;
 @property(nonatomic, strong) VmfViewport* topViewport;
@@ -321,6 +334,17 @@ static NSString* clip_mode_label(ViewerClipMode mode) {
 @property(nonatomic, strong) NSTextField* shapeSecondaryValueLabel;
 @property(nonatomic, strong) NSSlider* shapeSecondarySlider;
 @property(nonatomic, strong) NSButton* shapeCollapseButton;
+@property(nonatomic, strong) NSVisualEffectView* contentBrowserPanel;
+@property(nonatomic, strong) NSButton* contentBrowserTabButton;
+@property(nonatomic, strong) NSButton* contentBrowserImportButton;
+@property(nonatomic, strong) NSView* contentBrowserBodyView;
+@property(nonatomic, strong) NSScrollView* contentBrowserScrollView;
+@property(nonatomic, strong) NSView* contentBrowserGridView;
+@property(nonatomic, strong) NSTextField* contentBrowserStatusLabel;
+@property(nonatomic, strong) NSLayoutConstraint* contentBrowserHeightConstraint;
+@property(nonatomic, strong) NSLayoutConstraint* inspectorBottomConstraint;
+@property(nonatomic, strong) NSMutableArray<NSDictionary<NSString*, id>*>* contentBrowserItems;
+@property(nonatomic, assign) BOOL contentBrowserCollapsed;
 @property(nonatomic, strong) NSMutableArray<ProceduralShapePrefab*>* currentPrefabs;
 @property(nonatomic, strong) ProceduralShapePrefab* editingPrefab;
 @property(nonatomic, strong) SceneHistoryEntry* activeShapeSessionEntry;
@@ -361,6 +385,9 @@ static NSString* clip_mode_label(ViewerClipMode mode) {
 - (BOOL)rebuildMeshFromScene;
 - (void)reloadDocument:(id)sender;
 - (void)invokePluginRecord:(SledgehammerLoadedPluginRecord*)plugin commandIndex:(NSUInteger)commandIndex;
+- (void)buildContentBrowserUI;
+- (void)reloadContentBrowser;
+- (void)setContentBrowserCollapsed:(BOOL)collapsed animated:(BOOL)animated;
 
 @end
 
@@ -565,6 +592,8 @@ static bool sledgehammer_plugin_host_get_editor_stats(void* app_context,
     _pluginDirectoryWatchFd = -1;
     _loadedPluginsBySourcePath = [NSMutableDictionary dictionary];
     _pluginCommandTargets = [NSMutableArray array];
+    _contentBrowserItems = [NSMutableArray array];
+    _contentBrowserCollapsed = YES;
     _sceneWorld = nova_scene_world_create();
     if (_sceneWorld != NULL) {
         nova_scene_world_register_editor_tags(_sceneWorld);
@@ -674,6 +703,10 @@ static bool sledgehammer_plugin_host_get_editor_stats(void* app_context,
     [viewMenu addItemWithTitle:@"Frame Scene" action:@selector(frameScene:) keyEquivalent:@"k"];
     [viewMenu addItemWithTitle:@"Bake Preview Lighting (1 Bounce GI)" action:@selector(bakePreviewLighting:) keyEquivalent:@"j"];
     [viewMenu addItemWithTitle:@"Show Lightmap Debug" action:@selector(showLightmapDebugWindow:) keyEquivalent:@""];
+    NSMenuItem* contentBrowserItem = [viewMenu addItemWithTitle:@"Toggle Content Browser" action:@selector(toggleContentBrowser:) keyEquivalent:@"c"];
+    contentBrowserItem.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagOption;
+    NSMenuItem* importModelsItem = [viewMenu addItemWithTitle:@"Import Models To Content Browser..." action:@selector(importModelsToContentBrowser:) keyEquivalent:@"i"];
+    importModelsItem.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagOption;
     [viewMenu addItemWithTitle:@"Next File" action:@selector(nextDocument:) keyEquivalent:@"n"];
     [viewMenu addItemWithTitle:@"Previous File" action:@selector(previousDocument:) keyEquivalent:@"p"];
     [viewItem setSubmenu:viewMenu];
@@ -1185,11 +1218,13 @@ static bool sledgehammer_plugin_host_get_editor_stats(void* app_context,
     [self.verticalSplitView addSubview:self.bottomSplitView];
     [self.rootView addSubview:self.verticalSplitView];
 
+    self.verticalSplitBottomConstraint = [self.verticalSplitView.bottomAnchor constraintEqualToAnchor:self.rootView.bottomAnchor constant:-54.0];
+
     [NSLayoutConstraint activateConstraints:@[
         [self.verticalSplitView.leadingAnchor constraintEqualToAnchor:self.rootView.leadingAnchor constant:80.0],
         [self.verticalSplitView.trailingAnchor constraintEqualToAnchor:self.rootView.trailingAnchor constant:-324.0],
         [self.verticalSplitView.topAnchor constraintEqualToAnchor:self.rootView.topAnchor constant:68.0],
-        [self.verticalSplitView.bottomAnchor constraintEqualToAnchor:self.rootView.bottomAnchor constant:-12.0],
+        self.verticalSplitBottomConstraint,
     ]];
 
     [self layoutViewportSplitsEqually];
@@ -2309,20 +2344,252 @@ static bool sledgehammer_plugin_host_get_editor_stats(void* app_context,
     [self.inspectorStack addArrangedSubview:self.lightInspectorView];
     [self.inspectorStack addArrangedSubview:self.faceTextureInspectorView];
     [self.inspectorStack addArrangedSubview:self.genericInspectorView];
+    [self buildContentBrowserUI];
+
+    self.verticalSplitBottomConstraint.active = NO;
+    self.verticalSplitBottomConstraint = [self.verticalSplitView.bottomAnchor constraintEqualToAnchor:self.contentBrowserPanel.topAnchor constant:-12.0];
+    self.verticalSplitBottomConstraint.active = YES;
 
     [self.inspectorPanel addSubview:self.inspectorStack];
     [self.rootView addSubview:self.inspectorPanel];
 
+    self.inspectorBottomConstraint = [self.inspectorPanel.bottomAnchor constraintEqualToAnchor:self.contentBrowserPanel.topAnchor constant:-12.0];
+
     [NSLayoutConstraint activateConstraints:@[
         [self.inspectorPanel.trailingAnchor constraintEqualToAnchor:self.rootView.trailingAnchor constant:-12.0],
         [self.inspectorPanel.topAnchor constraintEqualToAnchor:self.verticalSplitView.topAnchor],
-        [self.inspectorPanel.bottomAnchor constraintEqualToAnchor:self.verticalSplitView.bottomAnchor],
+        self.inspectorBottomConstraint,
         [self.inspectorPanel.widthAnchor constraintEqualToConstant:300.0],
         [self.inspectorStack.leadingAnchor constraintEqualToAnchor:self.inspectorPanel.leadingAnchor],
         [self.inspectorStack.trailingAnchor constraintEqualToAnchor:self.inspectorPanel.trailingAnchor],
         [self.inspectorStack.topAnchor constraintEqualToAnchor:self.inspectorPanel.topAnchor],
         [self.inspectorStack.bottomAnchor constraintLessThanOrEqualToAnchor:self.inspectorPanel.bottomAnchor],
     ]];
+}
+
+- (void)buildContentBrowserUI {
+    if (self.contentBrowserPanel != nil) {
+        return;
+    }
+
+    self.contentBrowserPanel = [[NSVisualEffectView alloc] initWithFrame:NSZeroRect];
+    self.contentBrowserPanel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.contentBrowserPanel.material = NSVisualEffectMaterialSidebar;
+    self.contentBrowserPanel.blendingMode = NSVisualEffectBlendingModeWithinWindow;
+    self.contentBrowserPanel.state = NSVisualEffectStateActive;
+    self.contentBrowserPanel.wantsLayer = YES;
+    self.contentBrowserPanel.layer.cornerRadius = 8.0;
+    self.contentBrowserPanel.layer.masksToBounds = YES;
+
+    NSStackView* stack = [[NSStackView alloc] initWithFrame:NSZeroRect];
+    stack.translatesAutoresizingMaskIntoConstraints = NO;
+    stack.orientation = NSUserInterfaceLayoutOrientationVertical;
+    stack.alignment = NSLayoutAttributeLeading;
+    stack.spacing = 8.0;
+    stack.edgeInsets = NSEdgeInsetsMake(10.0, 10.0, 10.0, 10.0);
+
+    NSStackView* header = [[NSStackView alloc] initWithFrame:NSZeroRect];
+    header.translatesAutoresizingMaskIntoConstraints = NO;
+    header.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    header.alignment = NSLayoutAttributeCenterY;
+    header.spacing = 8.0;
+
+    self.contentBrowserTabButton = [NSButton buttonWithTitle:@"Content Browser" target:self action:@selector(toggleContentBrowser:)];
+    self.contentBrowserTabButton.translatesAutoresizingMaskIntoConstraints = NO;
+    self.contentBrowserTabButton.bezelStyle = NSBezelStyleTexturedRounded;
+
+    self.contentBrowserImportButton = [NSButton buttonWithTitle:@"Import Models" target:self action:@selector(importModelsToContentBrowser:)];
+    self.contentBrowserImportButton.translatesAutoresizingMaskIntoConstraints = NO;
+    self.contentBrowserImportButton.bezelStyle = NSBezelStyleRounded;
+
+    [header addArrangedSubview:self.contentBrowserTabButton];
+    [header addArrangedSubview:self.contentBrowserImportButton];
+
+    self.contentBrowserBodyView = [[NSView alloc] initWithFrame:NSZeroRect];
+    self.contentBrowserBodyView.translatesAutoresizingMaskIntoConstraints = NO;
+
+    self.contentBrowserStatusLabel = [NSTextField labelWithString:@"No imported model assets yet."];
+    self.contentBrowserStatusLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.contentBrowserStatusLabel.font = [NSFont systemFontOfSize:11.0 weight:NSFontWeightRegular];
+    self.contentBrowserStatusLabel.textColor = [NSColor secondaryLabelColor];
+    self.contentBrowserStatusLabel.maximumNumberOfLines = 2;
+
+    self.contentBrowserGridView = [[NSView alloc] initWithFrame:NSZeroRect];
+    self.contentBrowserGridView.translatesAutoresizingMaskIntoConstraints = NO;
+
+    self.contentBrowserScrollView = [[NSScrollView alloc] initWithFrame:NSZeroRect];
+    self.contentBrowserScrollView.translatesAutoresizingMaskIntoConstraints = NO;
+    self.contentBrowserScrollView.hasVerticalScroller = YES;
+    self.contentBrowserScrollView.borderType = NSNoBorder;
+    self.contentBrowserScrollView.drawsBackground = NO;
+    self.contentBrowserScrollView.documentView = self.contentBrowserGridView;
+
+    [self.contentBrowserBodyView addSubview:self.contentBrowserStatusLabel];
+    [self.contentBrowserBodyView addSubview:self.contentBrowserScrollView];
+    [self.contentBrowserPanel addSubview:stack];
+    [stack addArrangedSubview:header];
+    [stack addArrangedSubview:self.contentBrowserBodyView];
+
+    [self.rootView addSubview:self.contentBrowserPanel];
+
+    self.contentBrowserHeightConstraint = [self.contentBrowserPanel.heightAnchor constraintEqualToConstant:42.0];
+    self.contentBrowserHeightConstraint.active = YES;
+    self.contentBrowserBodyView.hidden = YES;
+    self.contentBrowserBodyView.alphaValue = 0.0;
+
+    [NSLayoutConstraint activateConstraints:@[
+        [self.contentBrowserPanel.leadingAnchor constraintEqualToAnchor:self.rootView.leadingAnchor constant:80.0],
+        [self.contentBrowserPanel.trailingAnchor constraintEqualToAnchor:self.rootView.trailingAnchor constant:-12.0],
+        [self.contentBrowserPanel.bottomAnchor constraintEqualToAnchor:self.rootView.bottomAnchor constant:-12.0],
+        [stack.leadingAnchor constraintEqualToAnchor:self.contentBrowserPanel.leadingAnchor],
+        [stack.trailingAnchor constraintEqualToAnchor:self.contentBrowserPanel.trailingAnchor],
+        [stack.topAnchor constraintEqualToAnchor:self.contentBrowserPanel.topAnchor],
+        [stack.bottomAnchor constraintEqualToAnchor:self.contentBrowserPanel.bottomAnchor],
+        [self.contentBrowserBodyView.widthAnchor constraintEqualToConstant:260.0],
+        [self.contentBrowserStatusLabel.leadingAnchor constraintEqualToAnchor:self.contentBrowserBodyView.leadingAnchor],
+        [self.contentBrowserStatusLabel.trailingAnchor constraintEqualToAnchor:self.contentBrowserBodyView.trailingAnchor],
+        [self.contentBrowserStatusLabel.topAnchor constraintEqualToAnchor:self.contentBrowserBodyView.topAnchor],
+        [self.contentBrowserScrollView.leadingAnchor constraintEqualToAnchor:self.contentBrowserBodyView.leadingAnchor],
+        [self.contentBrowserScrollView.trailingAnchor constraintEqualToAnchor:self.contentBrowserBodyView.trailingAnchor],
+        [self.contentBrowserScrollView.topAnchor constraintEqualToAnchor:self.contentBrowserStatusLabel.bottomAnchor constant:8.0],
+        [self.contentBrowserScrollView.bottomAnchor constraintEqualToAnchor:self.contentBrowserBodyView.bottomAnchor],
+        [self.contentBrowserScrollView.heightAnchor constraintEqualToConstant:240.0],
+    ]];
+
+    [self reloadContentBrowser];
+}
+
+- (void)setContentBrowserCollapsed:(BOOL)collapsed animated:(BOOL)animated {
+    _contentBrowserCollapsed = collapsed;
+
+    CGFloat targetHeight = self.hasDocument ? (collapsed ? 42.0 : 330.0) : 0.0;
+    if (!self.hasDocument) {
+        self.contentBrowserPanel.hidden = YES;
+    } else {
+        self.contentBrowserPanel.hidden = NO;
+    }
+
+    if (!collapsed) {
+        self.contentBrowserBodyView.hidden = NO;
+    }
+
+    void (^apply_state)(BOOL) = ^(BOOL useAnimator) {
+        if (useAnimator) {
+            self.contentBrowserHeightConstraint.animator.constant = targetHeight;
+            self.contentBrowserBodyView.animator.alphaValue = collapsed ? 0.0 : 1.0;
+        } else {
+            self.contentBrowserHeightConstraint.constant = targetHeight;
+            self.contentBrowserBodyView.alphaValue = collapsed ? 0.0 : 1.0;
+        }
+    };
+
+    if (animated && self.hasDocument) {
+        [self.rootView layoutSubtreeIfNeeded];
+        [NSAnimationContext runAnimationGroup:^(NSAnimationContext* context) {
+            context.duration = 0.22;
+            apply_state(YES);
+            [self.rootView layoutSubtreeIfNeeded];
+        } completionHandler:^{
+            self.contentBrowserBodyView.hidden = collapsed;
+            self.contentBrowserPanel.hidden = !self.hasDocument;
+        }];
+    } else {
+        apply_state(NO);
+        self.contentBrowserBodyView.hidden = collapsed || !self.hasDocument;
+    }
+}
+
+- (NSString*)contentBrowserRootDirectory {
+    NSString* executableDir = [NSBundle.mainBundle.executablePath stringByDeletingLastPathComponent];
+    return [[executableDir stringByAppendingPathComponent:@"content"] stringByAppendingPathComponent:@"models"];
+}
+
+- (void)reloadContentBrowser {
+    [self.contentBrowserItems removeAllObjects];
+
+    NSString* modelsDirectory = [self contentBrowserRootDirectory];
+    BOOL isDirectory = NO;
+    NSFileManager* fileManager = [NSFileManager defaultManager];
+    if (![fileManager fileExistsAtPath:modelsDirectory isDirectory:&isDirectory] || !isDirectory) {
+        [fileManager createDirectoryAtPath:modelsDirectory withIntermediateDirectories:YES attributes:nil error:nil];
+    }
+
+    NSArray<NSString*>* entries = [fileManager contentsOfDirectoryAtPath:modelsDirectory error:nil];
+    NSArray<NSString*>* sortedEntries = [entries sortedArrayUsingSelector:@selector(localizedStandardCompare:)];
+    for (NSString* entry in sortedEntries) {
+        if (![entry.pathExtension.lowercaseString isEqualToString:kSledgehammerModelAssetExtension]) {
+            continue;
+        }
+        NSString* fullPath = [modelsDirectory stringByAppendingPathComponent:entry];
+        [self.contentBrowserItems addObject:@{ @"name": entry.stringByDeletingPathExtension, @"path": fullPath }];
+    }
+
+    for (NSView* subview in self.contentBrowserGridView.subviews.copy) {
+        [subview removeFromSuperview];
+    }
+
+    CGFloat itemWidth = 116.0;
+    CGFloat itemHeight = 132.0;
+    CGFloat spacing = 10.0;
+    NSInteger columnCount = 2;
+    [self.contentBrowserItems enumerateObjectsUsingBlock:^(NSDictionary<NSString*, id>* item, NSUInteger index, BOOL* stop) {
+        (void)stop;
+        NSInteger row = (NSInteger)index / columnCount;
+        NSInteger column = (NSInteger)index % columnCount;
+        NSRect frame = NSMakeRect((itemWidth + spacing) * column,
+                                  (itemHeight + spacing) * row,
+                                  itemWidth,
+                                  itemHeight);
+        ContentBrowserAssetButton* button = [[ContentBrowserAssetButton alloc] initWithFrame:frame];
+        button.assetPath = item[@"path"];
+        button.title = item[@"name"];
+        button.imagePosition = NSImageAbove;
+        button.bezelStyle = NSBezelStyleTexturedRounded;
+        button.imageScaling = NSImageScaleProportionallyUpOrDown;
+        button.target = nil;
+        [self.contentBrowserGridView addSubview:button];
+    }];
+
+    NSInteger rowCount = (NSInteger)((self.contentBrowserItems.count + (NSUInteger)columnCount - 1u) / (NSUInteger)columnCount);
+    self.contentBrowserGridView.frame = NSMakeRect(0.0, 0.0, columnCount * itemWidth + (columnCount - 1) * spacing, MAX(1.0, rowCount * itemHeight + MAX(0, rowCount - 1) * spacing));
+    self.contentBrowserStatusLabel.stringValue = self.contentBrowserItems.count > 0
+        ? [NSString stringWithFormat:@"%zu model assets", (size_t)self.contentBrowserItems.count]
+        : @"No imported model assets yet.";
+}
+
+- (void)toggleContentBrowser:(id)sender {
+    (void)sender;
+    [self setContentBrowserCollapsed:!self.contentBrowserCollapsed animated:YES];
+    [self.contentBrowserTabButton setTitle:self.contentBrowserCollapsed ? @"Content Browser" : @"Content Browser"];
+    [self updateChrome];
+}
+
+- (void)importModelsToContentBrowser:(id)sender {
+    (void)sender;
+    NSOpenPanel* panel = [NSOpenPanel openPanel];
+    panel.canChooseFiles = YES;
+    panel.canChooseDirectories = NO;
+    panel.allowsMultipleSelection = YES;
+    panel.allowedContentTypes = @[
+        [UTType typeWithFilenameExtension:@"gltf"],
+        [UTType typeWithFilenameExtension:@"glb"],
+        [UTType typeWithFilenameExtension:@"obj"],
+    ];
+    [panel beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse response) {
+        if (response != NSModalResponseOK) {
+            return;
+        }
+        NSFileManager* fileManager = [NSFileManager defaultManager];
+        NSString* modelsDirectory = [self contentBrowserRootDirectory];
+        [fileManager createDirectoryAtPath:modelsDirectory withIntermediateDirectories:YES attributes:nil error:nil];
+        for (NSURL* url in panel.URLs) {
+            NSString* targetPath = [[modelsDirectory stringByAppendingPathComponent:url.lastPathComponent.stringByDeletingPathExtension] stringByAppendingPathExtension:kSledgehammerModelAssetExtension];
+            NSData* placeholder = [NSData dataWithBytes:"SMDL" length:4u];
+            [placeholder writeToFile:targetPath atomically:YES];
+        }
+        [self setContentBrowserCollapsed:NO animated:YES];
+        [self reloadContentBrowser];
+    }];
 }
 
 - (BOOL)applyShapeTool:(VmfViewportEditorTool)tool
@@ -3439,6 +3706,11 @@ static bool sledgehammer_plugin_host_get_editor_stats(void* app_context,
     [self updateToolbarLayout];
     self.emptyStateView.hidden = self.hasDocument;
     self.inspectorPanel.hidden = !self.hasDocument;
+    self.contentBrowserPanel.hidden = !self.hasDocument;
+    self.contentBrowserImportButton.enabled = self.hasDocument;
+    self.contentBrowserBodyView.hidden = self.contentBrowserCollapsed || !self.hasDocument;
+    self.contentBrowserBodyView.alphaValue = self.contentBrowserCollapsed || !self.hasDocument ? 0.0 : 1.0;
+    self.contentBrowserHeightConstraint.constant = self.hasDocument ? (self.contentBrowserCollapsed ? 42.0 : 330.0) : 0.0;
     self.saveButton.enabled = self.hasDocument;
     self.undoButton.enabled = self.undoStack.count > 0;
     self.redoButton.enabled = self.redoStack.count > 0;
@@ -3523,6 +3795,13 @@ static bool sledgehammer_plugin_host_get_editor_stats(void* app_context,
         }
         menuItem.state = (viewport != nil && [viewport isLightmapDebugWindowVisible]) ? NSControlStateValueOn : NSControlStateValueOff;
         return self.hasDocument && viewport != nil && viewport.dimension == VmfViewportDimension3D;
+    }
+    if (action == @selector(toggleContentBrowser:)) {
+        menuItem.state = self.contentBrowserCollapsed ? NSControlStateValueOff : NSControlStateValueOn;
+        return self.hasDocument;
+    }
+    if (action == @selector(importModelsToContentBrowser:)) {
+        return self.hasDocument;
     }
     return YES;
 }
