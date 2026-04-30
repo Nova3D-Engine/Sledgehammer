@@ -117,6 +117,8 @@ typedef struct HwrtBakeTexelAccum {
     simd_float4 worldPosWeight;
     simd_float4 normalSum;
     simd_float4 albedoSum;
+    uint32_t sourceTriangleIdPlusOne;
+    uint32_t padding[3];
 } HwrtBakeTexelAccum;
 
 typedef struct HwrtPathTraceVertex {
@@ -1622,6 +1624,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
 @property(nonatomic, strong) NSPanel* previewBakePanel;
 @property(nonatomic, strong) NSTextField* previewBakeMapCountLabel;
 @property(nonatomic, strong) NSTextField* previewBakeStatusLabel;
+@property(nonatomic, strong) NSProgressIndicator* previewBakeProgressIndicator;
 @property(nonatomic, strong) NSSlider* previewBakeExposureSlider;
 @property(nonatomic, strong) NSTextField* previewBakeExposureValueLabel;
 @property(nonatomic, strong) NSSlider* previewBakeBatchSppSlider;
@@ -1639,6 +1642,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
 @property(nonatomic, strong) NSPopUpButton* previewBakeMapPopUp;
 @property(nonatomic, strong) NSImageView* previewBakeImageView;
 @property(nonatomic, strong) NSTextField* previewBakeImageInfoLabel;
+@property(nonatomic, strong) NSButton* previewBakeRebakeButton;
 @property(nonatomic, assign) float previewBakeDebugExposure;
 @property(nonatomic, assign) uint32_t previewBakeRtSamplesPerTexel;
 @property(nonatomic, assign) uint32_t previewBakeTargetSamplesPerTexel;
@@ -1647,9 +1651,12 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
 @property(nonatomic, assign) float previewBakeDiffuseBounceIntensity;
 @property(nonatomic, assign) int previewBakeDensity;
 @property(nonatomic, assign) uint32_t previewBakeAccumulatedSamplesPerTexel;
+@property(nonatomic, assign) uint32_t previewBakeRunningTargetSamplesPerTexel;
+@property(nonatomic, assign) uint32_t previewBakeRunningBounceCount;
 @property(nonatomic, assign) int previewBakeDisplayMode;
 @property(nonatomic, assign) BOOL previewBakePauseRequested;
 @property(nonatomic, assign) BOOL previewBakeCancelRequested;
+@property(nonatomic, assign) BOOL previewBakeRestartQueued;
 @property(nonatomic, strong) id<MTLComputePipelineState> hwrtBakePipeline;
 @property(nonatomic, copy) NSString* textureDirectory;
 @property(nonatomic, assign) NovaToolMetalEditorViewportRenderer metalRenderer;
@@ -1666,6 +1673,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
 @property(nonatomic, assign) BOOL orbitLerpActive;
 @property(nonatomic, assign) BOOL previewBakeInProgress;
 @property(nonatomic, assign) BOOL previewBakedLightingEnabled;
+@property(nonatomic, assign) uint64_t previewBakeGeneration;
 @property(nonatomic, assign) uint64_t meshRevision;
 
 @end
@@ -1830,11 +1838,15 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     _previewBakeDiffuseBounceIntensity = 1.0f;
     _previewBakeDensity = kPreviewBakeDensityDefault;
     _previewBakeAccumulatedSamplesPerTexel = 0u;
+    _previewBakeRunningTargetSamplesPerTexel = 0u;
+    _previewBakeRunningBounceCount = 0u;
     _previewBakeDisplayMode = kPreviewBakeDisplayModeCombined;
     _previewBakePauseRequested = NO;
     _previewBakeCancelRequested = NO;
+    _previewBakeRestartQueued = NO;
     _previewBakeInProgress = NO;
     _previewBakedLightingEnabled = NO;
+    _previewBakeGeneration = 0u;
     _fullRendererUiState.previewBakeLightingEnabled = 0;
     _fullRendererUiState.previewBakeDisplayMode = kPreviewBakeDisplayModeCombined;
     _meshRevision = 1u;
@@ -2103,6 +2115,13 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         return;
     }
 
+    BOOL panelLocked = self.previewBakeInProgress;
+    uint32_t activeTargetSamples = panelLocked ? self.previewBakeRunningTargetSamplesPerTexel : self.previewBakeTargetSamplesPerTexel;
+    uint32_t activeBounceCount = panelLocked ? self.previewBakeRunningBounceCount : self.previewBakeBounceCount;
+    if (activeTargetSamples == 0u) {
+        activeTargetSamples = self.previewBakeTargetSamplesPerTexel > 0u ? self.previewBakeTargetSamplesPerTexel : 1u;
+    }
+
     NSArray<NSString*>* keys = [self previewBakeOrderedKeys];
     NSUInteger atlasTileCount = keys.count;
     double atlasUsedPixels = 0.0;
@@ -2130,10 +2149,11 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                                                  atlasFillPercent,
                                                  atlasWastePercent];
     if (self.previewBakeInProgress) {
-        self.previewBakeStatusLabel.stringValue = [NSString stringWithFormat:@"Running %u / %u spp, %u bounces",
+        self.previewBakeStatusLabel.stringValue = [NSString stringWithFormat:@"Running %u / %u spp, %u bounces%@",
                                                     self.previewBakeAccumulatedSamplesPerTexel,
-                                                    self.previewBakeTargetSamplesPerTexel,
-                                                    self.previewBakeBounceCount];
+                                                    activeTargetSamples,
+                                                    activeBounceCount,
+                                                    self.previewBakeRestartQueued ? @"\nRestart queued after current batch" : @""];
     } else if (keys.count > 0) {
         self.previewBakeStatusLabel.stringValue = [NSString stringWithFormat:@"Ready, %u target spp, %u bounces",
                                                     self.previewBakeTargetSamplesPerTexel,
@@ -2144,6 +2164,12 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
 
     self.previewBakeExposureSlider.floatValue = fminf(kPreviewBakeDebugExposureMax, fmaxf(kPreviewBakeDebugExposureMin, self.previewBakeDebugExposure));
     self.previewBakeExposureValueLabel.stringValue = [NSString stringWithFormat:@"%.3fx", self.previewBakeDebugExposure];
+    self.previewBakeProgressIndicator.hidden = !panelLocked;
+    self.previewBakeProgressIndicator.indeterminate = NO;
+    self.previewBakeProgressIndicator.minValue = 0.0;
+    self.previewBakeProgressIndicator.maxValue = (double)activeTargetSamples;
+    self.previewBakeProgressIndicator.doubleValue = fmin((double)self.previewBakeAccumulatedSamplesPerTexel, (double)activeTargetSamples);
+    self.previewBakeExposureSlider.enabled = !panelLocked;
 
     int batchMin = viewport_preview_bake_power_of_two_exponent(kPreviewBakeRtSamplesPerTexelMin, kPreviewBakeRtSamplesPerTexelMin, kPreviewBakeRtSamplesPerTexelMax);
     int batchMax = viewport_preview_bake_power_of_two_exponent(kPreviewBakeRtSamplesPerTexelMax, kPreviewBakeRtSamplesPerTexelMin, kPreviewBakeRtSamplesPerTexelMax);
@@ -2152,6 +2178,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     self.previewBakeBatchSppSlider.maxValue = (double)batchMax;
     self.previewBakeBatchSppSlider.intValue = batchExp;
     self.previewBakeBatchSppValueLabel.stringValue = [NSString stringWithFormat:@"2^%d = %u spp", batchExp, self.previewBakeRtSamplesPerTexel];
+    self.previewBakeBatchSppSlider.enabled = !panelLocked;
 
     int targetMin = viewport_preview_bake_power_of_two_exponent(kPreviewBakeTargetSamplesPerTexelMin, kPreviewBakeTargetSamplesPerTexelMin, kPreviewBakeTargetSamplesPerTexelMax);
     int targetMax = viewport_preview_bake_power_of_two_exponent(kPreviewBakeTargetSamplesPerTexelMax, kPreviewBakeTargetSamplesPerTexelMin, kPreviewBakeTargetSamplesPerTexelMax);
@@ -2160,19 +2187,24 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     self.previewBakeTargetSppSlider.maxValue = (double)targetMax;
     self.previewBakeTargetSppSlider.intValue = targetExp;
     self.previewBakeTargetSppValueLabel.stringValue = [NSString stringWithFormat:@"2^%d = %u spp", targetExp, self.previewBakeTargetSamplesPerTexel];
+    self.previewBakeTargetSppSlider.enabled = !panelLocked;
 
     self.previewBakeBounceSlider.intValue = (int)self.previewBakeBounceCount;
     self.previewBakeBounceValueLabel.stringValue = [NSString stringWithFormat:@"%u bounces", self.previewBakeBounceCount];
+    self.previewBakeBounceSlider.enabled = !panelLocked;
 
     self.previewBakeSkyBrightnessSlider.floatValue = self.previewBakeSkyBrightness;
     self.previewBakeSkyBrightnessValueLabel.stringValue = [NSString stringWithFormat:@"%.2fx", self.previewBakeSkyBrightness];
+    self.previewBakeSkyBrightnessSlider.enabled = !panelLocked;
 
     self.previewBakeDiffuseBounceSlider.floatValue = self.previewBakeDiffuseBounceIntensity;
     self.previewBakeDiffuseBounceValueLabel.stringValue = [NSString stringWithFormat:@"%.2fx", self.previewBakeDiffuseBounceIntensity];
+    self.previewBakeDiffuseBounceSlider.enabled = !panelLocked;
 
     int density = (int)fmin((double)kPreviewBakeDensityMax, fmax((double)kPreviewBakeDensityMin, (double)self.previewBakeDensity));
     self.previewBakeDensitySlider.intValue = density;
     self.previewBakeDensityValueLabel.stringValue = [NSString stringWithFormat:@"%d px / unit", density];
+    self.previewBakeDensitySlider.enabled = !panelLocked;
 
     [self.previewBakeMapPopUp removeAllItems];
     if (keys.count > 0) {
@@ -2181,7 +2213,9 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     } else {
         [self.previewBakeMapPopUp addItemWithTitle:@"No baked maps"]; 
     }
-    self.previewBakeMapPopUp.enabled = keys.count > 0;
+    self.previewBakeMapPopUp.enabled = keys.count > 0 && !panelLocked;
+    self.previewBakeRebakeButton.enabled = !panelLocked;
+    self.previewBakeRebakeButton.title = panelLocked ? @"Bake Running..." : @"Rebake Preview";
 
     NSString* selectedKey = self.previewBakeDebugSelectedKey;
     NSDictionary<NSString*, id>* info = selectedKey.length > 0 ? self.previewBakedLightmaps[selectedKey] : nil;
@@ -2207,6 +2241,25 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     } else {
         self.previewBakeImageInfoLabel.stringValue = @"Select a baked map to inspect it.";
     }
+}
+
+- (BOOL)previewBakeControlChangesBakeSettings:(id)sender {
+    return sender == self.previewBakeBatchSppSlider ||
+           sender == self.previewBakeTargetSppSlider ||
+           sender == self.previewBakeBounceSlider ||
+           sender == self.previewBakeSkyBrightnessSlider ||
+           sender == self.previewBakeDiffuseBounceSlider ||
+           sender == self.previewBakeDensitySlider;
+}
+
+- (void)requestPreviewLightingBakeRestart {
+    if (self.previewBakeInProgress) {
+        self.previewBakeRestartQueued = YES;
+        self.previewBakeCancelRequested = YES;
+        [self syncPreviewBakePanel];
+        return;
+    }
+    [self startPreviewLightingBake];
 }
 
 - (void)previewBakePanelControlChanged:(id)sender {
@@ -2237,13 +2290,18 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         self.previewBakeDebugSelectedKey = self.previewBakeMapPopUp.selectedItem.title ?: @"";
     }
 
+    if ([self previewBakeControlChangesBakeSettings:sender] && self.previewBakeInProgress) {
+        self.previewBakeRestartQueued = YES;
+        self.previewBakeCancelRequested = YES;
+    }
+
     [self syncPreviewBakePanel];
     [self.metalView setNeedsDisplay:YES];
 }
 
 - (void)previewBakePanelRebake:(id)sender {
     (void)sender;
-    [self startPreviewLightingBake];
+    [self requestPreviewLightingBakeRestart];
     [self syncPreviewBakePanel];
 }
 
@@ -2295,9 +2353,18 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
 
     self.previewBakeMapCountLabel = makeLabel(@"Baked maps: 0", [NSFont systemFontOfSize:13.0 weight:NSFontWeightSemibold], nil);
     self.previewBakeStatusLabel = makeLabel(@"No baked lightmaps yet.", [NSFont systemFontOfSize:12.0 weight:NSFontWeightRegular], NSColor.secondaryLabelColor);
-    self.previewBakeStatusLabel.maximumNumberOfLines = 2;
+    self.previewBakeStatusLabel.maximumNumberOfLines = 3;
+    self.previewBakeProgressIndicator = [[NSProgressIndicator alloc] initWithFrame:NSZeroRect];
+    self.previewBakeProgressIndicator.translatesAutoresizingMaskIntoConstraints = NO;
+    self.previewBakeProgressIndicator.indeterminate = NO;
+    self.previewBakeProgressIndicator.minValue = 0.0;
+    self.previewBakeProgressIndicator.maxValue = 1.0;
+    self.previewBakeProgressIndicator.doubleValue = 0.0;
+    self.previewBakeProgressIndicator.hidden = YES;
+    [self.previewBakeProgressIndicator.widthAnchor constraintEqualToConstant:460.0].active = YES;
     [root addArrangedSubview:self.previewBakeMapCountLabel];
     [root addArrangedSubview:self.previewBakeStatusLabel];
+    [root addArrangedSubview:self.previewBakeProgressIndicator];
 
     NSStackView* (^makeRow)(NSString*, NSSlider* __strong*, NSTextField* __strong*) = ^NSStackView*(NSString* title, NSSlider* __strong* outSlider, NSTextField* __strong* outValue) {
         NSStackView* section = [[NSStackView alloc] initWithFrame:NSZeroRect];
@@ -2375,9 +2442,9 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     [self.previewBakeImageInfoLabel.widthAnchor constraintEqualToConstant:460.0].active = YES;
     [root addArrangedSubview:self.previewBakeImageInfoLabel];
 
-    NSButton* rebakeButton = [NSButton buttonWithTitle:@"Rebake Preview" target:self action:@selector(previewBakePanelRebake:)];
-    rebakeButton.translatesAutoresizingMaskIntoConstraints = NO;
-    [root addArrangedSubview:rebakeButton];
+    self.previewBakeRebakeButton = [NSButton buttonWithTitle:@"Rebake Preview" target:self action:@selector(previewBakePanelRebake:)];
+    self.previewBakeRebakeButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [root addArrangedSubview:self.previewBakeRebakeButton];
 
     [NSLayoutConstraint activateConstraints:@[
         [root.leadingAnchor constraintEqualToAnchor:content.leadingAnchor],
@@ -3041,7 +3108,10 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     self.previewBakeInProgress = NO;
     self.previewBakePauseRequested = NO;
     self.previewBakeCancelRequested = NO;
+    self.previewBakeRestartQueued = NO;
     self.previewBakeAccumulatedSamplesPerTexel = 0u;
+    self.previewBakeRunningTargetSamplesPerTexel = 0u;
+    self.previewBakeRunningBounceCount = 0u;
     self.previewBakedLightingEnabled = NO;
     _fullRendererUiState.previewBakeLightingEnabled = 0;
     [self.previewBakedLightmaps removeAllObjects];
@@ -3174,6 +3244,12 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     uint64_t revision;
     UiGizmoState uiStateSnapshot;
     uint32_t targetSamplesPerTexel;
+    uint32_t batchSamplesPerTexel;
+    uint32_t bounceCount;
+    int bakeDensity;
+    float skyBrightness;
+    float diffuseBounceIntensity;
+    uint64_t bakeGeneration;
 
     if (self.previewBakeInProgress ||
         self.dimension != VmfViewportDimension3D ||
@@ -3214,11 +3290,24 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                                        &lightEnabled);
     uiStateSnapshot = _fullRendererUiState;
     targetSamplesPerTexel = self.previewBakeTargetSamplesPerTexel;
+    batchSamplesPerTexel = self.previewBakeRtSamplesPerTexel;
+    bounceCount = self.previewBakeBounceCount;
+    bakeDensity = self.previewBakeDensity;
+    skyBrightness = self.previewBakeSkyBrightness;
+    diffuseBounceIntensity = self.previewBakeDiffuseBounceIntensity;
     revision = self.meshRevision;
+    bakeGeneration = self.previewBakeGeneration + 1u;
+    self.previewBakeGeneration = bakeGeneration;
 
     self.previewBakeInProgress = YES;
+    self.previewBakePauseRequested = NO;
+    self.previewBakeCancelRequested = NO;
+    self.previewBakeRestartQueued = NO;
     self.previewBakeAccumulatedSamplesPerTexel = 0u;
+    self.previewBakeRunningTargetSamplesPerTexel = targetSamplesPerTexel;
+    self.previewBakeRunningBounceCount = bounceCount;
     NSLog(@"[lighting] HWRT preview bake started (%zu vertices, %zu faces, texel tracing + 1-bounce GI)", vertexCount, faceRangeCount);
+    [self syncPreviewBakePanel];
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSMutableDictionary<NSString*, NSNumber*>* brushSlotByKey = [NSMutableDictionary dictionary];
@@ -3258,10 +3347,14 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         uint32_t totalTriangles = 0u;
         uint32_t processedTriangles = 0u;
         int lastPercent = -1;
+        BOOL bakeCanceled = NO;
 
         if (!self.device.supportsRaytracing) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.previewBakeInProgress = NO;
+                self.previewBakeRunningTargetSamplesPerTexel = 0u;
+                self.previewBakeRunningBounceCount = 0u;
+                [self syncPreviewBakePanel];
                 NSLog(@"[lighting] HWRT preview bake unavailable: current Metal device does not support ray tracing");
             });
             free(verticesSnapshot);
@@ -3274,6 +3367,9 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         if (bakePipeline == nil) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.previewBakeInProgress = NO;
+                self.previewBakeRunningTargetSamplesPerTexel = 0u;
+                self.previewBakeRunningBounceCount = 0u;
+                [self syncPreviewBakePanel];
                 NSLog(@"[lighting] HWRT preview bake failed: compute pipeline is unavailable");
             });
             free(verticesSnapshot);
@@ -3290,6 +3386,9 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
             if (bakeLightsBuffer == nil) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     self.previewBakeInProgress = NO;
+                    self.previewBakeRunningTargetSamplesPerTexel = 0u;
+                    self.previewBakeRunningBounceCount = 0u;
+                    [self syncPreviewBakePanel];
                     NSLog(@"[lighting] HWRT preview bake failed to allocate bake light buffer");
                 });
                 free(verticesSnapshot);
@@ -3404,6 +3503,9 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         if (rtBakeVertices == NULL || rtBakePositions == NULL) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.previewBakeInProgress = NO;
+                self.previewBakeRunningTargetSamplesPerTexel = 0u;
+                self.previewBakeRunningBounceCount = 0u;
+                [self syncPreviewBakePanel];
                 NSLog(@"[lighting] HWRT preview bake failed to allocate filtered bake geometry arrays");
             });
             free(rtBakeVertices);
@@ -3459,6 +3561,9 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         if (rtBakeVertexCount < 3u) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.previewBakeInProgress = NO;
+                self.previewBakeRunningTargetSamplesPerTexel = 0u;
+                self.previewBakeRunningBounceCount = 0u;
+                [self syncPreviewBakePanel];
                 NSLog(@"[lighting] HWRT preview bake aborted: no bakeable world triangles after filtering helper geometry");
             });
             free(rtBakeVertices);
@@ -3480,6 +3585,9 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         if (pathTraceVertices == nil || rtVertexPositions == nil) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.previewBakeInProgress = NO;
+                self.previewBakeRunningTargetSamplesPerTexel = 0u;
+                self.previewBakeRunningBounceCount = 0u;
+                [self syncPreviewBakePanel];
                 NSLog(@"[lighting] HWRT preview bake failed to allocate filtered geometry buffers");
             });
             free(verticesSnapshot);
@@ -3506,6 +3614,9 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
             if (accelerationStructure == nil || asScratch == nil) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     self.previewBakeInProgress = NO;
+                    self.previewBakeRunningTargetSamplesPerTexel = 0u;
+                    self.previewBakeRunningBounceCount = 0u;
+                    [self syncPreviewBakePanel];
                     NSLog(@"[lighting] HWRT preview bake failed to allocate acceleration structure resources");
                 });
                 free(verticesSnapshot);
@@ -3519,6 +3630,9 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
             if (asBuildCommand == nil || asEncoder == nil) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     self.previewBakeInProgress = NO;
+                    self.previewBakeRunningTargetSamplesPerTexel = 0u;
+                    self.previewBakeRunningBounceCount = 0u;
+                    [self syncPreviewBakePanel];
                     NSLog(@"[lighting] HWRT preview bake failed to create acceleration structure encoder");
                 });
                 free(verticesSnapshot);
@@ -3534,6 +3648,9 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
             if (asBuildCommand.status != MTLCommandBufferStatusCompleted) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     self.previewBakeInProgress = NO;
+                    self.previewBakeRunningTargetSamplesPerTexel = 0u;
+                    self.previewBakeRunningBounceCount = 0u;
+                    [self syncPreviewBakePanel];
                     NSLog(@"[lighting] HWRT preview bake failed while building acceleration structure");
                 });
                 free(verticesSnapshot);
@@ -3613,7 +3730,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
 
             slotValue = brushSlotByKey[brushKey];
             if (slotValue == nil) {
-                int resolution = (int)fmin((double)kPreviewBakeDensityMax, fmax((double)kPreviewBakeDensityMin, (double)self.previewBakeDensity));
+                int resolution = (int)fmin((double)kPreviewBakeDensityMax, fmax((double)kPreviewBakeDensityMin, (double)bakeDensity));
                 int chartWidth = kPreviewBakeMinResolution;
                 int chartHeight = kPreviewBakeMinResolution;
                 viewport_preview_bake_chart_size_for_range(verticesSnapshot, range, resolution, &chartWidth, &chartHeight);
@@ -3641,18 +3758,19 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                 const Vec3 a0 = baseColorSnapshot[range.vertexStart + triOffset + 0u];
                 const Vec3 a1 = baseColorSnapshot[range.vertexStart + triOffset + 1u];
                 const Vec3 a2 = baseColorSnapshot[range.vertexStart + triOffset + 2u];
+                uint32_t trianglePrimitiveId = (brushTriangleStartByKey[brushKey] != nil ? brushTriangleStartByKey[brushKey].unsignedIntValue : 0u) + (uint32_t)(triOffset / 3u);
                 float uvMinU = brushUvMinUByKey[brushKey] != nil ? brushUvMinUByKey[brushKey].floatValue : 0.0f;
                 float uvMinV = brushUvMinVByKey[brushKey] != nil ? brushUvMinVByKey[brushKey].floatValue : 0.0f;
                 float uvMaxU = brushUvMaxUByKey[brushKey] != nil ? brushUvMaxUByKey[brushKey].floatValue : 1.0f;
                 float uvMaxV = brushUvMaxVByKey[brushKey] != nil ? brushUvMaxVByKey[brushKey].floatValue : 1.0f;
                 float uvSpanU = fmaxf(uvMaxU - uvMinU, 1e-4f);
                 float uvSpanV = fmaxf(uvMaxV - uvMinV, 1e-4f);
-                float x0 = ((v0->u - uvMinU) / uvSpanU) * (float)(bakeWidth - 1);
-                float y0 = ((v0->v - uvMinV) / uvSpanV) * (float)(bakeHeight - 1);
-                float x1 = ((v1->u - uvMinU) / uvSpanU) * (float)(bakeWidth - 1);
-                float y1 = ((v1->v - uvMinV) / uvSpanV) * (float)(bakeHeight - 1);
-                float x2 = ((v2->u - uvMinU) / uvSpanU) * (float)(bakeWidth - 1);
-                float y2 = ((v2->v - uvMinV) / uvSpanV) * (float)(bakeHeight - 1);
+                float x0 = ((v0->u - uvMinU) / uvSpanU) * (float)bakeWidth;
+                float y0 = ((v0->v - uvMinV) / uvSpanV) * (float)bakeHeight;
+                float x1 = ((v1->u - uvMinU) / uvSpanU) * (float)bakeWidth;
+                float y1 = ((v1->v - uvMinV) / uvSpanV) * (float)bakeHeight;
+                float x2 = ((v2->u - uvMinU) / uvSpanU) * (float)bakeWidth;
+                float y2 = ((v2->v - uvMinV) / uvSpanV) * (float)bakeHeight;
                 float denom = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2);
 
                 float minU = floorf(fminf(fminf(x0, x1), x2));
@@ -3676,6 +3794,10 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                     simd_float3 albedo = (simd_make_float3(a0.raw[0], a0.raw[1], a0.raw[2]) +
                                           simd_make_float3(a1.raw[0], a1.raw[1], a1.raw[2]) +
                                           simd_make_float3(a2.raw[0], a2.raw[1], a2.raw[2])) / 3.0f;
+
+                    if (accum[texelIndex].sourceTriangleIdPlusOne == 0u) {
+                        accum[texelIndex].sourceTriangleIdPlusOne = trianglePrimitiveId + 1u;
+                    }
 
                     accum[texelIndex].worldPosWeight.x += worldPos.x;
                     accum[texelIndex].worldPosWeight.y += worldPos.y;
@@ -3718,6 +3840,10 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                                              simd_make_float3(a1.raw[0], a1.raw[1], a1.raw[2]) * w1 +
                                              simd_make_float3(a2.raw[0], a2.raw[1], a2.raw[2]) * w2;
                         size_t texelIndex = (size_t)py * (size_t)bakeWidth + (size_t)px;
+
+                        if (accum[texelIndex].sourceTriangleIdPlusOne == 0u) {
+                            accum[texelIndex].sourceTriangleIdPlusOne = trianglePrimitiveId + 1u;
+                        }
 
                         accum[texelIndex].worldPosWeight.x += worldPos.x;
                         accum[texelIndex].worldPosWeight.y += worldPos.y;
@@ -3786,7 +3912,10 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                                                                  fminf(fmaxf(albedo.y, 0.0f), 1.0f),
                                                                  fminf(fmaxf(albedo.z, 0.0f), 1.0f),
                                                                  0.0f);
-                    texels[texelIndex].sourceTriangleData = simd_make_uint4(sourceTriangleStart, sourceTriangleCount, 0u, 0u);
+                    texels[texelIndex].sourceTriangleData = simd_make_uint4(sourceTriangleStart,
+                                                                            sourceTriangleCount,
+                                                                            0u,
+                                                                            0u);
                     validTexelCount += 1u;
                 } else {
                     texels[texelIndex].worldPosValid = simd_make_float4(0.0f, 0.0f, 0.0f, 0.0f);
@@ -3876,20 +4005,30 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         BOOL bakeDispatchFailed = NO;
         NSString* bakeDispatchFailureKey = nil;
         while (accumulatedSamples < targetSamplesPerTexel) {
-            uint32_t batchSamples = self.previewBakeRtSamplesPerTexel;
-            if (batchSamples > (targetSamplesPerTexel - accumulatedSamples)) {
-                batchSamples = targetSamplesPerTexel - accumulatedSamples;
-            }
-            if (batchSamples == 0u) {
-                break;
-            }
+            @autoreleasepool {
+                if (self.previewBakeCancelRequested) {
+                    bakeCanceled = YES;
+                    break;
+                }
 
-            uint32_t newAccumulatedSamples = accumulatedSamples + batchSamples;
-            NSMutableDictionary<NSString*, NSDictionary<NSString*, id>*>* progressiveMaps = [NSMutableDictionary dictionary];
-            NSMutableDictionary<NSString*, NSDictionary<NSString*, NSNumber*>*>* progressiveStats = [NSMutableDictionary dictionary];
-            NSMutableDictionary<NSString*, NSDictionary<NSString*, id>*>* progressiveFacePayloads = [NSMutableDictionary dictionary];
+                uint32_t batchSamples = batchSamplesPerTexel;
+                if (batchSamples > (targetSamplesPerTexel - accumulatedSamples)) {
+                    batchSamples = targetSamplesPerTexel - accumulatedSamples;
+                }
+                if (batchSamples == 0u) {
+                    break;
+                }
 
-            for (NSUInteger pageIndex = 0; pageIndex < lightmapPageKeys.count; ++pageIndex) {
+                uint32_t newAccumulatedSamples = accumulatedSamples + batchSamples;
+                NSMutableDictionary<NSString*, NSDictionary<NSString*, id>*>* progressiveMaps = [NSMutableDictionary dictionary];
+                NSMutableDictionary<NSString*, NSDictionary<NSString*, NSNumber*>*>* progressiveStats = [NSMutableDictionary dictionary];
+                NSMutableDictionary<NSString*, NSDictionary<NSString*, id>*>* progressiveFacePayloads = [NSMutableDictionary dictionary];
+
+                for (NSUInteger pageIndex = 0; pageIndex < lightmapPageKeys.count; ++pageIndex) {
+                if (self.previewBakeCancelRequested) {
+                    bakeCanceled = YES;
+                    break;
+                }
                 NSString* key = lightmapPageKeys[pageIndex];
                 int bakeWidth = lightmapPageWidths[pageIndex].intValue;
                 int bakeHeight = lightmapPageHeights[pageIndex].intValue;
@@ -3916,17 +4055,17 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                     uniforms->lightPosRange = simd_make_float4(lightPosition.raw[0], lightPosition.raw[1], lightPosition.raw[2], fmaxf(lightRange, 1.0f));
                     uniforms->lightColorIntensity = simd_make_float4(lightColor.raw[0], lightColor.raw[1], lightColor.raw[2], lightEnabled ? fmaxf(lightIntensity, 0.0f) : 0.0f);
                     uniforms->sampleCount = batchSamples;
-                    uniforms->bounceCount = self.previewBakeBounceCount;
+                    uniforms->bounceCount = bounceCount;
                     uniforms->texelCount = (uint32_t)texelCount;
                     uniforms->frameSeed = (uint32_t)(revision + (uint64_t)pageIndex * 9973ull + (uint64_t)accumulatedSamples * 131u);
                     uniforms->lightCount = bakeLightCount;
                     uniforms->importedMaterialCount = bakeMaterialCount;
                     uniforms->importedTextureCount = bakeTextureCount;
                     uniforms->sceneTriangleCount = (uint32_t)(rtBakeVertexCount / 3u);
-                    uniforms->skyBounceScale = 0.18f * self.previewBakeSkyBrightness;
-                    uniforms->diffuseBounceScale = 1.05f * self.previewBakeDiffuseBounceIntensity;
+                    uniforms->skyBounceScale = 0.18f * skyBrightness;
+                    uniforms->diffuseBounceScale = 1.05f * diffuseBounceIntensity;
                     uniforms->indirectScale = 1.95f;
-                    uniforms->skyAmbientScale = self.previewBakeSkyBrightness;
+                    uniforms->skyAmbientScale = skyBrightness;
                     uniforms->padding = simd_make_float3(0.0f, 0.0f, 0.0f);
                 }
 
@@ -4073,52 +4212,84 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                       targetSamplesPerTexel,
                       validTexelCount,
                       (dispatchEnd - dispatchStart) * 1000.0);
-            }
-
-            if (bakeDispatchFailed) {
-                break;
-            }
-
-            // Assemble per-face bakes into a small number of shared global lightmap pages.
-            [progressiveMaps addEntriesFromDictionary:viewport_assemble_global_lightmap_atlases(progressiveFacePayloads, brushKeys, kPreviewBakeAtlasTileExtent)];
-
-            accumulatedSamples = newAccumulatedSamples;
-            bakedMaps = progressiveMaps;
-            bakedStats = progressiveStats;
-
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (self.meshRevision == revision && self.cpuVertices != NULL && self.vertexCount == vertexCount) {
-                    self.previewBakedLightmaps = [progressiveMaps mutableCopy];
-                    self.previewBakeBrushStats = [progressiveStats mutableCopy];
-                    self.previewBakeAccumulatedSamplesPerTexel = accumulatedSamples;
-                    [self.previewBakedDebugTextures removeAllObjects];
-                    if (self.previewBakeDebugSelectedKey.length == 0 || progressiveMaps[self.previewBakeDebugSelectedKey] == nil) {
-                        NSArray<NSString*>* keys = [[progressiveMaps allKeys] sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
-                        self.previewBakeDebugSelectedKey = keys.count > 0 ? keys.firstObject : @"";
-                    }
-                    self.previewBakedLightingEnabled = progressiveMaps.count > 0;
-                    _fullRendererUiState.previewBakeLightingEnabled = self.previewBakedLightingEnabled ? 1 : 0;
-                    [self syncPreviewBakePanel];
-
-                    ViewerMesh progressiveMesh = {0};
-                    progressiveMesh.vertices = self.cpuVertices;
-                    progressiveMesh.vertexCount = self.vertexCount;
-                    progressiveMesh.edgeVertices = self.cpuEdgeVertices;
-                    progressiveMesh.edgeVertexCount = self.edgeVertexCount;
-                    progressiveMesh.faceRanges = self.faceRanges;
-                    progressiveMesh.faceRangeCount = self.faceRangeCount;
-                    progressiveMesh.bounds = self.sceneBounds;
-                    [self syncHeavyRendererSceneFromMesh:&progressiveMesh];
-                    [self.metalView setNeedsDisplay:YES];
                 }
-            });
+
+                if (bakeDispatchFailed || bakeCanceled) {
+                    break;
+                }
+
+                // Assemble per-face bakes into a small number of shared global lightmap pages.
+                [progressiveMaps addEntriesFromDictionary:viewport_assemble_global_lightmap_atlases(progressiveFacePayloads, brushKeys, kPreviewBakeAtlasTileExtent)];
+
+                accumulatedSamples = newAccumulatedSamples;
+                bakedMaps = progressiveMaps;
+                bakedStats = progressiveStats;
+
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    if (self.previewBakeGeneration == bakeGeneration && self.meshRevision == revision && self.cpuVertices != NULL && self.vertexCount == vertexCount) {
+                        self.previewBakedLightmaps = [progressiveMaps mutableCopy];
+                        self.previewBakeBrushStats = [progressiveStats mutableCopy];
+                        self.previewBakeAccumulatedSamplesPerTexel = newAccumulatedSamples;
+                        [self.previewBakedDebugTextures removeAllObjects];
+                        if (self.previewBakeDebugSelectedKey.length == 0 || progressiveMaps[self.previewBakeDebugSelectedKey] == nil) {
+                            NSArray<NSString*>* keys = [[progressiveMaps allKeys] sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+                            self.previewBakeDebugSelectedKey = keys.count > 0 ? keys.firstObject : @"";
+                        }
+                        self.previewBakedLightingEnabled = progressiveMaps.count > 0;
+                        _fullRendererUiState.previewBakeLightingEnabled = self.previewBakedLightingEnabled ? 1 : 0;
+                        [self syncPreviewBakePanel];
+
+                        ViewerMesh progressiveMesh = {0};
+                        progressiveMesh.vertices = self.cpuVertices;
+                        progressiveMesh.vertexCount = self.vertexCount;
+                        progressiveMesh.edgeVertices = self.cpuEdgeVertices;
+                        progressiveMesh.edgeVertexCount = self.edgeVertexCount;
+                        progressiveMesh.faceRanges = self.faceRanges;
+                        progressiveMesh.faceRangeCount = self.faceRangeCount;
+                        progressiveMesh.bounds = self.sceneBounds;
+                        [self syncHeavyRendererSceneFromMesh:&progressiveMesh];
+                        [self.metalView setNeedsDisplay:YES];
+                    }
+                });
+            }
         }
 
         dispatch_async(dispatch_get_main_queue(), ^{
+            if (self.previewBakeGeneration != bakeGeneration) {
+                return;
+            }
+
             if (bakeDispatchFailed) {
                 NSLog(@"[lighting] HWRT preview bake aborted after GPU dispatch failure%@",
                       bakeDispatchFailureKey != nil ? [@" on brush " stringByAppendingString:bakeDispatchFailureKey] : @"");
                 self.previewBakeInProgress = NO;
+                self.previewBakePauseRequested = NO;
+                self.previewBakeCancelRequested = NO;
+                self.previewBakeRestartQueued = NO;
+                self.previewBakeRunningTargetSamplesPerTexel = 0u;
+                self.previewBakeRunningBounceCount = 0u;
+                [self syncPreviewBakePanel];
+                return;
+            }
+
+            if (bakeCanceled || self.previewBakeRestartQueued) {
+                BOOL restartQueued = self.previewBakeRestartQueued;
+                if (restartQueued) {
+                    NSLog(@"[lighting] HWRT preview bake restarting with updated settings");
+                } else {
+                    NSLog(@"[lighting] HWRT preview bake cancelled");
+                }
+                self.previewBakeInProgress = NO;
+                self.previewBakePauseRequested = NO;
+                self.previewBakeCancelRequested = NO;
+                self.previewBakeAccumulatedSamplesPerTexel = 0u;
+                self.previewBakeRunningTargetSamplesPerTexel = 0u;
+                self.previewBakeRunningBounceCount = 0u;
+                [self syncPreviewBakePanel];
+                if (restartQueued) {
+                    self.previewBakeRestartQueued = NO;
+                    [self startPreviewLightingBake];
+                }
                 return;
             }
 
@@ -4149,6 +4320,12 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                 NSLog(@"[lighting] HWRT preview bake discarded because mesh changed during bake");
             }
             self.previewBakeInProgress = NO;
+            self.previewBakePauseRequested = NO;
+            self.previewBakeCancelRequested = NO;
+            self.previewBakeRestartQueued = NO;
+            self.previewBakeRunningTargetSamplesPerTexel = 0u;
+            self.previewBakeRunningBounceCount = 0u;
+            [self syncPreviewBakePanel];
         });
 
         free(verticesSnapshot);
