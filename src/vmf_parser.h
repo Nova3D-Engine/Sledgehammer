@@ -13,6 +13,7 @@ typedef enum VmfEntityKind {
     VmfEntityKindRoot = 0,
     VmfEntityKindBrush = 1,
     VmfEntityKindLight = 2,
+    VmfEntityKindModel = 3,
 } VmfEntityKind;
 
 typedef struct VmfSide {
@@ -59,8 +60,10 @@ typedef struct VmfEntity {
     char classname[128];
     char targetname[128];
     char name[128];
+    char modelAssetPath[512];
     VmfEntityKind kind;
     Vec3 position;
+    Vec3 modelHalfExtents;
     Vec3 color;
     float intensity;
     float range;

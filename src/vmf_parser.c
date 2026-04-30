@@ -625,6 +625,9 @@ static int parse_entity_block(Parser* parser, VmfEntity* outEntity, int isWorld)
             } else if (strcmp(valueBuffer, "light") == 0) {
                 outEntity->kind = VmfEntityKindLight;
                 outEntity->isWorld = 0;
+            } else if (strcmp(valueBuffer, "model") == 0) {
+                outEntity->kind = VmfEntityKindModel;
+                outEntity->isWorld = 0;
             } else {
                 outEntity->kind = VmfEntityKindBrush;
                 outEntity->isWorld = 0;
@@ -650,6 +653,14 @@ static int parse_entity_block(Parser* parser, VmfEntity* outEntity, int isWorld)
             outEntity->spotInnerDegrees = strtof(valueBuffer, NULL);
         } else if (strcmp(keyBuffer, "spot_outer_degrees") == 0) {
             outEntity->spotOuterDegrees = strtof(valueBuffer, NULL);
+        } else if (strcmp(keyBuffer, "model") == 0) {
+            strncpy(outEntity->modelAssetPath, valueBuffer, sizeof(outEntity->modelAssetPath) - 1);
+            outEntity->modelAssetPath[sizeof(outEntity->modelAssetPath) - 1] = '\0';
+            if (!outEntity->isWorld && outEntity->solidCount == 0 && outEntity->kind == VmfEntityKindBrush) {
+                outEntity->kind = VmfEntityKindModel;
+            }
+        } else if (strcmp(keyBuffer, "model_half_extents") == 0) {
+            parse_bracket_vec3(valueBuffer, &outEntity->modelHalfExtents);
         } else if (strcmp(keyBuffer, "classname") == 0) {
             strncpy(outEntity->classname, valueBuffer, sizeof(outEntity->classname) - 1);
             outEntity->classname[sizeof(outEntity->classname) - 1] = '\0';
@@ -658,6 +669,9 @@ static int parse_entity_block(Parser* parser, VmfEntity* outEntity, int isWorld)
                 outEntity->isWorld = 1;
             } else if (strcmp(valueBuffer, "light") == 0 || strcmp(valueBuffer, "light_point") == 0) {
                 outEntity->kind = VmfEntityKindLight;
+                outEntity->isWorld = 0;
+            } else if (strcmp(valueBuffer, "prop_static") == 0 || strcmp(valueBuffer, "prop_dynamic") == 0) {
+                outEntity->kind = VmfEntityKindModel;
                 outEntity->isWorld = 0;
             }
         } else if (strcmp(keyBuffer, "targetname") == 0) {

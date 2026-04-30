@@ -7,6 +7,7 @@
 
 #include <stdio.h>
 
+#include "novamodel_asset.h"
 #include "nova_scene_data.h"
 #include "nova_tool_metal.h"
 
@@ -153,6 +154,7 @@ typedef struct ViewportBakePolygon {
 - (void)handleViewportSecondaryMouseUp;
 - (void)handleViewportScrollDelta:(CGFloat)deltaY;
 - (void)handleViewportDroppedPath:(NSString*)path;
+- (Vec3)dropPlacementPointForViewPoint:(NSPoint)point;
 - (void)handleViewportMouseHoverAtPoint:(NSPoint)point;
 - (void)handleViewportSecondaryClickAtPoint:(NSPoint)point modifierFlags:(NSEventModifierFlags)flags;
 - (void)drawEditorOverlay;
@@ -235,6 +237,55 @@ static void viewport_init_imported_material_gpu_defaults(NovaSceneGpuMaterial* m
     material->extra[0] = 1.0f;
     material->extra[1] = -1.0f;
     material->extra[2] = 0.5f;
+}
+
+static NSDictionary<NSString*, id>* viewport_texture_dictionary_from_scene_texture(const NovaSceneTexture* texture) {
+    NSMutableDictionary<NSString*, id>* textureInfo;
+    size_t pixelCount;
+
+    if (texture == NULL || texture->width <= 0 || texture->height <= 0) {
+        return nil;
+    }
+
+    textureInfo = [NSMutableDictionary dictionaryWithCapacity:4];
+    textureInfo[@"width"] = @(texture->width);
+    textureInfo[@"height"] = @(texture->height);
+    textureInfo[@"format"] = @(texture->format);
+    pixelCount = (size_t)texture->width * (size_t)texture->height;
+    if (texture->format == NOVA_SCENE_TEXTURE_FORMAT_RGBA32_FLOAT && texture->rgba32f != NULL) {
+        textureInfo[@"rgba32f"] = [NSData dataWithBytes:texture->rgba32f length:pixelCount * sizeof(float) * 4u];
+        return textureInfo;
+    }
+    if (texture->rgba8 != NULL) {
+        textureInfo[@"format"] = @(NOVA_SCENE_TEXTURE_FORMAT_RGBA8_UNORM);
+        textureInfo[@"rgba8"] = [NSData dataWithBytes:texture->rgba8 length:pixelCount * 4u];
+        return textureInfo;
+    }
+    return nil;
+}
+
+static int32_t viewport_import_texture_dictionary(NSMutableDictionary<NSString*, NSNumber*>* importedTextureIndices,
+                                                  NSMutableArray<NSDictionary<NSString*, id>*>* importedTextures,
+                                                  NSString* textureKey,
+                                                  NSDictionary<NSString*, id>* textureInfo) {
+    NSNumber* existingTextureIndex;
+
+    if (importedTextureIndices == nil || importedTextures == nil || textureKey.length == 0 || textureInfo == nil) {
+        return -1;
+    }
+
+    existingTextureIndex = importedTextureIndices[textureKey];
+    if (existingTextureIndex != nil) {
+        return existingTextureIndex.intValue;
+    }
+    if (importedTextures.count >= UI_MAX_LIGHTS) {
+        return -1;
+    }
+
+    existingTextureIndex = @(importedTextures.count);
+    importedTextureIndices[textureKey] = existingTextureIndex;
+    [importedTextures addObject:textureInfo];
+    return existingTextureIndex.intValue;
 }
 
 static Vec3 world_up(void) {
@@ -1846,6 +1897,13 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     NSURL* firstURL = urls.firstObject;
     if (!firstURL) {
         return NO;
+    }
+    NSPoint point = [self convertPoint:sender.draggingLocation fromView:nil];
+    if ([firstURL.pathExtension.lowercaseString isEqualToString:@"novamodel"]) {
+        if (self.owner.delegate) {
+            [self.owner.delegate viewport:self.owner didRequestPlaceDroppedPath:firstURL.path atPoint:[self.owner dropPlacementPointForViewPoint:point]];
+        }
+        return YES;
     }
     [self.owner handleViewportDroppedPath:firstURL.path];
     return YES;
@@ -5027,9 +5085,12 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
 - (void)syncHeavyRendererSceneFromMesh:(const ViewerMesh*)mesh {
     NovaSceneObjectRecord* objectRecords = NULL;
     char materialNames[UI_MAX_LIGHTS][128] = {{0}};
+    char materialModelAssetPaths[UI_MAX_LIGHTS][512] = {{0}};
     float materialColors[UI_MAX_LIGHTS][3] = {{0}};
     uint32_t materialSamples[UI_MAX_LIGHTS] = {0};
     int32_t materialTextureIndices[UI_MAX_LIGHTS];
+    int32_t materialSourceMaterialIndices[UI_MAX_LIGHTS];
+    uint8_t materialUsesSourceModel[UI_MAX_LIGHTS] = {0};
     int32_t* objectBakedLightmapIndices = NULL;
     uint32_t* objectBrushEntity = NULL;
     uint32_t* objectBrushSolid = NULL;
@@ -5043,6 +5104,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
 
     for (uint32_t index = 0u; index < UI_MAX_LIGHTS; ++index) {
         materialTextureIndices[index] = -1;
+        materialSourceMaterialIndices[index] = -1;
     }
 
     nova_scene_data_release(&_importedSceneData);
@@ -5106,9 +5168,16 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         ViewerFaceRange range = mesh->faceRanges[faceIndex];
         uint32_t materialIndex = 0u;
         Bounds3 objectBounds;
+        const char* modelAssetPath = NULL;
+        BOOL isModelRange = NO;
 
         if (strncmp(range.material, "light_marker", sizeof(range.material)) == 0) {
             continue;
+        }
+
+        if (range.modelAssetPath[0] != '\0' && range.sourceMaterialIndex >= 0) {
+            isModelRange = YES;
+            modelAssetPath = range.modelAssetPath;
         }
 
         if (range.vertexStart >= mesh->vertexCount) {
@@ -5123,7 +5192,14 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         }
 
         for (; materialIndex < materialCount; ++materialIndex) {
-            if (strncmp(materialNames[materialIndex], range.material, sizeof(materialNames[materialIndex])) == 0) {
+            if (isModelRange) {
+                if (materialUsesSourceModel[materialIndex] != 0u &&
+                    materialSourceMaterialIndices[materialIndex] == range.sourceMaterialIndex &&
+                    strncmp(materialModelAssetPaths[materialIndex], modelAssetPath, sizeof(materialModelAssetPaths[materialIndex])) == 0) {
+                    break;
+                }
+            } else if (materialUsesSourceModel[materialIndex] == 0u &&
+                       strncmp(materialNames[materialIndex], range.material, sizeof(materialNames[materialIndex])) == 0) {
                 break;
             }
         }
@@ -5132,6 +5208,11 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                 continue;
             }
             snprintf(materialNames[materialIndex], sizeof(materialNames[materialIndex]), "%s", range.material);
+            if (isModelRange) {
+                snprintf(materialModelAssetPaths[materialIndex], sizeof(materialModelAssetPaths[materialIndex]), "%s", modelAssetPath);
+                materialSourceMaterialIndices[materialIndex] = range.sourceMaterialIndex;
+                materialUsesSourceModel[materialIndex] = 1u;
+            }
             materialCount += 1u;
         }
 
@@ -5330,6 +5411,9 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         NSDictionary<NSString*, id>* textureInfo;
         NSNumber* existingTextureIndex;
 
+        if (materialUsesSourceModel[materialIndex] != 0u) {
+            continue;
+        }
         if (materialName.length == 0) {
             continue;
         }
@@ -5504,6 +5588,116 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         float baseColorR = materialColors[materialIndex][0] / sampleCount;
         float baseColorG = materialColors[materialIndex][1] / sampleCount;
         float baseColorB = materialColors[materialIndex][2] / sampleCount;
+
+        if (materialUsesSourceModel[materialIndex] != 0u && materialModelAssetPaths[materialIndex][0] != '\0') {
+            NovaSceneData sourceScene;
+            char modelLoadError[512] = {0};
+            NSDictionary<NSString*, id>* modelTextureInfo = nil;
+            int32_t baseColorTextureIndex = -1;
+            int32_t metallicRoughnessTextureIndex = -1;
+            int32_t normalTextureIndex = -1;
+            int32_t emissiveTextureIndex = -1;
+            int32_t occlusionTextureIndex = -1;
+            int32_t transmissionTextureIndex = -1;
+            uint32_t materialFlags = 0u;
+
+            nova_scene_data_init(&sourceScene);
+            if (nova_model_asset_load_scene(materialModelAssetPaths[materialIndex], &sourceScene, modelLoadError, (uint32_t)sizeof(modelLoadError)) &&
+                materialSourceMaterialIndices[materialIndex] >= 0 &&
+                (uint32_t)materialSourceMaterialIndices[materialIndex] < sourceScene.materialCount) {
+                const NovaSceneMaterial* sourceMaterial = &sourceScene.materials[materialSourceMaterialIndices[materialIndex]];
+                NSString* assetPathString = [NSString stringWithUTF8String:materialModelAssetPaths[materialIndex]];
+
+                *material = *sourceMaterial;
+                if (material->name[0] == '\0') {
+                    snprintf(material->name, sizeof(material->name), "%s", materialNames[materialIndex]);
+                }
+
+                if (sourceMaterial->baseColorTexture >= 0 && (uint32_t)sourceMaterial->baseColorTexture < sourceScene.textureCount) {
+                    NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->baseColorTexture];
+                    modelTextureInfo = viewport_texture_dictionary_from_scene_texture(&sourceScene.textures[sourceMaterial->baseColorTexture]);
+                    baseColorTextureIndex = viewport_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
+                }
+                if (sourceMaterial->metallicRoughnessTexture >= 0 && (uint32_t)sourceMaterial->metallicRoughnessTexture < sourceScene.textureCount) {
+                    NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->metallicRoughnessTexture];
+                    modelTextureInfo = viewport_texture_dictionary_from_scene_texture(&sourceScene.textures[sourceMaterial->metallicRoughnessTexture]);
+                    metallicRoughnessTextureIndex = viewport_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
+                }
+                if (sourceMaterial->normalTexture >= 0 && (uint32_t)sourceMaterial->normalTexture < sourceScene.textureCount) {
+                    NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->normalTexture];
+                    modelTextureInfo = viewport_texture_dictionary_from_scene_texture(&sourceScene.textures[sourceMaterial->normalTexture]);
+                    normalTextureIndex = viewport_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
+                }
+                if (sourceMaterial->emissiveTexture >= 0 && (uint32_t)sourceMaterial->emissiveTexture < sourceScene.textureCount) {
+                    NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->emissiveTexture];
+                    modelTextureInfo = viewport_texture_dictionary_from_scene_texture(&sourceScene.textures[sourceMaterial->emissiveTexture]);
+                    emissiveTextureIndex = viewport_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
+                }
+                if (sourceMaterial->occlusionTexture >= 0 && (uint32_t)sourceMaterial->occlusionTexture < sourceScene.textureCount) {
+                    NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->occlusionTexture];
+                    modelTextureInfo = viewport_texture_dictionary_from_scene_texture(&sourceScene.textures[sourceMaterial->occlusionTexture]);
+                    occlusionTextureIndex = viewport_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
+                }
+                if (sourceMaterial->transmissionTexture >= 0 && (uint32_t)sourceMaterial->transmissionTexture < sourceScene.textureCount) {
+                    NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->transmissionTexture];
+                    modelTextureInfo = viewport_texture_dictionary_from_scene_texture(&sourceScene.textures[sourceMaterial->transmissionTexture]);
+                    transmissionTextureIndex = viewport_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
+                }
+
+                material->baseColorTexture = baseColorTextureIndex;
+                material->metallicRoughnessTexture = metallicRoughnessTextureIndex;
+                material->normalTexture = normalTextureIndex;
+                material->emissiveTexture = emissiveTextureIndex;
+                material->occlusionTexture = occlusionTextureIndex;
+                material->transmissionTexture = transmissionTextureIndex;
+
+                snprintf(materialRecord->name, sizeof(materialRecord->name), "%s", material->name);
+                materialRecord->baseColor[0] = material->baseColorFactor[0];
+                materialRecord->baseColor[1] = material->baseColorFactor[1];
+                materialRecord->baseColor[2] = material->baseColorFactor[2];
+                materialRecord->baseColor[3] = material->baseColorFactor[3];
+                materialRecord->emissive[0] = material->emissiveFactor[0];
+                materialRecord->emissive[1] = material->emissiveFactor[1];
+                materialRecord->emissive[2] = material->emissiveFactor[2];
+                materialRecord->metallic = material->metallic;
+                materialRecord->roughness = material->roughness;
+                materialRecord->transmission = material->transmission;
+                materialRecord->ior = material->ior;
+
+                viewport_init_imported_material_gpu_defaults(materialGpu);
+                materialGpu->baseColor[0] = material->baseColorFactor[0];
+                materialGpu->baseColor[1] = material->baseColorFactor[1];
+                materialGpu->baseColor[2] = material->baseColorFactor[2];
+                materialGpu->baseColor[3] = material->baseColorFactor[3];
+                materialGpu->emissive[0] = material->emissiveFactor[0];
+                materialGpu->emissive[1] = material->emissiveFactor[1];
+                materialGpu->emissive[2] = material->emissiveFactor[2];
+                materialGpu->params[0] = material->metallic;
+                materialGpu->params[1] = material->roughness;
+                materialGpu->params[2] = material->transmission;
+                materialGpu->params[3] = material->ior;
+                materialGpu->texIndices[0] = (float)material->baseColorTexture;
+                materialGpu->texIndices[1] = (float)material->metallicRoughnessTexture;
+                materialGpu->texIndices[2] = (float)material->normalTexture;
+                materialGpu->texIndices[3] = (float)material->emissiveTexture;
+                if (material->alphaMode == 1) {
+                    materialFlags |= 1u;
+                }
+                if (material->doubleSided != 0) {
+                    materialFlags |= 2u;
+                }
+                if (material->normalTexture >= 0) {
+                    materialFlags |= 4u;
+                }
+                materialGpu->extra[0] = material->normalScale;
+                materialGpu->extra[1] = (float)material->transmissionTexture;
+                materialGpu->extra[2] = material->alphaCutoff;
+                materialGpu->extra[3] = (float)materialFlags;
+                nova_scene_data_release(&sourceScene);
+                continue;
+            }
+            nova_scene_data_release(&sourceScene);
+        }
 
         if (textureIndex >= 0 && strncmp(materialNames[materialIndex], "dev_", 4) == 0) {
             logicalTextureSize = 256.0f;
@@ -7008,6 +7202,28 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     if (self.delegate) {
         [self.delegate viewportDidRequestOpenDroppedPath:path];
     }
+}
+
+- (Vec3)dropPlacementPointForViewPoint:(NSPoint)point {
+    if (self.dimension == VmfViewportDimension2D) {
+        return [self snappedWorldPointForViewPoint:point];
+    }
+
+    Vec3 origin = [self cameraPosition];
+    Vec3 direction = [self rayDirectionForViewPoint:point];
+    float distance = 256.0f;
+    if (fabsf(direction.raw[2]) > 1e-5f) {
+        float planeDistance = -origin.raw[2] / direction.raw[2];
+        if (planeDistance > 0.0f) {
+            distance = planeDistance;
+        }
+    }
+
+    Vec3 worldPoint = vec3_add(origin, vec3_scale(direction, distance));
+    worldPoint.raw[0] = snap_to_grid(worldPoint.raw[0], (float)self.gridSize);
+    worldPoint.raw[1] = snap_to_grid(worldPoint.raw[1], (float)self.gridSize);
+    worldPoint.raw[2] = snap_to_grid(worldPoint.raw[2], (float)self.gridSize);
+    return worldPoint;
 }
 
 - (void)handleViewportMouseHoverAtPoint:(NSPoint)point {

@@ -24,6 +24,10 @@ typedef struct ViewerFaceRange {
     size_t sideIndex;
     size_t vertexStart;
     size_t vertexCount;
+    size_t edgeVertexStart;
+    size_t edgeVertexCount;
+    int sourceMaterialIndex;
+    char modelAssetPath[512];
     char material[128];
 } ViewerFaceRange;
 

@@ -11,6 +11,7 @@
 
 #include "nova_scene_ecs.h"
 #include "gltf_loader.h"
+#include "novamodel_asset.h"
 
 #import "file_index.h"
 #import "sledgehammer_plugin_api.h"
@@ -142,13 +143,78 @@ typedef NS_ENUM(NSUInteger, ViewerClipMode) {
 static NSString* const kAppDisplayName = @"Sledgehammer";
 static NSString* const kSledgehammerModelAssetExtension = @"novamodel";
 
-@interface ContentBrowserAssetButton : NSButton
+@interface ContentBrowserAssetButton : NSButton <NSDraggingSource>
 
 @property(nonatomic, copy) NSString* assetPath;
 
 @end
 
 @implementation ContentBrowserAssetButton
+
+- (void)beginAssetDragWithEvent:(NSEvent*)event {
+    if (self.assetPath.length == 0) {
+        return;
+    }
+
+    NSURL* fileURL = [NSURL fileURLWithPath:self.assetPath];
+    NSDraggingItem* draggingItem = [[NSDraggingItem alloc] initWithPasteboardWriter:fileURL];
+    NSRect dragFrame = self.bounds;
+    id dragContents = self.image != nil ? self.image : self.title;
+    [draggingItem setDraggingFrame:dragFrame contents:dragContents];
+    NSDraggingSession* session = [self beginDraggingSessionWithItems:@[draggingItem] event:event source:self];
+    session.animatesToStartingPositionsOnCancelOrFail = YES;
+}
+
+- (void)mouseDown:(NSEvent*)event {
+    if (self.assetPath.length == 0 || self.window == nil) {
+        [super mouseDown:event];
+        return;
+    }
+
+    NSPoint mouseDownPoint = [self convertPoint:event.locationInWindow fromView:nil];
+    CGFloat dragThreshold = 4.0;
+    BOOL startedDrag = NO;
+
+    for (;;) {
+        NSEvent* nextEvent = [self.window nextEventMatchingMask:(NSEventMaskLeftMouseDragged | NSEventMaskLeftMouseUp)];
+        if (nextEvent.type == NSEventTypeLeftMouseUp) {
+            break;
+        }
+
+        NSPoint currentPoint = [self convertPoint:nextEvent.locationInWindow fromView:nil];
+        CGFloat deltaX = currentPoint.x - mouseDownPoint.x;
+        CGFloat deltaY = currentPoint.y - mouseDownPoint.y;
+        if ((deltaX * deltaX + deltaY * deltaY) >= (dragThreshold * dragThreshold)) {
+            [self beginAssetDragWithEvent:event];
+            startedDrag = YES;
+            break;
+        }
+    }
+
+    if (!startedDrag && self.target != nil && self.action != NULL) {
+        [NSApp sendAction:self.action to:self.target from:self];
+    }
+}
+
+- (void)mouseDragged:(NSEvent*)event {
+    if (self.assetPath.length == 0) {
+        [super mouseDragged:event];
+        return;
+    }
+
+    [self beginAssetDragWithEvent:event];
+}
+
+- (NSDragOperation)draggingSession:(NSDraggingSession*)session sourceOperationMaskForDraggingContext:(NSDraggingContext)context {
+    (void)session;
+    (void)context;
+    return NSDragOperationCopy;
+}
+
+- (BOOL)ignoreModifierKeysForDraggingSession:(NSDraggingSession*)session {
+    (void)session;
+    return YES;
+}
 
 @end
 
@@ -161,6 +227,115 @@ static size_t sledgehammer_copy_utf8_string(NSString* value, char* buffer, size_
         buffer[copy_count] = '\0';
     }
     return required;
+}
+
+static NSImage* sledgehammer_make_thumbnail_image(const NovaModelAssetThumbnail* thumbnail) {
+    if (thumbnail == NULL || thumbnail->rgba8 == NULL || thumbnail->width == 0u || thumbnail->height == 0u) {
+        return nil;
+    }
+
+    NSBitmapImageRep* bitmap = [[NSBitmapImageRep alloc]
+        initWithBitmapDataPlanes:nil
+                      pixelsWide:(NSInteger)thumbnail->width
+                      pixelsHigh:(NSInteger)thumbnail->height
+                   bitsPerSample:8
+                 samplesPerPixel:4
+                        hasAlpha:YES
+                        isPlanar:NO
+                        colorSpaceName:NSCalibratedRGBColorSpace
+                     bytesPerRow:(NSInteger)thumbnail->width * 4
+                    bitsPerPixel:32];
+    if (bitmap == nil || bitmap.bitmapData == NULL) {
+        return nil;
+    }
+
+    memcpy(bitmap.bitmapData, thumbnail->rgba8, (size_t)thumbnail->width * (size_t)thumbnail->height * 4u);
+    bitmap.size = NSMakeSize((CGFloat)thumbnail->width, (CGFloat)thumbnail->height);
+    NSImage* image = [[NSImage alloc] initWithSize:NSMakeSize((CGFloat)thumbnail->width, (CGFloat)thumbnail->height)];
+    [image addRepresentation:bitmap];
+    image.template = NO;
+    return image;
+}
+
+static NSImage* sledgehammer_make_placeholder_thumbnail_image(NSString* title) {
+    NSSize size = NSMakeSize(192.0, 192.0);
+    NSImage* image = [[NSImage alloc] initWithSize:size];
+    [image lockFocus];
+
+    NSGradient* gradient = [[NSGradient alloc] initWithStartingColor:[NSColor colorWithCalibratedRed:0.18 green:0.21 blue:0.26 alpha:1.0]
+                                                         endingColor:[NSColor colorWithCalibratedRed:0.10 green:0.12 blue:0.16 alpha:1.0]];
+    [gradient drawInRect:NSMakeRect(0.0, 0.0, size.width, size.height) angle:-90.0];
+
+    [[NSColor colorWithCalibratedWhite:1.0 alpha:0.08] setFill];
+    NSBezierPath* accentPath = [NSBezierPath bezierPathWithRoundedRect:NSMakeRect(18.0, 18.0, size.width - 36.0, size.height - 36.0) xRadius:18.0 yRadius:18.0];
+    [accentPath fill];
+
+    NSString* displayTitle = title.length > 0 ? title : @"Model";
+    NSDictionary<NSAttributedStringKey, id>* attributes = @{
+        NSFontAttributeName: [NSFont boldSystemFontOfSize:18.0],
+        NSForegroundColorAttributeName: [NSColor colorWithCalibratedWhite:0.98 alpha:1.0],
+    };
+    NSRect textRect = NSMakeRect(20.0, 20.0, size.width - 40.0, 48.0);
+    [displayTitle drawInRect:textRect withAttributes:attributes];
+
+    NSDictionary<NSAttributedStringKey, id>* subtitleAttributes = @{
+        NSFontAttributeName: [NSFont systemFontOfSize:12.0 weight:NSFontWeightMedium],
+        NSForegroundColorAttributeName: [NSColor colorWithCalibratedWhite:0.86 alpha:0.9],
+    };
+    [@"No embedded thumbnail" drawInRect:NSMakeRect(20.0, 54.0, size.width - 40.0, 24.0) withAttributes:subtitleAttributes];
+
+    [image unlockFocus];
+    image.template = NO;
+    return image;
+}
+
+static BOOL sledgehammer_model_asset_bounds(NSString* assetPath, Vec3* outCenter, Vec3* outHalfExtents, NSString** outError) {
+    if (outCenter != NULL) {
+        *outCenter = vec3_make(0.0f, 0.0f, 0.0f);
+    }
+    if (outHalfExtents != NULL) {
+        *outHalfExtents = vec3_make(32.0f, 32.0f, 32.0f);
+    }
+    if (assetPath.length == 0) {
+        if (outError != NULL) {
+            *outError = @"Model asset path is empty.";
+        }
+        return NO;
+    }
+
+    NovaSceneData scene;
+    nova_scene_data_init(&scene);
+    char errorText[512] = { 0 };
+    if (!nova_model_asset_load_scene(assetPath.fileSystemRepresentation, &scene, errorText, (uint32_t)sizeof(errorText))) {
+        nova_scene_data_release(&scene);
+        if (outError != NULL) {
+            *outError = [NSString stringWithUTF8String:errorText[0] != '\0' ? errorText : "Failed to load model asset."];
+        }
+        return NO;
+    }
+
+    Bounds3 bounds = bounds3_empty();
+    for (uint32_t vertexIndex = 0; vertexIndex < scene.vertexCount; ++vertexIndex) {
+        const NovaSceneVertex* vertex = &scene.vertices[vertexIndex];
+        bounds3_expand(&bounds, vec3_make(vertex->position[0], vertex->position[1], vertex->position[2]));
+    }
+    nova_scene_data_release(&scene);
+
+    if (!bounds3_is_valid(bounds)) {
+        if (outError != NULL) {
+            *outError = @"Model asset does not contain any renderable vertices.";
+        }
+        return NO;
+    }
+
+    if (outCenter != NULL) {
+        *outCenter = bounds3_center(bounds);
+    }
+    if (outHalfExtents != NULL) {
+        Vec3 size = bounds3_size(bounds);
+        *outHalfExtents = vec3_scale(size, 0.5f);
+    }
+    return YES;
 }
 
 static NSEventModifierFlags sledgehammer_menu_flags_for_plugin_modifiers(uint32_t modifiers) {
@@ -200,12 +375,69 @@ static BOOL bounds_equal(Bounds3 a, Bounds3 b) {
     return YES;
 }
 
+static void sledgehammer_translate_mesh_range(ViewerVertex* vertices, size_t start, size_t count, Vec3 delta) {
+    if (vertices == NULL || count == 0u) {
+        return;
+    }
+    for (size_t index = start; index < start + count; ++index) {
+        vertices[index].position = vec3_add(vertices[index].position, delta);
+    }
+}
+
+static void sledgehammer_recompute_mesh_bounds(ViewerMesh* mesh) {
+    if (mesh == NULL) {
+        return;
+    }
+    mesh->bounds = bounds3_empty();
+    if (mesh->vertices == NULL) {
+        return;
+    }
+    for (size_t index = 0; index < mesh->vertexCount; ++index) {
+        bounds3_expand(&mesh->bounds, mesh->vertices[index].position);
+    }
+}
+
+static void sledgehammer_translate_mesh_for_entity(ViewerMesh* mesh, size_t entityIndex, Vec3 delta) {
+    if (mesh == NULL || mesh->faceRanges == NULL || mesh->vertices == NULL) {
+        return;
+    }
+
+    for (size_t rangeIndex = 0; rangeIndex < mesh->faceRangeCount; ++rangeIndex) {
+        const ViewerFaceRange* range = &mesh->faceRanges[rangeIndex];
+        if (range->entityIndex != entityIndex) {
+            continue;
+        }
+
+        if (range->vertexStart < mesh->vertexCount) {
+            size_t vertexCount = range->vertexCount;
+            if (range->vertexStart + vertexCount > mesh->vertexCount) {
+                vertexCount = mesh->vertexCount - range->vertexStart;
+            }
+            sledgehammer_translate_mesh_range(mesh->vertices, range->vertexStart, vertexCount, delta);
+        }
+
+        if (mesh->edgeVertices != NULL && range->edgeVertexStart < mesh->edgeVertexCount) {
+            size_t edgeVertexCount = range->edgeVertexCount;
+            if (range->edgeVertexStart + edgeVertexCount > mesh->edgeVertexCount) {
+                edgeVertexCount = mesh->edgeVertexCount - range->edgeVertexStart;
+            }
+            sledgehammer_translate_mesh_range(mesh->edgeVertices, range->edgeVertexStart, edgeVertexCount, delta);
+        }
+    }
+
+    sledgehammer_recompute_mesh_bounds(mesh);
+}
+
 static float entity_pick_radius(const VmfEntity* entity) {
     if (entity == NULL) {
         return 16.0f;
     }
     if (entity->kind == VmfEntityKindLight) {
         return fmaxf(24.0f, fminf(entity->range * 0.1f, 64.0f));
+    }
+    if (entity->kind == VmfEntityKindModel) {
+        float maxExtent = fmaxf(entity->modelHalfExtents.raw[0], fmaxf(entity->modelHalfExtents.raw[1], entity->modelHalfExtents.raw[2]));
+        return fmaxf(maxExtent, 24.0f);
     }
     return 16.0f;
 }
@@ -566,6 +798,9 @@ static bool sledgehammer_plugin_host_get_editor_stats(void* app_context,
     Vec3   _draftFaceRefNormals[128];
     size_t _draftFaceSideIndices[128];
     size_t _draftFaceCount;
+    BOOL _hasPointEntityDragPreview;
+    size_t _pointEntityDragEntityIndex;
+    Bounds3 _pointEntityDragBounds;
 }
 
 - (instancetype)initWithStartupPath:(NSString*)startupPath {
@@ -1841,7 +2076,9 @@ static bool sledgehammer_plugin_host_get_editor_stats(void* app_context,
         return NO;
     }
     const VmfEntity* entity = &self.scene.entities[self.selectedEntityIndex];
-    return entity->solidCount == 0 && entity->kind == VmfEntityKindLight;
+    return entity->solidCount == 0 &&
+        entity->kind != VmfEntityKindRoot &&
+        (entity->kind == VmfEntityKindLight || entity->kind == VmfEntityKindModel);
 }
 
 - (BOOL)selectedEntityBounds:(Bounds3*)outBounds {
@@ -1858,7 +2095,7 @@ static bool sledgehammer_plugin_host_get_editor_stats(void* app_context,
     size_t bestEntityIndex = 0;
     for (size_t entityIndex = 0; entityIndex < self.scene.entityCount; ++entityIndex) {
         const VmfEntity* entity = &self.scene.entities[entityIndex];
-        if (entity->solidCount != 0 || entity->kind != VmfEntityKindLight) {
+        if (entity->solidCount != 0 || (entity->kind != VmfEntityKindLight && entity->kind != VmfEntityKindModel)) {
             continue;
         }
 
@@ -1899,7 +2136,7 @@ static bool sledgehammer_plugin_host_get_editor_stats(void* app_context,
     Vec3 normalizedDirection = vec3_normalize(direction);
     for (size_t entityIndex = 0; entityIndex < self.scene.entityCount; ++entityIndex) {
         const VmfEntity* entity = &self.scene.entities[entityIndex];
-        if (entity->solidCount != 0 || entity->kind != VmfEntityKindLight) {
+        if (entity->solidCount != 0 || (entity->kind != VmfEntityKindLight && entity->kind != VmfEntityKindModel)) {
             continue;
         }
 
@@ -2545,8 +2782,22 @@ static bool sledgehammer_plugin_host_get_editor_stats(void* app_context,
         button.assetPath = item[@"path"];
         button.title = item[@"name"];
         button.imagePosition = NSImageAbove;
-        button.bezelStyle = NSBezelStyleTexturedRounded;
+        button.bordered = NO;
         button.imageScaling = NSImageScaleProportionallyUpOrDown;
+        button.alignment = NSTextAlignmentCenter;
+        button.font = [NSFont systemFontOfSize:12.0 weight:NSFontWeightMedium];
+        NovaModelAssetThumbnail thumbnail = {0};
+        char thumbnailError[256] = {0};
+        NSImage* thumbnailImage = nil;
+        if (nova_model_asset_read_thumbnail(button.assetPath.fileSystemRepresentation, &thumbnail, thumbnailError, (uint32_t)sizeof(thumbnailError))) {
+            thumbnailImage = sledgehammer_make_thumbnail_image(&thumbnail);
+        }
+        nova_model_asset_thumbnail_release(&thumbnail);
+        if (thumbnailImage == nil) {
+            thumbnailImage = sledgehammer_make_placeholder_thumbnail_image(button.title);
+        }
+        thumbnailImage.template = NO;
+        button.image = thumbnailImage;
         button.target = nil;
         [self.contentBrowserGridView addSubview:button];
     }];
@@ -2583,13 +2834,21 @@ static bool sledgehammer_plugin_host_get_editor_stats(void* app_context,
         NSFileManager* fileManager = [NSFileManager defaultManager];
         NSString* modelsDirectory = [self contentBrowserRootDirectory];
         [fileManager createDirectoryAtPath:modelsDirectory withIntermediateDirectories:YES attributes:nil error:nil];
+        NSMutableArray<NSString*>* failures = [NSMutableArray array];
         for (NSURL* url in panel.URLs) {
             NSString* targetPath = [[modelsDirectory stringByAppendingPathComponent:url.lastPathComponent.stringByDeletingPathExtension] stringByAppendingPathExtension:kSledgehammerModelAssetExtension];
-            NSData* placeholder = [NSData dataWithBytes:"SMDL" length:4u];
-            [placeholder writeToFile:targetPath atomically:YES];
+            char compileMessage[512] = {0};
+            if (!nova_model_asset_compile_from_source(url.path.fileSystemRepresentation, targetPath.fileSystemRepresentation, compileMessage, (uint32_t)sizeof(compileMessage))) {
+                NSString* filename = url.lastPathComponent ?: @"<unknown>";
+                NSString* reason = compileMessage[0] != '\0' ? [NSString stringWithUTF8String:compileMessage] : @"Unknown error";
+                [failures addObject:[NSString stringWithFormat:@"%@: %@", filename, reason]];
+            }
         }
         [self setContentBrowserCollapsed:NO animated:YES];
         [self reloadContentBrowser];
+        if (failures.count > 0) {
+            [self showError:[NSString stringWithFormat:@"Model import failed for:\n%@", [failures componentsJoinedByString:@"\n"]]];
+        }
     }];
 }
 
@@ -2733,7 +2992,8 @@ static bool sledgehammer_plugin_host_get_editor_stats(void* app_context,
     if (![self selectionIsPointEntity] || self.selectedEntityIndex >= self.scene.entityCount) {
         return NULL;
     }
-    return &_scene.entities[self.selectedEntityIndex];
+    VmfEntity* entity = &_scene.entities[self.selectedEntityIndex];
+    return entity->kind == VmfEntityKindLight ? entity : NULL;
 }
 
 - (void)refreshShapeSettingsPanel {
@@ -2914,15 +3174,24 @@ static bool sledgehammer_plugin_host_get_editor_stats(void* app_context,
 - (void)refreshGenericInspector {
     [self buildGenericInspectorView];
 
-    NSString* details = @"Select a brush, prefab, or light to edit it here.";
+    NSString* details = @"Select a brush, prefab, light, or model to edit it here.";
     if (self.editingPrefab) {
         details = [NSString stringWithFormat:@"Prefab with %zu solids. Use the controls above to regenerate it.", self.editingPrefab.solidCount];
     } else if ([self selectionIsPointEntity] && self.selectedEntityIndex < self.scene.entityCount) {
         const VmfEntity* entity = &self.scene.entities[self.selectedEntityIndex];
-        details = [NSString stringWithFormat:@"%@ light. %s, %s.",
-                   light_type_label(entity->lightType),
-                   entity->enabled ? "enabled" : "disabled",
-                   entity->castShadows ? "casts shadows" : "no shadows"];
+        if (entity->kind == VmfEntityKindLight) {
+            details = [NSString stringWithFormat:@"%@ light. %s, %s.",
+                       light_type_label(entity->lightType),
+                       entity->enabled ? "enabled" : "disabled",
+                       entity->castShadows ? "casts shadows" : "no shadows"];
+        } else {
+            NSString* assetName = [[NSString stringWithUTF8String:entity->modelAssetPath] lastPathComponent];
+            details = [NSString stringWithFormat:@"Model instance: %@ at %.0f, %.0f, %.0f.",
+                       assetName.length > 0 ? assetName : @"(missing asset)",
+                       entity->position.raw[0],
+                       entity->position.raw[1],
+                       entity->position.raw[2]];
+        }
     } else if (self.hasSelection && self.selectedEntityIndex < self.scene.entityCount) {
         const VmfEntity* entity = &self.scene.entities[self.selectedEntityIndex];
         details = [NSString stringWithFormat:@"Brush selection in entity %d with %zu solids.", entity->id, entity->solidCount];
@@ -2935,13 +3204,19 @@ static bool sledgehammer_plugin_host_get_editor_stats(void* app_context,
     [self buildInspectorUI];
 
     NSString* title = @"Inspector";
-    NSString* subtitle = @"Select a brush, prefab, or light to edit it.";
+    NSString* subtitle = @"Select a brush, prefab, light, or model to edit it.";
     if (self.editingPrefab) {
         title = [self shapeSettingsPanelTitleForTool:self.editingPrefab.tool];
         subtitle = @"Procedural prefab settings are docked here now.";
     } else if ([self selectionIsPointEntity]) {
-        title = @"Light";
-        subtitle = @"Point and spot light properties update the scene and renderer live.";
+        const VmfEntity* entity = self.selectedEntityIndex < self.scene.entityCount ? &self.scene.entities[self.selectedEntityIndex] : NULL;
+        if (entity != NULL && entity->kind == VmfEntityKindModel) {
+            title = @"Model";
+            subtitle = @"Model placement is editable through the viewport and saved in the scene.";
+        } else {
+            title = @"Light";
+            subtitle = @"Point and spot light properties update the scene and renderer live.";
+        }
     } else if (self.hasSelection) {
         title = self.hasFaceSelection ? @"Face" : @"Brush";
         subtitle = self.hasFaceSelection
@@ -4374,6 +4649,10 @@ static bool sledgehammer_plugin_host_get_editor_stats(void* app_context,
             selectionBounds = prefab.bounds;
         } else if (pointEntitySelection || groupedBrushSelection) {
             showSelection = [self selectedEntityBounds:&selectionBounds];
+            if (pointEntitySelection && _hasPointEntityDragPreview && _pointEntityDragEntityIndex == self.selectedEntityIndex) {
+                selectionBounds = _pointEntityDragBounds;
+                showSelection = bounds3_is_valid(selectionBounds) ? YES : showSelection;
+            }
         } else {
             char errorBuffer[256] = { 0 };
             showSelection = vmf_scene_solid_bounds(&_scene, self.selectedEntityIndex, self.selectedSolidIndex, &selectionBounds, errorBuffer, sizeof(errorBuffer));
@@ -4423,6 +4702,7 @@ static bool sledgehammer_plugin_host_get_editor_stats(void* app_context,
 }
 
 - (BOOL)rebuildMeshFromScene {
+    _hasPointEntityDragPreview = NO;
     viewer_mesh_free(&_mesh);
     char errorBuffer[512] = { 0 };
     if (!vmf_build_mesh(&_scene, &_mesh, errorBuffer, sizeof(errorBuffer))) {
@@ -4912,6 +5192,35 @@ static bool sledgehammer_plugin_host_get_editor_stats(void* app_context,
 - (void)duplicateSelection:(id)sender {
     (void)sender;
     if (!self.hasSelection) {
+        return;
+    }
+
+    if ([self selectionIsPointEntity]) {
+        SceneHistoryEntry* entry = [self captureHistoryEntry];
+        if (!entry) {
+            return;
+        }
+
+        size_t duplicatedEntityIndex = 0;
+        char errorBuffer[256] = { 0 };
+        if (!vmf_scene_duplicate_entity(&_scene,
+                                        self.selectedEntityIndex,
+                                        [self duplicateOffsetForActiveViewport],
+                                        &duplicatedEntityIndex,
+                                        errorBuffer,
+                                        sizeof(errorBuffer))) {
+            [self showError:[NSString stringWithUTF8String:errorBuffer]];
+            return;
+        }
+
+        self.hasSelection = YES;
+        self.selectedEntityIndex = duplicatedEntityIndex;
+        self.selectedSolidIndex = 0;
+        self.hasFaceSelection = NO;
+        self.selectedSideIndex = 0;
+        [self pushUndoEntry:entry];
+        [self markDocumentChangedWithLabel:@"Duplicate Entity"];
+        [self rebuildMeshFromScene];
         return;
     }
 
@@ -5555,6 +5864,58 @@ static bool sledgehammer_plugin_host_get_editor_stats(void* app_context,
     [self openPath:path];
 }
 
+- (void)placeModelAssetAtPath:(NSString*)path worldPoint:(Vec3)worldPoint {
+    if (!self.hasDocument) {
+        [self showError:@"Open or create a scene before placing a model."];
+        return;
+    }
+    if (path.length == 0) {
+        return;
+    }
+
+    Vec3 halfExtents = vec3_make(32.0f, 32.0f, 32.0f);
+    NSString* error = nil;
+    if (!sledgehammer_model_asset_bounds(path, NULL, &halfExtents, &error)) {
+        [self showError:error ?: @"Failed to inspect model asset."];
+        return;
+    }
+
+    SceneHistoryEntry* entry = [self captureHistoryEntry];
+    if (!entry) {
+        return;
+    }
+
+    size_t entityIndex = 0;
+    char errorBuffer[512] = { 0 };
+    NSString* displayName = path.lastPathComponent.stringByDeletingPathExtension;
+    if (!vmf_scene_add_model_entity(&_scene,
+                                    displayName.UTF8String,
+                                    path.fileSystemRepresentation,
+                                    vec3_add(worldPoint, vec3_make(0.0f, 0.0f, halfExtents.raw[2])),
+                                    halfExtents,
+                                    &entityIndex,
+                                    errorBuffer,
+                                    sizeof(errorBuffer))) {
+        [self showError:[NSString stringWithUTF8String:errorBuffer]];
+        return;
+    }
+
+    self.hasSelection = YES;
+    self.selectedEntityIndex = entityIndex;
+    self.selectedSolidIndex = 0;
+    self.hasFaceSelection = NO;
+    self.selectedSideIndex = 0;
+    self.editingPrefab = nil;
+    [self pushUndoEntry:entry];
+    [self markDocumentChangedWithLabel:@"Place Model"];
+    [self rebuildMeshFromScene];
+}
+
+- (void)viewport:(VmfViewport*)viewport didRequestPlaceDroppedPath:(NSString*)path atPoint:(Vec3)point {
+    [self setActiveViewport:viewport];
+    [self placeModelAssetAtPath:path worldPoint:point];
+}
+
 - (void)viewport:(VmfViewport*)viewport handleKeyDown:(NSEvent*)event {
     [self setActiveViewport:viewport];
     [self handleKey:event];
@@ -5857,31 +6218,63 @@ static bool sledgehammer_plugin_host_get_editor_stats(void* app_context,
             return;
         }
 
+        if (commit) {
+            Bounds3 sceneBounds = bounds3_empty();
+            if (![self selectedEntityBounds:&sceneBounds]) {
+                if (self.pendingHistoryEntry) {
+                    [self discardPendingHistoryEntry];
+                }
+                _hasPointEntityDragPreview = NO;
+                [self syncSelectionOverlay];
+                return;
+            }
+
+            Vec3 commitDelta = vec3_sub(bounds3_center(bounds), bounds3_center(sceneBounds));
+            if (vec3_length(commitDelta) < 0.001f) {
+                _hasPointEntityDragPreview = NO;
+                if (self.pendingHistoryEntry) {
+                    [self discardPendingHistoryEntry];
+                }
+                [self syncSelectionOverlay];
+                return;
+            }
+            if (![self beginPendingHistoryEntryWithLabel:@"Move Entity"]) {
+                return;
+            }
+
+            char errorBuffer[256] = { 0 };
+            if (!vmf_scene_translate_entity(&_scene, self.selectedEntityIndex, commitDelta, self.textureLockEnabled ? 1 : 0, errorBuffer, sizeof(errorBuffer))) {
+                _hasPointEntityDragPreview = NO;
+                [self discardPendingHistoryEntry];
+                [self syncSelectionOverlay];
+                return;
+            }
+            _hasPointEntityDragPreview = NO;
+            sledgehammer_translate_mesh_for_entity(&_mesh, self.selectedEntityIndex, commitDelta);
+            [self refreshViewportsFromCurrentMeshClearingMaterialMisses:NO];
+            [self commitPendingHistoryEntry];
+            return;
+        }
+
         Bounds3 currentBounds = bounds3_empty();
-        if (![self selectedEntityBounds:&currentBounds]) {
+        if (_hasPointEntityDragPreview && _pointEntityDragEntityIndex == self.selectedEntityIndex) {
+            currentBounds = _pointEntityDragBounds;
+        } else if (![self selectedEntityBounds:&currentBounds]) {
             return;
         }
 
         Vec3 delta = vec3_sub(bounds3_center(bounds), bounds3_center(currentBounds));
         if (vec3_length(delta) < 0.001f) {
-            if (commit && self.pendingHistoryEntry) {
-                [self commitPendingHistoryEntry];
-            }
             return;
         }
         if (![self beginPendingHistoryEntryWithLabel:@"Move Entity"]) {
             return;
         }
 
-        char errorBuffer[256] = { 0 };
-        if (!vmf_scene_translate_entity(&_scene, self.selectedEntityIndex, delta, self.textureLockEnabled ? 1 : 0, errorBuffer, sizeof(errorBuffer))) {
-            [self discardPendingHistoryEntry];
-            return;
-        }
-        [self rebuildMeshFromScene];
-        if (commit) {
-            [self commitPendingHistoryEntry];
-        }
+        _hasPointEntityDragPreview = YES;
+        _pointEntityDragEntityIndex = self.selectedEntityIndex;
+        _pointEntityDragBounds = bounds;
+        [self syncSelectionOverlay];
         return;
     }
 

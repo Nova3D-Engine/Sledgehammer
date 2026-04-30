@@ -55,6 +55,14 @@ int vmf_scene_add_light_entity(VmfScene* scene,
                                size_t* outEntityIndex,
                                char* errorBuffer,
                                size_t errorBufferSize);
+int vmf_scene_add_model_entity(VmfScene* scene,
+                               const char* name,
+                               const char* modelAssetPath,
+                               Vec3 position,
+                               Vec3 modelHalfExtents,
+                               size_t* outEntityIndex,
+                               char* errorBuffer,
+                               size_t errorBufferSize);
 int vmf_scene_add_brush_entity(VmfScene* scene,
                                const char* name,
                                const char* classname,
@@ -121,6 +129,12 @@ int vmf_scene_duplicate_solid(VmfScene* scene,
                               size_t* outSolidIndex,
                               char* errorBuffer,
                               size_t errorBufferSize);
+int vmf_scene_duplicate_entity(VmfScene* scene,
+                               size_t entityIndex,
+                               Vec3 offset,
+                               size_t* outEntityIndex,
+                               char* errorBuffer,
+                               size_t errorBufferSize);
 int vmf_scene_solid_bounds(const VmfScene* scene,
                            size_t entityIndex,
                            size_t solidIndex,
@@ -309,6 +323,26 @@ int vmf_scene_pick_ray(const VmfScene* scene,
                        Vec3* outHitPoint,
                        char* errorBuffer,
                        size_t errorBufferSize);
+
+/* Internal utility functions for brush creation and manipulation */
+typedef struct EditorSolidPlane {
+    Vec3 normal;
+    float distance;
+    char material[128];
+    int sideId;
+    Vec3 uaxis;
+    float uoffset;
+    Vec3 vaxis;
+    float voffset;
+    float uscale;
+    float vscale;
+    int preserveTextureFrame;
+} EditorSolidPlane;
+
+int build_solid_from_planes(VmfSolid* solid,
+                           const EditorSolidPlane* planes,
+                           size_t planeCount,
+                           size_t* nextId);
 
 #ifdef __cplusplus
 }

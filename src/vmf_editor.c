@@ -11,33 +11,15 @@ typedef struct EditorPlane {
     float distance;
 } EditorPlane;
 
-typedef struct EditorSolidPlane {
-    EditorPlane plane;
-    char material[128];
-    int sideId;
-    Vec3 uaxis;
-    float uoffset;
-    Vec3 vaxis;
-    float voffset;
-    float uscale;
-    float vscale;
-    int preserveTextureFrame;
-} EditorSolidPlane;
-
 typedef struct EditorFacePolygon {
     Vec3 points[256];
     size_t pointCount;
     EditorSolidPlane face;
 } EditorFacePolygon;
-
-static int build_solid_from_planes(VmfSolid* solid,
-                                   const EditorSolidPlane* planes,
-                                   size_t planeCount,
-                                   size_t* nextId);
 static void replace_solid_contents(VmfSolid* destination, VmfSolid* replacement);
 static void free_solid_contents(VmfSolid* solid);
 
-static int reserve_sides(VmfSolid* solid, size_t minimum) {
+int reserve_sides(VmfSolid* solid, size_t minimum) {
     if (solid->sideCapacity >= minimum) {
         return 1;
     }
@@ -204,7 +186,7 @@ static EditorPlane orient_plane_toward_interior(EditorPlane plane, Vec3 interior
     return plane;
 }
 
-static int intersect_planes(EditorPlane a, EditorPlane b, EditorPlane c, Vec3* outPoint) {
+int intersect_planes(EditorPlane a, EditorPlane b, EditorPlane c, Vec3* outPoint) {
     Vec3 bc = vec3_cross(b.normal, c.normal);
     float determinant = vec3_dot(a.normal, bc);
     if (fabsf(determinant) < 1e-5f) {
@@ -218,7 +200,7 @@ static int intersect_planes(EditorPlane a, EditorPlane b, EditorPlane c, Vec3* o
     return 1;
 }
 
-static int point_in_brush(const EditorPlane* planes, size_t planeCount, Vec3 point) {
+int point_in_brush(const EditorPlane* planes, size_t planeCount, Vec3 point) {
     for (size_t i = 0; i < planeCount; ++i) {
         float distance = vec3_dot(planes[i].normal, point) - planes[i].distance;
         if (distance > 0.05f) {
@@ -233,7 +215,7 @@ static int point_equals(Vec3 a, Vec3 b) {
     return vec3_length(delta) < 0.05f;
 }
 
-static int append_unique(Vec3* points, size_t* pointCount, Vec3 point) {
+int append_unique(Vec3* points, size_t* pointCount, Vec3 point) {
     for (size_t i = 0; i < *pointCount; ++i) {
         if (point_equals(points[i], point)) {
             return 1;
@@ -244,7 +226,7 @@ static int append_unique(Vec3* points, size_t* pointCount, Vec3 point) {
     return 1;
 }
 
-static void sort_polygon(Vec3* points, size_t pointCount, Vec3 normal) {
+void sort_polygon(Vec3* points, size_t pointCount, Vec3 normal) {
     if (pointCount < 3) {
         return;
     }
@@ -385,12 +367,14 @@ static int clone_entity(const VmfEntity* source, VmfEntity* outEntity) {
     outEntity->spotOuterDegrees = source->spotOuterDegrees;
     outEntity->kind = source->kind;
     outEntity->position = source->position;
+    outEntity->modelHalfExtents = source->modelHalfExtents;
     outEntity->color = source->color;
     outEntity->intensity = source->intensity;
     outEntity->range = source->range;
     memcpy(outEntity->classname, source->classname, sizeof(source->classname));
     memcpy(outEntity->targetname, source->targetname, sizeof(source->targetname));
     memcpy(outEntity->name, source->name, sizeof(source->name));
+    memcpy(outEntity->modelAssetPath, source->modelAssetPath, sizeof(source->modelAssetPath));
     if (source->solidCount == 0) {
         return 1;
     }
@@ -455,10 +439,16 @@ static Bounds3 entity_selection_bounds(const VmfEntity* entity) {
         return bounds;
     }
 
-    float markerHalfExtent = entity->kind == VmfEntityKindLight
-        ? fmaxf(24.0f, fminf(entity->range * 0.1f, 64.0f))
-        : 16.0f;
-    Vec3 extent = vec3_make(markerHalfExtent, markerHalfExtent, markerHalfExtent);
+    Vec3 extent = vec3_make(16.0f, 16.0f, 16.0f);
+    if (entity->kind == VmfEntityKindLight) {
+        float markerHalfExtent = fmaxf(24.0f, fminf(entity->range * 0.1f, 64.0f));
+        extent = vec3_make(markerHalfExtent, markerHalfExtent, markerHalfExtent);
+    } else if (entity->kind == VmfEntityKindModel) {
+        extent = entity->modelHalfExtents;
+        if (extent.raw[0] < 1.0f && extent.raw[1] < 1.0f && extent.raw[2] < 1.0f) {
+            extent = vec3_make(32.0f, 32.0f, 32.0f);
+        }
+    }
     bounds.min = vec3_sub(entity->position, extent);
     bounds.max = vec3_add(entity->position, extent);
     return bounds;
@@ -537,9 +527,14 @@ static int set_plane_from_points(EditorSolidPlane* plane,
         return 0;
     }
 
-    plane->plane.normal = vec3_normalize(normal);
-    plane->plane.distance = vec3_dot(plane->plane.normal, a);
-    plane->plane = orient_plane_toward_interior(plane->plane, interiorPoint);
+    {
+        EditorPlane _tmpP;
+        _tmpP.normal = vec3_normalize(normal);
+        _tmpP.distance = vec3_dot(_tmpP.normal, a);
+        _tmpP = orient_plane_toward_interior(_tmpP, interiorPoint);
+        plane->normal = _tmpP.normal;
+        plane->distance = _tmpP.distance;
+    }
     assign_material(plane->material, material);
     plane->sideId = 0;
     return 1;
@@ -838,7 +833,11 @@ static int collect_solid_planes(const VmfSolid* solid, EditorSolidPlane* outPlan
 
     Vec3 interiorPoint = solid_reference_point(solid);
     for (size_t sideIndex = 0; sideIndex < solid->sideCount; ++sideIndex) {
-        outPlanes[sideIndex].plane = orient_plane_toward_interior(plane_from_side(&solid->sides[sideIndex]), interiorPoint);
+        {
+            EditorPlane _tmpP = orient_plane_toward_interior(plane_from_side(&solid->sides[sideIndex]), interiorPoint);
+            outPlanes[sideIndex].normal = _tmpP.normal;
+            outPlanes[sideIndex].distance = _tmpP.distance;
+        }
         assign_material(outPlanes[sideIndex].material, solid->sides[sideIndex].material);
         outPlanes[sideIndex].sideId = solid->sides[sideIndex].id;
         outPlanes[sideIndex].uaxis = solid->sides[sideIndex].uaxis;
@@ -875,7 +874,8 @@ static int collect_solid_face_polygons(const VmfSolid* solid,
 
         EditorFacePolygon* face = &outFaces[faceCount];
         memset(face, 0, sizeof(*face));
-        face->face.plane = planes[sideIndex];
+        face->face.normal = planes[sideIndex].normal;
+        face->face.distance = planes[sideIndex].distance;
         assign_material(face->face.material, solid->sides[sideIndex].material);
         face->face.sideId = solid->sides[sideIndex].id;
 
@@ -904,7 +904,7 @@ static int collect_solid_face_polygons(const VmfSolid* solid,
             continue;
         }
 
-        sort_polygon(face->points, face->pointCount, face->face.plane.normal);
+        sort_polygon(face->points, face->pointCount, face->face.normal);
         faceCount += 1;
     }
 
@@ -916,7 +916,7 @@ static int plane_from_points_matching_reference(Vec3 a,
                                                 Vec3 b,
                                                 Vec3 c,
                                                 Vec3 referenceNormal,
-                                                EditorPlane* outPlane) {
+                                                EditorSolidPlane* outPlane) {
     Vec3 normal = vec3_cross(vec3_sub(b, a), vec3_sub(c, a));
     if (vec3_length(normal) < 1e-5f) {
         return 0;
@@ -1073,7 +1073,7 @@ static int rebuild_solid_from_planes_checked(VmfSolid* solid,
     return 1;
 }
 
-static int build_solid_from_planes(VmfSolid* solid,
+int build_solid_from_planes(VmfSolid* solid,
                                    const EditorSolidPlane* planes,
                                    size_t planeCount,
                                    size_t* nextId) {
@@ -1086,7 +1086,8 @@ static int build_solid_from_planes(VmfSolid* solid,
 
     EditorPlane planeBuffer[129];
     for (size_t planeIndex = 0; planeIndex < planeCount; ++planeIndex) {
-        planeBuffer[planeIndex] = planes[planeIndex].plane;
+        planeBuffer[planeIndex].normal = planes[planeIndex].normal;
+        planeBuffer[planeIndex].distance = planes[planeIndex].distance;
     }
 
     size_t builtCount = 0;
@@ -1102,7 +1103,11 @@ static int build_solid_from_planes(VmfSolid* solid,
                     continue;
                 }
                 Vec3 point;
-                if (!intersect_planes(planes[sideIndex].plane, planes[j].plane, planes[k].plane, &point)) {
+                {
+                    EditorPlane epS = {planes[sideIndex].normal, planes[sideIndex].distance};
+                    EditorPlane epJ = {planes[j].normal, planes[j].distance};
+                    EditorPlane epK = {planes[k].normal, planes[k].distance};
+                if (!intersect_planes(epS, epJ, epK, &point)) {
                     continue;
                 }
                 if (!point_in_brush(planeBuffer, planeCount, point)) {
@@ -1111,18 +1116,19 @@ static int build_solid_from_planes(VmfSolid* solid,
                 if (polygonCount < 256) {
                     append_unique(polygon, &polygonCount, point);
                 }
+                }
             }
         }
         if (polygonCount < 3) {
             continue;
         }
 
-        sort_polygon(polygon, polygonCount, planes[sideIndex].plane.normal);
+        sort_polygon(polygon, polygonCount, planes[sideIndex].normal);
         Vec3 p0 = polygon[0];
         Vec3 p1 = polygon[1];
         Vec3 p2 = polygon[2];
         Vec3 builtNormal = vec3_normalize(vec3_cross(vec3_sub(p1, p0), vec3_sub(p2, p0)));
-        if (vec3_dot(builtNormal, planes[sideIndex].plane.normal) < 0.0f) {
+        if (vec3_dot(builtNormal, planes[sideIndex].normal) < 0.0f) {
             Vec3 tmp = p1;
             p1 = p2;
             p2 = tmp;
@@ -1508,7 +1514,8 @@ int vmf_scene_save(const char* path, const VmfScene* scene, char* errorBuffer, s
         fprintf(file, "    \"id\" \"%d\"\n", entity->id);
         fprintf(file, "    \"type\" \"%s\"\n",
                 (entity->kind == VmfEntityKindRoot || entity->isWorld) ? "root" :
-                (entity->kind == VmfEntityKindLight ? "light" : "brush"));
+                    (entity->kind == VmfEntityKindLight ? "light" :
+                     (entity->kind == VmfEntityKindModel ? "model" : "brush")));
         if (entity->name[0]) {
             fprintf(file, "    \"name\" \"%s\"\n", entity->name);
         }
@@ -1528,6 +1535,10 @@ int vmf_scene_save(const char* path, const VmfScene* scene, char* errorBuffer, s
             fprintf(file, "    \"light_type\" \"%d\"\n", entity->lightType);
             fprintf(file, "    \"spot_inner_degrees\" \"%.6f\"\n", entity->spotInnerDegrees);
             fprintf(file, "    \"spot_outer_degrees\" \"%.6f\"\n", entity->spotOuterDegrees);
+        } else if (entity->kind == VmfEntityKindModel) {
+            fprintf(file, "    \"position\" \"[%.6f %.6f %.6f]\"\n", entity->position.raw[0], entity->position.raw[1], entity->position.raw[2]);
+            fprintf(file, "    \"model\" \"%s\"\n", entity->modelAssetPath);
+            fprintf(file, "    \"model_half_extents\" \"[%.6f %.6f %.6f]\"\n", entity->modelHalfExtents.raw[0], entity->modelHalfExtents.raw[1], entity->modelHalfExtents.raw[2]);
         }
 
         for (size_t solidIndex = 0; solidIndex < entity->solidCount; ++solidIndex) {
@@ -1897,6 +1908,43 @@ int vmf_scene_add_arch_brushes(VmfScene* scene,
     return 1;
 }
 
+int vmf_scene_add_model_entity(VmfScene* scene,
+                               const char* name,
+                               const char* modelAssetPath,
+                               Vec3 position,
+                               Vec3 modelHalfExtents,
+                               size_t* outEntityIndex,
+                               char* errorBuffer,
+                               size_t errorBufferSize) {
+    if (!scene || modelAssetPath == NULL || modelAssetPath[0] == '\0') {
+        snprintf(errorBuffer, errorBufferSize, "invalid model entity request");
+        return 0;
+    }
+    if (!reserve_entities(scene, scene->entityCount + 1)) {
+        snprintf(errorBuffer, errorBufferSize, "out of memory adding model entity");
+        return 0;
+    }
+
+    VmfEntity entity;
+    memset(&entity, 0, sizeof(entity));
+    entity.id = (int)scene_next_id(scene);
+    entity.kind = VmfEntityKindModel;
+    entity.position = position;
+    entity.modelHalfExtents = modelHalfExtents;
+    entity.enabled = 1;
+    entity.castShadows = 1;
+    strncpy(entity.classname, "prop_static", sizeof(entity.classname) - 1);
+    strncpy(entity.name, name && name[0] ? name : "Model", sizeof(entity.name) - 1);
+    strncpy(entity.modelAssetPath, modelAssetPath, sizeof(entity.modelAssetPath) - 1);
+
+    scene->entities[scene->entityCount] = entity;
+    if (outEntityIndex) {
+        *outEntityIndex = scene->entityCount;
+    }
+    scene->entityCount += 1;
+    return 1;
+}
+
 int vmf_scene_delete_solid(VmfScene* scene,
                            size_t entityIndex,
                            size_t solidIndex,
@@ -2087,6 +2135,43 @@ int vmf_scene_solid_vertices(const VmfScene* scene,
     return 1;
 }
 
+int vmf_scene_duplicate_entity(VmfScene* scene,
+                               size_t entityIndex,
+                               Vec3 offset,
+                               size_t* outEntityIndex,
+                               char* errorBuffer,
+                               size_t errorBufferSize) {
+    if (!scene || entityIndex >= scene->entityCount) {
+        snprintf(errorBuffer, errorBufferSize, "invalid duplicate entity request");
+        return 0;
+    }
+
+    const VmfEntity* source = &scene->entities[entityIndex];
+    if (source->isWorld || source->kind == VmfEntityKindRoot || source->solidCount != 0) {
+        snprintf(errorBuffer, errorBufferSize, "entity kind does not support direct duplication");
+        return 0;
+    }
+    if (!reserve_entities(scene, scene->entityCount + 1)) {
+        snprintf(errorBuffer, errorBufferSize, "out of memory duplicating entity");
+        return 0;
+    }
+
+    VmfEntity duplicate;
+    if (!clone_entity(source, &duplicate)) {
+        snprintf(errorBuffer, errorBufferSize, "out of memory cloning entity");
+        return 0;
+    }
+
+    duplicate.id = (int)scene_next_id(scene);
+    duplicate.position = vec3_add(duplicate.position, offset);
+    scene->entities[scene->entityCount] = duplicate;
+    if (outEntityIndex) {
+        *outEntityIndex = scene->entityCount;
+    }
+    scene->entityCount += 1;
+    return 1;
+}
+
 int vmf_scene_solid_vertex_refs(const VmfScene* scene,
                                 size_t entityIndex,
                                 size_t solidIndex,
@@ -2211,8 +2296,8 @@ int vmf_scene_move_solid_vertex(VmfScene* scene,
         if (!plane_from_points_matching_reference(faces[faceIndex].points[previousIndex],
                                                   newPosition,
                                                   faces[faceIndex].points[nextIndex],
-                                                  faces[faceIndex].face.plane.normal,
-                                                  &editedPlanes[faceIndex].plane)) {
+                                                  faces[faceIndex].face.normal,
+                                                  &editedPlanes[faceIndex])) {
             free_solid_contents(&original);
             snprintf(errorBuffer, errorBufferSize, "vertex move would create a degenerate face");
             return 0;
@@ -2255,7 +2340,7 @@ int vmf_scene_move_solid_vertex(VmfScene* scene,
 static int plane_from_polygon_matching_reference(const Vec3* points,
                                                  size_t pointCount,
                                                  Vec3 referenceNormal,
-                                                 EditorPlane* outPlane) {
+                                                 EditorSolidPlane* outPlane) {
     for (size_t i = 0; i < pointCount; ++i) {
         for (size_t j = i + 1; j < pointCount; ++j) {
             for (size_t k = j + 1; k < pointCount; ++k) {
@@ -2341,8 +2426,8 @@ int vmf_scene_move_solid_vertices(VmfScene* scene,
         }
 
         if (!plane_from_polygon_matching_reference(updatedPoints, pointCount,
-                                                   faces[faceIndex].face.plane.normal,
-                                                   &editedPlanes[faceIndex].plane)) {
+                                                   faces[faceIndex].face.normal,
+                                                   &editedPlanes[faceIndex])) {
             free_solid_contents(&original);
             snprintf(errorBuffer, errorBufferSize, "vertex move would create a degenerate face");
             return 0;
@@ -2553,8 +2638,8 @@ int vmf_scene_move_solid_edge(VmfScene* scene,
         if (!plane_from_points_matching_reference(movedStart,
                                                   movedEnd,
                                                   anchor,
-                                                  faces[faceIndex].face.plane.normal,
-                                                  &editedPlanes[faceIndex].plane)) {
+                                                  faces[faceIndex].face.normal,
+                                                  &editedPlanes[faceIndex])) {
             free_solid_contents(&original);
             snprintf(errorBuffer, errorBufferSize, "edge move would create a degenerate face");
             return 0;
@@ -2644,12 +2729,12 @@ int vmf_scene_split_solid_by_plane(VmfScene* scene,
     EditorSolidPlane backPlanes[130];
     memcpy(frontPlanes, sourcePlanes, sourcePlaneCount * sizeof(EditorSolidPlane));
     memcpy(backPlanes, sourcePlanes, sourcePlaneCount * sizeof(EditorSolidPlane));
-    frontPlanes[sourcePlaneCount].plane.normal = planeNormal;
-    frontPlanes[sourcePlaneCount].plane.distance = planeDistance;
+    frontPlanes[sourcePlaneCount].normal = planeNormal;
+    frontPlanes[sourcePlaneCount].distance = planeDistance;
     assign_material(frontPlanes[sourcePlaneCount].material, clipMaterial);
     frontPlanes[sourcePlaneCount].sideId = (int)nextId++;
-    backPlanes[sourcePlaneCount].plane.normal = vec3_scale(planeNormal, -1.0f);
-    backPlanes[sourcePlaneCount].plane.distance = -planeDistance;
+    backPlanes[sourcePlaneCount].normal = vec3_scale(planeNormal, -1.0f);
+    backPlanes[sourcePlaneCount].distance = -planeDistance;
     assign_material(backPlanes[sourcePlaneCount].material, clipMaterial);
     backPlanes[sourcePlaneCount].sideId = (int)nextId++;
 
@@ -2904,7 +2989,7 @@ int vmf_scene_justify_side_texture(VmfScene* scene,
     }
 
     if (vec3_length(side->uaxis) < 1e-5f || vec3_length(side->vaxis) < 1e-5f) {
-        default_face_wrap_axes(face.face.plane.normal, &side->uaxis, &side->vaxis);
+        default_face_wrap_axes(face.face.normal, &side->uaxis, &side->vaxis);
     }
     normalize_side_uv_frame(side);
     projected_face_bounds(&face, side->uaxis, side->vaxis, &minU, &maxU, &minV, &maxV);
@@ -3044,7 +3129,7 @@ int vmf_scene_wrap_align_solid_from_side(VmfScene* scene,
     int visited[128] = { 0 };
 
     VmfSide* seedSide = &solid->sides[sideIndex];
-    Vec3 seedNormal = faces[sideIndex].face.plane.normal;
+    Vec3 seedNormal = faces[sideIndex].face.normal;
     if (vec3_length(seedSide->uaxis) < 1e-5f || vec3_length(seedSide->vaxis) < 1e-5f) {
         default_face_wrap_axes(seedNormal, &seedSide->uaxis, &seedSide->vaxis);
     }
@@ -3060,7 +3145,7 @@ int vmf_scene_wrap_align_solid_from_side(VmfScene* scene,
     while (queueHead < queueTail) {
         size_t currentIndex = queue[queueHead++];
         VmfSide* currentSide = &solid->sides[currentIndex];
-        Vec3 currentNormal = faces[currentIndex].face.plane.normal;
+        Vec3 currentNormal = faces[currentIndex].face.normal;
         normalize_side_uv_frame(currentSide);
 
         for (size_t edgeIndex = 0; edgeIndex < edgeCount; ++edgeIndex) {
@@ -3081,7 +3166,7 @@ int vmf_scene_wrap_align_solid_from_side(VmfScene* scene,
             }
 
             VmfSide* neighborSide = &solid->sides[neighborIndex];
-            Vec3 neighborNormal = faces[neighborIndex].face.plane.normal;
+            Vec3 neighborNormal = faces[neighborIndex].face.normal;
             float sinAngle = vec3_dot(edgeAxis, vec3_cross(neighborNormal, currentNormal));
             float cosAngle = vec3_dot(neighborNormal, currentNormal);
             float unfoldAngle = atan2f(sinAngle, cosAngle);
@@ -3107,7 +3192,7 @@ int vmf_scene_wrap_align_solid_from_side(VmfScene* scene,
         }
         Vec3 fallbackU = vec3_make(0.0f, 0.0f, 0.0f);
         Vec3 fallbackV = vec3_make(0.0f, 0.0f, 0.0f);
-        default_face_wrap_axes(faces[faceIndex].face.plane.normal, &fallbackU, &fallbackV);
+        default_face_wrap_axes(faces[faceIndex].face.normal, &fallbackU, &fallbackV);
         solid->sides[faceIndex].uaxis = fallbackU;
         solid->sides[faceIndex].vaxis = fallbackV;
         solid->sides[faceIndex].uoffset = 0.0f;

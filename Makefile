@@ -5,9 +5,21 @@ ASSET_DIR := assets
 NOVA_ROOT := ..
 NOVA_SDK_ROOT ?=
 NOVA_CORE_DIR := $(NOVA_ROOT)/NovaCore
+NOVA_ASSET_DIR := $(NOVA_ROOT)/NovaAssetManager
 NOVA_EDITOR_DIR := $(NOVA_ROOT)/NovaEditor
+NOVA_MEMORY_DIR := $(NOVA_ROOT)/NovaMemoryManager
 NOVA_RENDERER_MTL_DIR := $(NOVA_ROOT)/NovaRendererMTL
 NOVA_RENDERER_VK_DIR := $(NOVA_ROOT)/NovaRendererVK
+NOVA_BUILD_DIR ?= ../../build
+NOVA_DEPS_DIR := $(NOVA_BUILD_DIR)/_deps
+IMGUI_DIR := $(NOVA_DEPS_DIR)/imgui-src
+IMGUIZMO_DIR := $(NOVA_DEPS_DIR)/imguizmo-src
+GLFW_DIR := $(NOVA_DEPS_DIR)/glfw-src
+TINYGLTF_DIR := $(NOVA_DEPS_DIR)/tinygltf-src
+TINYOBJLOADER_DIR := $(NOVA_DEPS_DIR)/tinyobjloader-src
+MIKKTSPACE_DIR := $(NOVA_DEPS_DIR)/mikktspace-src
+VMA_DIR := $(NOVA_DEPS_DIR)/vma-src
+FLECS_DIR := $(NOVA_DEPS_DIR)/flecs-src
 CGLM_PREFIX := $(shell brew --prefix cglm 2>/dev/null)
 USE_NOVA_SDK := $(if $(strip $(NOVA_SDK_ROOT)),1,0)
 SDK_OBJC_SOURCES :=
@@ -21,7 +33,12 @@ LOCAL_C_SOURCES := \
 	$(SRC_DIR)/vmf_editor.c \
 	$(SRC_DIR)/vmf_parser.c \
 	$(SRC_DIR)/vmf_geometry.c \
-	$(SRC_DIR)/file_index.c
+	$(SRC_DIR)/file_index.c \
+	$(SRC_DIR)/vmf_brush_creation.c \
+	$(SRC_DIR)/vmf_solid_manipulation.c \
+	$(SRC_DIR)/vmf_texture_operations.c
+
+LOCAL_CPP_SOURCES :=
 
 NOVA_SOURCE_OBJC_SOURCES := \
 	$(NOVA_RENDERER_MTL_DIR)/app_metal.mm \
@@ -35,14 +52,21 @@ NOVA_SOURCE_C_SOURCES := \
 	$(NOVA_CORE_DIR)/app_logging.c \
 	$(NOVA_CORE_DIR)/nova_scene_data.c \
 	$(NOVA_CORE_DIR)/nova_scene_ecs.c \
-	$(NOVA_RENDERER_MTL_DIR)/app_metal_shadow_common.c
+	$(NOVA_RENDERER_MTL_DIR)/app_metal_shadow_common.c \
+	$(MIKKTSPACE_DIR)/mikktspace.c
+
+NOVA_SOURCE_CPP_SOURCES := \
+	$(NOVA_ASSET_DIR)/gltf_loader.cpp \
+	$(NOVA_ASSET_DIR)/novamodel_asset.cpp
 
 OBJC_SOURCES := $(LOCAL_OBJC_SOURCES)
 C_SOURCES := $(LOCAL_C_SOURCES)
+CPP_SOURCES := $(LOCAL_CPP_SOURCES)
 
 ifeq ($(USE_NOVA_SDK),0)
 OBJC_SOURCES += $(NOVA_SOURCE_OBJC_SOURCES)
 C_SOURCES += $(NOVA_SOURCE_C_SOURCES)
+CPP_SOURCES += $(NOVA_SOURCE_CPP_SOURCES)
 endif
 
 METAL_SOURCES := $(SRC_DIR)/shaders.metal
@@ -50,6 +74,7 @@ FONT_ASSET := $(ASSET_DIR)/MaterialSymbolsOutlined.ttf
 
 CFLAGS := -Wall -Wextra -Wpedantic -O2 -g \
 	-I$(SRC_DIR) \
+	-Iinclude \
 	-I/opt/homebrew/include \
 	-I/usr/local/include
 ifneq ($(strip $(CGLM_PREFIX)),)
@@ -62,16 +87,29 @@ CFLAGS += \
 	-I"$(NOVA_SDK_ROOT)/include" \
 	-I"$(NOVA_SDK_ROOT)/include/backends" \
 	-I"$(NOVA_SDK_ROOT)/include/NovaCore" \
+	-I"$(NOVA_SDK_ROOT)/include/NovaAssetManager" \
 	-I"$(NOVA_SDK_ROOT)/include/NovaRendererMTL"
 SDK_LINK_FLAGS := -L"$(NOVA_SDK_ROOT)/lib" -Wl,-rpath,@executable_path
-SDK_LIBS := -lNovaRendererMTL -lNovaCore
+SDK_LIBS := -lNovaRendererMTL -lNovaCore -lNovaAssetManager
 SDK_RUNTIME_DEPS := $(BUILD_DIR)/.nova-sdk-runtime
 else
 CFLAGS += \
 	-I$(NOVA_CORE_DIR) \
+	-I$(NOVA_ASSET_DIR) \
 	-I$(NOVA_EDITOR_DIR) \
+	-I$(NOVA_MEMORY_DIR) \
 	-I$(NOVA_RENDERER_MTL_DIR) \
-	-I$(NOVA_RENDERER_VK_DIR)
+	-I$(NOVA_RENDERER_VK_DIR) \
+	-I$(IMGUI_DIR) \
+	-I$(IMGUI_DIR)/backends \
+	-I$(IMGUIZMO_DIR) \
+	-I$(GLFW_DIR)/include \
+	-I$(TINYGLTF_DIR) \
+	-I$(TINYOBJLOADER_DIR) \
+	-I$(MIKKTSPACE_DIR) \
+	-I$(VMA_DIR)/include \
+	-I$(FLECS_DIR)/include \
+	-I$(FLECS_DIR)
 SDK_LINK_FLAGS :=
 SDK_LIBS :=
 SDK_RUNTIME_DEPS :=
@@ -79,8 +117,10 @@ endif
 
 OBJC_ALL_SOURCES := $(OBJC_SOURCES) $(SDK_OBJC_SOURCES)
 C_ALL_SOURCES := $(C_SOURCES)
+CPP_ALL_SOURCES := $(CPP_SOURCES)
 OBJC_OBJECTS := $(addprefix $(BUILD_DIR)/,$(addsuffix .o,$(basename $(notdir $(OBJC_ALL_SOURCES)))))
 C_OBJECTS := $(addprefix $(BUILD_DIR)/,$(addsuffix .o,$(basename $(notdir $(C_ALL_SOURCES)))))
+CPP_OBJECTS := $(addprefix $(BUILD_DIR)/,$(addsuffix .o,$(basename $(notdir $(CPP_ALL_SOURCES)))))
 
 OBJCFLAGS := -fobjc-arc
 FRAMEWORKS := -framework Cocoa -framework CoreText -framework Foundation -framework GameController -framework Metal -framework MetalKit -framework QuartzCore -framework UniformTypeIdentifiers
@@ -129,11 +169,17 @@ $(BUILD_DIR)/$(basename $(notdir $1)).o: $1 | $(BUILD_DIR)
 	clang $(CFLAGS) -std=gnu11 -x c -c $$< -o $$@
 endef
 
+define COMPILE_CPP_OBJECT
+$(BUILD_DIR)/$(basename $(notdir $1)).o: $1 | $(BUILD_DIR)
+	clang++ $(CFLAGS) -std=c++17 -x c++ -c $$< -o $$@
+endef
+
 $(foreach source,$(OBJC_ALL_SOURCES),$(eval $(call COMPILE_OBJC_OBJECT,$(source))))
 $(foreach source,$(C_ALL_SOURCES),$(eval $(call COMPILE_C_OBJECT,$(source))))
+$(foreach source,$(CPP_ALL_SOURCES),$(eval $(call COMPILE_CPP_OBJECT,$(source))))
 
-$(BUILD_DIR)/$(APP_NAME): $(OBJC_OBJECTS) $(C_OBJECTS) $(BUILD_DIR)/default.metallib $(BUILD_DIR)/MaterialSymbolsOutlined.ttf $(BUILD_DIR)/content $(SDK_RUNTIME_DEPS) | $(BUILD_DIR)
-	clang++ $(OBJC_OBJECTS) $(C_OBJECTS) $(FRAMEWORKS) $(SDK_LINK_FLAGS) $(SDK_LIBS) -o $@
+$(BUILD_DIR)/$(APP_NAME): $(OBJC_OBJECTS) $(C_OBJECTS) $(CPP_OBJECTS) $(BUILD_DIR)/default.metallib $(BUILD_DIR)/MaterialSymbolsOutlined.ttf $(BUILD_DIR)/content $(SDK_RUNTIME_DEPS) | $(BUILD_DIR)
+	clang++ $(OBJC_OBJECTS) $(C_OBJECTS) $(CPP_OBJECTS) $(FRAMEWORKS) $(SDK_LINK_FLAGS) $(SDK_LIBS) -o $@
 
 run: all
 	./$(BUILD_DIR)/$(APP_NAME)
