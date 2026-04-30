@@ -77,6 +77,7 @@ static const int kPreviewBakeAtlasChartPadding = 2;
 static const float kPreviewBakeDebugExposureDefault = 12.0f;
 static const float kPreviewBakeDebugExposureMin = 0.125f;
 static const float kPreviewBakeDebugExposureMax = 64.0f;
+static const size_t kViewportBakeMaxFragments = 128u;
 static const int kPreviewBakeDisplayModeCombined = 0;
 static const int kPreviewBakeDisplayModeBakedOnly = 1;
 static const int kPreviewBakeDisplayModeDynamicOnly = 2;
@@ -127,6 +128,16 @@ typedef struct HwrtPathTraceVertex {
     simd_float4 tangent;
     simd_float4 uv;
 } HwrtPathTraceVertex;
+
+typedef struct ViewportBakePlane {
+    Vec3 normal;
+    float distance;
+} ViewportBakePlane;
+
+typedef struct ViewportBakePolygon {
+    Vec3 points[256];
+    size_t pointCount;
+} ViewportBakePolygon;
 
 @class VmfViewport;
 
@@ -230,6 +241,23 @@ static Vec3 world_up(void) {
     return vec3_make(0.0f, 0.0f, 1.0f);
 }
 
+static unsigned int viewport_hash_string(const char* text) {
+    unsigned int hash = 2166136261u;
+    while (text != NULL && *text) {
+        hash ^= (unsigned char)*text++;
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+static Vec3 viewport_color_from_material(const char* material) {
+    unsigned int hash = viewport_hash_string(material && material[0] ? material : "default");
+    float r = 0.35f + ((hash & 0xFFu) / 255.0f) * 0.55f;
+    float g = 0.35f + (((hash >> 8) & 0xFFu) / 255.0f) * 0.55f;
+    float b = 0.35f + (((hash >> 16) & 0xFFu) / 255.0f) * 0.55f;
+    return vec3_make(r, g, b);
+}
+
 static float viewport_saturate(float value) {
     return fminf(1.0f, fmaxf(0.0f, value));
 }
@@ -247,6 +275,460 @@ static BOOL viewport_face_range_is_bake_excluded(const ViewerFaceRange* range) {
         return YES;
     }
     return strcasecmp(range->material, "light_marker") == 0;
+}
+
+static ViewportBakePlane viewport_bake_plane_from_side(const VmfSide* side) {
+    Vec3 edgeA = vec3_sub(side->points[1], side->points[0]);
+    Vec3 edgeB = vec3_sub(side->points[2], side->points[0]);
+    Vec3 normal = vec3_normalize(vec3_cross(edgeA, edgeB));
+    ViewportBakePlane plane = {
+        .normal = normal,
+        .distance = vec3_dot(normal, side->points[0]),
+    };
+    return plane;
+}
+
+static Vec3 viewport_bake_solid_reference_point(const VmfSolid* solid) {
+    Vec3 center = vec3_make(0.0f, 0.0f, 0.0f);
+    float sampleCount = 0.0f;
+    for (size_t sideIndex = 0; sideIndex < solid->sideCount; ++sideIndex) {
+        for (size_t pointIndex = 0; pointIndex < 3; ++pointIndex) {
+            center = vec3_add(center, solid->sides[sideIndex].points[pointIndex]);
+            sampleCount += 1.0f;
+        }
+    }
+    return sampleCount > 0.0f ? vec3_scale(center, 1.0f / sampleCount) : center;
+}
+
+static ViewportBakePlane viewport_bake_orient_plane_outward(ViewportBakePlane plane, Vec3 interiorPoint) {
+    float signedDistance = vec3_dot(plane.normal, interiorPoint) - plane.distance;
+    if (signedDistance > 0.0f) {
+        plane.normal = vec3_scale(plane.normal, -1.0f);
+        plane.distance = -plane.distance;
+    }
+    return plane;
+}
+
+static int viewport_bake_intersect_planes(ViewportBakePlane a, ViewportBakePlane b, ViewportBakePlane c, Vec3* outPoint) {
+    Vec3 bc = vec3_cross(b.normal, c.normal);
+    float determinant = vec3_dot(a.normal, bc);
+    if (fabsf(determinant) < 1e-5f) {
+        return 0;
+    }
+
+    Vec3 termA = vec3_scale(bc, a.distance);
+    Vec3 termB = vec3_scale(vec3_cross(c.normal, a.normal), b.distance);
+    Vec3 termC = vec3_scale(vec3_cross(a.normal, b.normal), c.distance);
+    *outPoint = vec3_scale(vec3_add(vec3_add(termA, termB), termC), 1.0f / determinant);
+    return 1;
+}
+
+static int viewport_bake_point_in_brush(const ViewportBakePlane* planes, size_t planeCount, Vec3 point) {
+    for (size_t planeIndex = 0; planeIndex < planeCount; ++planeIndex) {
+        float distance = vec3_dot(planes[planeIndex].normal, point) - planes[planeIndex].distance;
+        if (distance > 0.05f) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int viewport_bake_point_equals(Vec3 a, Vec3 b) {
+    return vec3_length(vec3_sub(a, b)) < 0.05f;
+}
+
+static void viewport_bake_append_unique(Vec3* points, size_t* pointCount, Vec3 point) {
+    for (size_t pointIndex = 0; pointIndex < *pointCount; ++pointIndex) {
+        if (viewport_bake_point_equals(points[pointIndex], point)) {
+            return;
+        }
+    }
+    if (*pointCount < 256u) {
+        points[*pointCount] = point;
+        *pointCount += 1u;
+    }
+}
+
+static void viewport_bake_sort_polygon(Vec3* points, size_t pointCount, Vec3 normal) {
+    if (pointCount < 3u) {
+        return;
+    }
+
+    Vec3 center = vec3_make(0.0f, 0.0f, 0.0f);
+    for (size_t pointIndex = 0; pointIndex < pointCount; ++pointIndex) {
+        center = vec3_add(center, points[pointIndex]);
+    }
+    center = vec3_scale(center, 1.0f / (float)pointCount);
+
+    Vec3 tangentSeed = fabsf(normal.raw[2]) < 0.99f ? vec3_make(0.0f, 0.0f, 1.0f) : vec3_make(0.0f, 1.0f, 0.0f);
+    Vec3 axisX = vec3_normalize(vec3_cross(tangentSeed, normal));
+    Vec3 axisY = vec3_cross(normal, axisX);
+
+    for (size_t i = 0; i + 1 < pointCount; ++i) {
+        for (size_t j = i + 1; j < pointCount; ++j) {
+            Vec3 ai = vec3_sub(points[i], center);
+            Vec3 aj = vec3_sub(points[j], center);
+            float angleI = atan2f(vec3_dot(ai, axisY), vec3_dot(ai, axisX));
+            float angleJ = atan2f(vec3_dot(aj, axisY), vec3_dot(aj, axisX));
+            if (angleJ < angleI) {
+                Vec3 tmp = points[i];
+                points[i] = points[j];
+                points[j] = tmp;
+            }
+        }
+    }
+}
+
+static void viewport_bake_compute_uv(Vec3 position, const VmfSide* side, float* outU, float* outV) {
+    if (fabsf(side->uscale) > 1e-5f) {
+        *outU = (vec3_dot(position, side->uaxis) + side->uoffset) / (side->uscale * 0.5f);
+    } else {
+        *outU = vec3_dot(position, side->uaxis) + side->uoffset;
+    }
+    if (fabsf(side->vscale) > 1e-5f) {
+        *outV = (vec3_dot(position, side->vaxis) + side->voffset) / (side->vscale * 0.5f);
+    } else {
+        *outV = vec3_dot(position, side->vaxis) + side->voffset;
+    }
+}
+
+static Bounds3 viewport_bake_solid_bounds(const VmfSolid* solid) {
+    Bounds3 bounds = bounds3_empty();
+    for (size_t sideIndex = 0; sideIndex < solid->sideCount; ++sideIndex) {
+        for (size_t pointIndex = 0; pointIndex < 3; ++pointIndex) {
+            bounds3_expand(&bounds, solid->sides[sideIndex].points[pointIndex]);
+        }
+    }
+    return bounds;
+}
+
+static Bounds3 viewport_bake_polygon_bounds(const ViewportBakePolygon* polygon) {
+    Bounds3 bounds = bounds3_empty();
+    for (size_t pointIndex = 0; pointIndex < polygon->pointCount; ++pointIndex) {
+        bounds3_expand(&bounds, polygon->points[pointIndex]);
+    }
+    return bounds;
+}
+
+static BOOL viewport_bake_bounds_overlap(Bounds3 a, Bounds3 b, float pad) {
+    if (!bounds3_is_valid(a) || !bounds3_is_valid(b)) {
+        return NO;
+    }
+    return !(a.max.raw[0] < b.min.raw[0] - pad || a.min.raw[0] > b.max.raw[0] + pad ||
+             a.max.raw[1] < b.min.raw[1] - pad || a.min.raw[1] > b.max.raw[1] + pad ||
+             a.max.raw[2] < b.min.raw[2] - pad || a.min.raw[2] > b.max.raw[2] + pad);
+}
+
+static BOOL viewport_bake_collect_face_polygon(const VmfSolid* solid,
+                                               size_t sideIndex,
+                                               ViewportBakePolygon* outPolygon,
+                                               Vec3* outNormal) {
+    if (solid == NULL || outPolygon == NULL || sideIndex >= solid->sideCount || solid->sideCount > 128u) {
+        return NO;
+    }
+
+    ViewportBakePlane planes[128];
+    Vec3 interiorPoint = viewport_bake_solid_reference_point(solid);
+    for (size_t planeIndex = 0; planeIndex < solid->sideCount; ++planeIndex) {
+        planes[planeIndex] = viewport_bake_orient_plane_outward(viewport_bake_plane_from_side(&solid->sides[planeIndex]), interiorPoint);
+    }
+
+    outPolygon->pointCount = 0u;
+    for (size_t j = 0; j < solid->sideCount; ++j) {
+        if (j == sideIndex) {
+            continue;
+        }
+        for (size_t k = j + 1u; k < solid->sideCount; ++k) {
+            if (k == sideIndex) {
+                continue;
+            }
+            Vec3 point;
+            if (!viewport_bake_intersect_planes(planes[sideIndex], planes[j], planes[k], &point)) {
+                continue;
+            }
+            if (!viewport_bake_point_in_brush(planes, solid->sideCount, point)) {
+                continue;
+            }
+            viewport_bake_append_unique(outPolygon->points, &outPolygon->pointCount, point);
+        }
+    }
+
+    if (outPolygon->pointCount < 3u) {
+        return NO;
+    }
+
+    viewport_bake_sort_polygon(outPolygon->points, outPolygon->pointCount, planes[sideIndex].normal);
+    if (outNormal != NULL) {
+        *outNormal = planes[sideIndex].normal;
+    }
+    return YES;
+}
+
+static void viewport_bake_append_polygon_point(ViewportBakePolygon* polygon, Vec3 point) {
+    if (polygon->pointCount == 0u || !viewport_bake_point_equals(polygon->points[polygon->pointCount - 1u], point)) {
+        if (polygon->pointCount < 256u) {
+            polygon->points[polygon->pointCount++] = point;
+        }
+    }
+}
+
+static void viewport_bake_split_polygon_by_plane(const ViewportBakePolygon* polygon,
+                                                 ViewportBakePlane plane,
+                                                 float epsilon,
+                                                 ViewportBakePolygon* outOutside,
+                                                 ViewportBakePolygon* outInside) {
+    outOutside->pointCount = 0u;
+    outInside->pointCount = 0u;
+    if (polygon == NULL || polygon->pointCount < 3u) {
+        return;
+    }
+
+    for (size_t pointIndex = 0; pointIndex < polygon->pointCount; ++pointIndex) {
+        Vec3 current = polygon->points[pointIndex];
+        Vec3 next = polygon->points[(pointIndex + 1u) % polygon->pointCount];
+        float currentDist = vec3_dot(plane.normal, current) - plane.distance;
+        float nextDist = vec3_dot(plane.normal, next) - plane.distance;
+        BOOL currentOutside = currentDist > epsilon;
+        BOOL nextOutside = nextDist > epsilon;
+
+        if (!currentOutside) {
+            viewport_bake_append_polygon_point(outInside, current);
+        } else {
+            viewport_bake_append_polygon_point(outOutside, current);
+        }
+
+        if (currentOutside != nextOutside) {
+            float denom = currentDist - nextDist;
+            if (fabsf(denom) > 1e-6f) {
+                float t = currentDist / denom;
+                t = fminf(fmaxf(t, 0.0f), 1.0f);
+                Vec3 intersection = vec3_add(current, vec3_scale(vec3_sub(next, current), t));
+                viewport_bake_append_polygon_point(outOutside, intersection);
+                viewport_bake_append_polygon_point(outInside, intersection);
+            }
+        }
+    }
+
+    if (outOutside->pointCount >= 2u && viewport_bake_point_equals(outOutside->points[0], outOutside->points[outOutside->pointCount - 1u])) {
+        outOutside->pointCount -= 1u;
+    }
+    if (outInside->pointCount >= 2u && viewport_bake_point_equals(outInside->points[0], outInside->points[outInside->pointCount - 1u])) {
+        outInside->pointCount -= 1u;
+    }
+}
+
+static BOOL viewport_bake_subtract_polygon_by_solid(const ViewportBakePolygon* source,
+                                                    const VmfSolid* solid,
+                                                    ViewportBakePolygon* outFragments,
+                                                    size_t maxFragments,
+                                                    size_t* outFragmentCount) {
+    if (outFragmentCount == NULL || source == NULL || solid == NULL || solid->sideCount == 0u || solid->sideCount > 128u) {
+        return NO;
+    }
+
+    ViewportBakePlane planes[128];
+    Vec3 interiorPoint = viewport_bake_solid_reference_point(solid);
+    for (size_t planeIndex = 0; planeIndex < solid->sideCount; ++planeIndex) {
+        planes[planeIndex] = viewport_bake_orient_plane_outward(viewport_bake_plane_from_side(&solid->sides[planeIndex]), interiorPoint);
+    }
+
+    ViewportBakePolygon* insideQueue = (ViewportBakePolygon*)malloc(kViewportBakeMaxFragments * sizeof(ViewportBakePolygon));
+    ViewportBakePolygon* nextInsideQueue = (ViewportBakePolygon*)malloc(kViewportBakeMaxFragments * sizeof(ViewportBakePolygon));
+    if (insideQueue == NULL || nextInsideQueue == NULL) {
+        free(insideQueue);
+        free(nextInsideQueue);
+        return NO;
+    }
+    size_t insideCount = 1u;
+    size_t keptCount = 0u;
+    insideQueue[0] = *source;
+
+    for (size_t planeIndex = 0; planeIndex < solid->sideCount; ++planeIndex) {
+        size_t nextInsideCount = 0u;
+        for (size_t fragmentIndex = 0; fragmentIndex < insideCount; ++fragmentIndex) {
+            ViewportBakePolygon outsideFragment;
+            ViewportBakePolygon insideFragment;
+            viewport_bake_split_polygon_by_plane(&insideQueue[fragmentIndex],
+                                                 planes[planeIndex],
+                                                 0.05f,
+                                                 &outsideFragment,
+                                                 &insideFragment);
+            if (outsideFragment.pointCount >= 3u) {
+                if (keptCount >= maxFragments) {
+                    free(insideQueue);
+                    free(nextInsideQueue);
+                    return NO;
+                }
+                outFragments[keptCount++] = outsideFragment;
+            }
+            if (insideFragment.pointCount >= 3u) {
+                if (nextInsideCount >= kViewportBakeMaxFragments) {
+                    free(insideQueue);
+                    free(nextInsideQueue);
+                    return NO;
+                }
+                nextInsideQueue[nextInsideCount++] = insideFragment;
+            }
+        }
+        insideCount = nextInsideCount;
+        for (size_t fragmentIndex = 0; fragmentIndex < insideCount; ++fragmentIndex) {
+            insideQueue[fragmentIndex] = nextInsideQueue[fragmentIndex];
+        }
+        if (insideCount == 0u) {
+            break;
+        }
+    }
+
+    *outFragmentCount = keptCount;
+    free(insideQueue);
+    free(nextInsideQueue);
+    return YES;
+}
+
+static BOOL viewport_bake_collect_exposed_fragments(const VmfScene* scene,
+                                                    size_t entityIndex,
+                                                    size_t solidIndex,
+                                                    size_t sideIndex,
+                                                    ViewportBakePolygon* outFragments,
+                                                    size_t maxFragments,
+                                                    size_t* outFragmentCount,
+                                                    Vec3* outFaceNormal) {
+    if (outFragmentCount == NULL || outFragments == NULL || maxFragments == 0u ||
+        scene == NULL || entityIndex >= scene->entityCount) {
+        return NO;
+    }
+
+    const VmfEntity* entity = &scene->entities[entityIndex];
+    if (solidIndex >= entity->solidCount) {
+        return NO;
+    }
+    const VmfSolid* solid = &entity->solids[solidIndex];
+    if (sideIndex >= solid->sideCount || solid->sides[sideIndex].dispinfo.hasData) {
+        return NO;
+    }
+
+    ViewportBakePolygon basePolygon;
+    Vec3 faceNormal;
+    if (!viewport_bake_collect_face_polygon(solid, sideIndex, &basePolygon, &faceNormal)) {
+        return NO;
+    }
+
+    ViewportBakePolygon* fragments = (ViewportBakePolygon*)malloc(kViewportBakeMaxFragments * sizeof(ViewportBakePolygon));
+    ViewportBakePolygon* nextFragments = (ViewportBakePolygon*)malloc(kViewportBakeMaxFragments * sizeof(ViewportBakePolygon));
+    ViewportBakePolygon* subtractedFragments = (ViewportBakePolygon*)malloc(kViewportBakeMaxFragments * sizeof(ViewportBakePolygon));
+    if (fragments == NULL || nextFragments == NULL || subtractedFragments == NULL) {
+        free(fragments);
+        free(nextFragments);
+        free(subtractedFragments);
+        return NO;
+    }
+
+    size_t fragmentCount = 1u;
+    BOOL subtractionFailed = NO;
+    fragments[0] = basePolygon;
+
+    for (size_t occluderEntityIndex = 0u; occluderEntityIndex < scene->entityCount && !subtractionFailed; ++occluderEntityIndex) {
+        const VmfEntity* occluderEntity = &scene->entities[occluderEntityIndex];
+        if (occluderEntity->kind == VmfEntityKindLight || (!occluderEntity->isWorld && !occluderEntity->enabled)) {
+            continue;
+        }
+
+        for (size_t occluderSolidIndex = 0u; occluderSolidIndex < occluderEntity->solidCount && !subtractionFailed; ++occluderSolidIndex) {
+            const VmfSolid* occluderSolid = &occluderEntity->solids[occluderSolidIndex];
+            if (occluderSolid == solid) {
+                continue;
+            }
+
+            Bounds3 solidBounds = viewport_bake_solid_bounds(occluderSolid);
+            size_t nextFragmentCount = 0u;
+            for (size_t fragmentIndex = 0u; fragmentIndex < fragmentCount; ++fragmentIndex) {
+                Bounds3 fragmentBounds = viewport_bake_polygon_bounds(&fragments[fragmentIndex]);
+                if (!viewport_bake_bounds_overlap(fragmentBounds, solidBounds, 0.05f)) {
+                    if (nextFragmentCount >= maxFragments) {
+                        subtractionFailed = YES;
+                        break;
+                    }
+                    nextFragments[nextFragmentCount++] = fragments[fragmentIndex];
+                    continue;
+                }
+
+                size_t subtractedCount = 0u;
+                if (!viewport_bake_subtract_polygon_by_solid(&fragments[fragmentIndex],
+                                                              occluderSolid,
+                                                              subtractedFragments,
+                                                              maxFragments,
+                                                              &subtractedCount)) {
+                    subtractionFailed = YES;
+                    break;
+                }
+                if (nextFragmentCount + subtractedCount > maxFragments) {
+                    subtractionFailed = YES;
+                    break;
+                }
+                for (size_t subtractedIndex = 0u; subtractedIndex < subtractedCount; ++subtractedIndex) {
+                    nextFragments[nextFragmentCount++] = subtractedFragments[subtractedIndex];
+                }
+            }
+
+            fragmentCount = nextFragmentCount;
+            for (size_t fragmentIndex = 0u; fragmentIndex < fragmentCount; ++fragmentIndex) {
+                fragments[fragmentIndex] = nextFragments[fragmentIndex];
+            }
+            if (fragmentCount == 0u) {
+                break;
+            }
+        }
+    }
+
+    BOOL success = !subtractionFailed;
+    if (success) {
+        *outFragmentCount = fragmentCount;
+        for (size_t fragmentIndex = 0u; fragmentIndex < fragmentCount; ++fragmentIndex) {
+            outFragments[fragmentIndex] = fragments[fragmentIndex];
+        }
+        if (outFaceNormal != NULL) {
+            *outFaceNormal = faceNormal;
+        }
+    }
+
+    free(fragments);
+    free(nextFragments);
+    free(subtractedFragments);
+    return success;
+}
+
+static BOOL viewport_reserve_hwrt_bake_geometry(HwrtPathTraceVertex** ioVertices,
+                                                simd_float3** ioPositions,
+                                                size_t* ioCapacity,
+                                                size_t requiredCount) {
+    if (ioVertices == NULL || ioPositions == NULL || ioCapacity == NULL) {
+        return NO;
+    }
+    if (requiredCount <= *ioCapacity) {
+        return YES;
+    }
+
+    size_t newCapacity = *ioCapacity > 0u ? *ioCapacity : 1024u;
+    while (newCapacity < requiredCount) {
+        newCapacity *= 2u;
+    }
+
+    HwrtPathTraceVertex* newVertices = (HwrtPathTraceVertex*)realloc(*ioVertices, newCapacity * sizeof(HwrtPathTraceVertex));
+    simd_float3* newPositions = (simd_float3*)realloc(*ioPositions, newCapacity * sizeof(simd_float3));
+    if (newVertices == NULL || newPositions == NULL) {
+        if (newVertices != NULL) {
+            *ioVertices = newVertices;
+        }
+        if (newPositions != NULL) {
+            *ioPositions = newPositions;
+        }
+        return NO;
+    }
+
+    *ioVertices = newVertices;
+    *ioPositions = newPositions;
+    *ioCapacity = newCapacity;
+    return YES;
 }
 
 static uint32_t viewport_clamp_preview_bake_power_of_two(uint32_t value, uint32_t minValue, uint32_t maxValue) {
@@ -642,47 +1124,6 @@ static NSDictionary<NSString*, id>* viewport_build_baked_lightmap_payload(const 
     }
 
     simd_float4* lit = (simd_float4*)dilatedA.mutableBytes;
-    {
-        float minDim = (float)MAX(MIN(bakeWidth, bakeHeight), 1);
-        float blurMix = fminf(0.22f, fmaxf(0.04f, 18.0f / minDim));
-        NSMutableData* softenedData = [NSMutableData dataWithLength:texelCount * sizeof(simd_float4)];
-        if (softenedData.length == texelCount * sizeof(simd_float4)) {
-            simd_float4* softened = (simd_float4*)softenedData.mutableBytes;
-            memcpy(softened, lit, texelCount * sizeof(simd_float4));
-            for (int y = 0; y < bakeHeight; ++y) {
-                for (int x = 0; x < bakeWidth; ++x) {
-                    size_t idx = (size_t)y * (size_t)bakeWidth + (size_t)x;
-                    if (texels[idx].worldPosValid.w <= 0.5f) {
-                        continue;
-                    }
-
-                    simd_float3 center = lit[idx].xyz;
-                    simd_float3 neighborSum = center * 2.0f;
-                    float neighborWeight = 2.0f;
-                    const int offsets[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
-                    for (int neighborIndex = 0; neighborIndex < 4; ++neighborIndex) {
-                        int nx = x + offsets[neighborIndex][0];
-                        int ny = y + offsets[neighborIndex][1];
-                        if (nx < 0 || nx >= bakeWidth || ny < 0 || ny >= bakeHeight) {
-                            continue;
-                        }
-                        size_t nIdx = (size_t)ny * (size_t)bakeWidth + (size_t)nx;
-                        if (texels[nIdx].worldPosValid.w <= 0.5f) {
-                            continue;
-                        }
-                        neighborSum += lit[nIdx].xyz;
-                        neighborWeight += 1.0f;
-                    }
-
-                    simd_float3 blurred = neighborWeight > 0.0f ? neighborSum / neighborWeight : center;
-                    simd_float3 blended = simd_mix(center, blurred, blurMix);
-                    softened[idx] = simd_make_float4(blended.x, blended.y, blended.z, lit[idx].w);
-                }
-            }
-            lit = softened;
-            dilatedA = softenedData;
-        }
-    }
 
     float finalLumMin = 1e30f;
     float finalLumMax = 0.0f;
@@ -1664,6 +2105,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
 @property(nonatomic, assign) NovaToolMetalRenderer fullMetalRenderer;
 @property(nonatomic, assign) NovaSceneData importedSceneData;
 @property(nonatomic, assign) UiGizmoState fullRendererUiState;
+@property(nonatomic, assign) const VmfScene* vmfScene;
 @property(nonatomic, assign) NovaSceneWorld* sceneWorld;
 @property(nonatomic, assign) BOOL fullRendererInitialized;
 @property(nonatomic, assign) uint32_t fullRendererFrameIndex;
@@ -1957,6 +2399,10 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         };
         [self syncHeavyRendererSceneFromMesh:&mesh];
     }
+}
+
+- (void)setVmfScene:(const VmfScene*)scene {
+    _vmfScene = scene;
 }
 
 - (void)buildUI {
@@ -3250,6 +3696,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     float skyBrightness;
     float diffuseBounceIntensity;
     uint64_t bakeGeneration;
+    const VmfScene* vmfSceneSnapshot;
 
     if (self.previewBakeInProgress ||
         self.dimension != VmfViewportDimension3D ||
@@ -3296,6 +3743,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     skyBrightness = self.previewBakeSkyBrightness;
     diffuseBounceIntensity = self.previewBakeDiffuseBounceIntensity;
     revision = self.meshRevision;
+    vmfSceneSnapshot = self.vmfScene;
     bakeGeneration = self.previewBakeGeneration + 1u;
     self.previewBakeGeneration = bakeGeneration;
 
@@ -3497,8 +3945,9 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
             bakeTextureCount = 0u;
         }
 
-        HwrtPathTraceVertex* rtBakeVertices = (HwrtPathTraceVertex*)malloc(vertexCount * sizeof(HwrtPathTraceVertex));
-        simd_float3* rtBakePositions = (simd_float3*)malloc(vertexCount * sizeof(simd_float3));
+        size_t rtBakeVertexCapacity = vertexCount > 0u ? vertexCount : 1024u;
+        HwrtPathTraceVertex* rtBakeVertices = (HwrtPathTraceVertex*)malloc(rtBakeVertexCapacity * sizeof(HwrtPathTraceVertex));
+        simd_float3* rtBakePositions = (simd_float3*)malloc(rtBakeVertexCapacity * sizeof(simd_float3));
         size_t rtBakeVertexCount = 0u;
         if (rtBakeVertices == NULL || rtBakePositions == NULL) {
             dispatch_async(dispatch_get_main_queue(), ^{
@@ -3545,17 +3994,110 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                 brushKey = @"brush_0_0_0";
             }
             brushTriangleStartByKey[brushKey] = @((uint32_t)(rtBakeVertexCount / 3u));
-            brushTriangleCountByKey[brushKey] = @((uint32_t)(range.vertexCount / 3u));
+            uint32_t emittedTriangleCount = 0u;
+            BOOL emittedExposedSceneGeometry = NO;
 
-            for (size_t triVertex = 0; triVertex < range.vertexCount; ++triVertex) {
-                const ViewerVertex* src = &verticesSnapshot[range.vertexStart + triVertex];
-                rtBakeVertices[rtBakeVertexCount].position = simd_make_float4(src->position.raw[0], src->position.raw[1], src->position.raw[2], 1.0f);
-                rtBakeVertices[rtBakeVertexCount].normal = simd_make_float4(src->normal.raw[0], src->normal.raw[1], src->normal.raw[2], 0.0f);
-                rtBakeVertices[rtBakeVertexCount].tangent = simd_make_float4(1.0f, 0.0f, 0.0f, 1.0f);
-                rtBakeVertices[rtBakeVertexCount].uv = simd_make_float4(src->u, src->v, (float)bakeMaterialIndex, 0.0f);
-                rtBakePositions[rtBakeVertexCount] = simd_make_float3(src->position.raw[0], src->position.raw[1], src->position.raw[2]);
-                rtBakeVertexCount += 1u;
+            if (vmfSceneSnapshot != NULL && range.entityIndex < vmfSceneSnapshot->entityCount) {
+                const VmfEntity* entity = &vmfSceneSnapshot->entities[range.entityIndex];
+                if (range.solidIndex < entity->solidCount) {
+                    const VmfSolid* solid = &entity->solids[range.solidIndex];
+                    ViewportBakePolygon* exposedFragments = (ViewportBakePolygon*)malloc(kViewportBakeMaxFragments * sizeof(ViewportBakePolygon));
+                    size_t exposedFragmentCount = 0u;
+                    Vec3 faceNormal;
+                    if (exposedFragments != NULL &&
+                        viewport_bake_collect_exposed_fragments(vmfSceneSnapshot,
+                                                                range.entityIndex,
+                                                                range.solidIndex,
+                                                                range.sideIndex,
+                                                                exposedFragments,
+                                                                kViewportBakeMaxFragments,
+                                                                &exposedFragmentCount,
+                                                                &faceNormal)) {
+                        const VmfSide* side = &solid->sides[range.sideIndex];
+                        emittedExposedSceneGeometry = YES;
+                        for (size_t fragmentIndex = 0u; fragmentIndex < exposedFragmentCount; ++fragmentIndex) {
+                            const ViewportBakePolygon* fragment = &exposedFragments[fragmentIndex];
+                            if (fragment->pointCount < 3u) {
+                                continue;
+                            }
+                            size_t triangleVertexCount = (fragment->pointCount - 2u) * 3u;
+                            if (!viewport_reserve_hwrt_bake_geometry(&rtBakeVertices,
+                                                                     &rtBakePositions,
+                                                                     &rtBakeVertexCapacity,
+                                                                     rtBakeVertexCount + triangleVertexCount)) {
+                                dispatch_async(dispatch_get_main_queue(), ^{
+                                    self.previewBakeInProgress = NO;
+                                    self.previewBakeRunningTargetSamplesPerTexel = 0u;
+                                    self.previewBakeRunningBounceCount = 0u;
+                                    [self syncPreviewBakePanel];
+                                    NSLog(@"[lighting] HWRT preview bake failed to grow bake geometry buffers");
+                                });
+                                free(rtBakeVertices);
+                                free(rtBakePositions);
+                                free(verticesSnapshot);
+                                free(baseColorSnapshot);
+                                free(faceRangesSnapshot);
+                                return;
+                            }
+
+                            for (size_t vertexIndex = 1u; vertexIndex + 1u < fragment->pointCount; ++vertexIndex) {
+                                Vec3 positions[3] = {
+                                    fragment->points[0],
+                                    fragment->points[vertexIndex],
+                                    fragment->points[vertexIndex + 1u],
+                                };
+                                for (size_t triVertex = 0u; triVertex < 3u; ++triVertex) {
+                                    float u = 0.0f;
+                                    float v = 0.0f;
+                                    viewport_bake_compute_uv(positions[triVertex], side, &u, &v);
+                                    rtBakeVertices[rtBakeVertexCount].position = simd_make_float4(positions[triVertex].raw[0], positions[triVertex].raw[1], positions[triVertex].raw[2], 1.0f);
+                                    rtBakeVertices[rtBakeVertexCount].normal = simd_make_float4(faceNormal.raw[0], faceNormal.raw[1], faceNormal.raw[2], 0.0f);
+                                    rtBakeVertices[rtBakeVertexCount].tangent = simd_make_float4(1.0f, 0.0f, 0.0f, 1.0f);
+                                    rtBakeVertices[rtBakeVertexCount].uv = simd_make_float4(u, v, (float)bakeMaterialIndex, 0.0f);
+                                    rtBakePositions[rtBakeVertexCount] = simd_make_float3(positions[triVertex].raw[0], positions[triVertex].raw[1], positions[triVertex].raw[2]);
+                                    rtBakeVertexCount += 1u;
+                                }
+                                emittedTriangleCount += 1u;
+                            }
+                        }
+                    }
+                    free(exposedFragments);
+                }
             }
+
+            if (!emittedExposedSceneGeometry) {
+                emittedTriangleCount = (uint32_t)(range.vertexCount / 3u);
+                if (!viewport_reserve_hwrt_bake_geometry(&rtBakeVertices,
+                                                         &rtBakePositions,
+                                                         &rtBakeVertexCapacity,
+                                                         rtBakeVertexCount + range.vertexCount)) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        self.previewBakeInProgress = NO;
+                        self.previewBakeRunningTargetSamplesPerTexel = 0u;
+                        self.previewBakeRunningBounceCount = 0u;
+                        [self syncPreviewBakePanel];
+                        NSLog(@"[lighting] HWRT preview bake failed to grow bake geometry buffers");
+                    });
+                    free(rtBakeVertices);
+                    free(rtBakePositions);
+                    free(verticesSnapshot);
+                    free(baseColorSnapshot);
+                    free(faceRangesSnapshot);
+                    return;
+                }
+
+                for (size_t triVertex = 0; triVertex < range.vertexCount; ++triVertex) {
+                    const ViewerVertex* src = &verticesSnapshot[range.vertexStart + triVertex];
+                    rtBakeVertices[rtBakeVertexCount].position = simd_make_float4(src->position.raw[0], src->position.raw[1], src->position.raw[2], 1.0f);
+                    rtBakeVertices[rtBakeVertexCount].normal = simd_make_float4(src->normal.raw[0], src->normal.raw[1], src->normal.raw[2], 0.0f);
+                    rtBakeVertices[rtBakeVertexCount].tangent = simd_make_float4(1.0f, 0.0f, 0.0f, 1.0f);
+                    rtBakeVertices[rtBakeVertexCount].uv = simd_make_float4(src->u, src->v, (float)bakeMaterialIndex, 0.0f);
+                    rtBakePositions[rtBakeVertexCount] = simd_make_float3(src->position.raw[0], src->position.raw[1], src->position.raw[2]);
+                    rtBakeVertexCount += 1u;
+                }
+            }
+
+            brushTriangleCountByKey[brushKey] = @(emittedTriangleCount);
         }
 
         if (rtBakeVertexCount < 3u) {
@@ -3750,6 +4292,135 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
             bakeHeight = brushHeights[slot].intValue;
             accumData = brushAccums[slot];
             accum = (HwrtBakeTexelAccum*)accumData.mutableBytes;
+
+            BOOL usedExposedReceiverFragments = NO;
+            if (vmfSceneSnapshot != NULL && range.entityIndex < vmfSceneSnapshot->entityCount) {
+                const VmfEntity* entity = &vmfSceneSnapshot->entities[range.entityIndex];
+                if (range.solidIndex < entity->solidCount) {
+                    const VmfSolid* solid = &entity->solids[range.solidIndex];
+                    ViewportBakePolygon* exposedFragments = (ViewportBakePolygon*)malloc(kViewportBakeMaxFragments * sizeof(ViewportBakePolygon));
+                    size_t exposedFragmentCount = 0u;
+                    Vec3 faceNormal;
+                    if (exposedFragments != NULL &&
+                        viewport_bake_collect_exposed_fragments(vmfSceneSnapshot,
+                                                                range.entityIndex,
+                                                                range.solidIndex,
+                                                                range.sideIndex,
+                                                                exposedFragments,
+                                                                kViewportBakeMaxFragments,
+                                                                &exposedFragmentCount,
+                                                                &faceNormal)) {
+                        const VmfSide* side = &solid->sides[range.sideIndex];
+                        Vec3 faceColor = viewport_color_from_material(side->material);
+                        uint32_t trianglePrimitiveId = (brushTriangleStartByKey[brushKey] != nil ? brushTriangleStartByKey[brushKey].unsignedIntValue : 0u);
+                        float uvMinU = brushUvMinUByKey[brushKey] != nil ? brushUvMinUByKey[brushKey].floatValue : 0.0f;
+                        float uvMinV = brushUvMinVByKey[brushKey] != nil ? brushUvMinVByKey[brushKey].floatValue : 0.0f;
+                        float uvMaxU = brushUvMaxUByKey[brushKey] != nil ? brushUvMaxUByKey[brushKey].floatValue : 1.0f;
+                        float uvMaxV = brushUvMaxVByKey[brushKey] != nil ? brushUvMaxVByKey[brushKey].floatValue : 1.0f;
+                        float uvSpanU = fmaxf(uvMaxU - uvMinU, 1e-4f);
+                        float uvSpanV = fmaxf(uvMaxV - uvMinV, 1e-4f);
+
+                        usedExposedReceiverFragments = YES;
+                        for (size_t fragmentIndex = 0u; fragmentIndex < exposedFragmentCount; ++fragmentIndex) {
+                            const ViewportBakePolygon* fragment = &exposedFragments[fragmentIndex];
+                            if (fragment->pointCount < 3u) {
+                                continue;
+                            }
+
+                            for (size_t vertexIndex = 1u; vertexIndex + 1u < fragment->pointCount; ++vertexIndex) {
+                                Vec3 triPositions[3] = {
+                                    fragment->points[0],
+                                    fragment->points[vertexIndex],
+                                    fragment->points[vertexIndex + 1u],
+                                };
+                                float triU[3];
+                                float triV[3];
+                                for (size_t triVertex = 0u; triVertex < 3u; ++triVertex) {
+                                    viewport_bake_compute_uv(triPositions[triVertex], side, &triU[triVertex], &triV[triVertex]);
+                                }
+
+                                float x0 = ((triU[0] - uvMinU) / uvSpanU) * (float)bakeWidth;
+                                float y0 = ((triV[0] - uvMinV) / uvSpanV) * (float)bakeHeight;
+                                float x1 = ((triU[1] - uvMinU) / uvSpanU) * (float)bakeWidth;
+                                float y1 = ((triV[1] - uvMinV) / uvSpanV) * (float)bakeHeight;
+                                float x2 = ((triU[2] - uvMinU) / uvSpanU) * (float)bakeWidth;
+                                float y2 = ((triV[2] - uvMinV) / uvSpanV) * (float)bakeHeight;
+                                float denom = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2);
+
+                                float minU = floorf(fminf(fminf(x0, x1), x2));
+                                float maxU = ceilf(fmaxf(fmaxf(x0, x1), x2));
+                                float minV = floorf(fminf(fminf(y0, y1), y2));
+                                float maxV = ceilf(fmaxf(fmaxf(y0, y1), y2));
+
+                                if (fabsf(denom) < 1e-6f) {
+                                    continue;
+                                }
+
+                                if (minU < 0.0f) minU = 0.0f;
+                                if (minV < 0.0f) minV = 0.0f;
+                                if (maxU > (float)(bakeWidth - 1)) maxU = (float)(bakeWidth - 1);
+                                if (maxV > (float)(bakeHeight - 1)) maxV = (float)(bakeHeight - 1);
+
+                                for (int py = (int)minV; py <= (int)maxV; ++py) {
+                                    for (int px = (int)minU; px <= (int)maxU; ++px) {
+                                        float sampleU = (float)px + 0.5f;
+                                        float sampleV = (float)py + 0.5f;
+                                        float w0 = ((y1 - y2) * (sampleU - x2) + (x2 - x1) * (sampleV - y2)) / denom;
+                                        float w1 = ((y2 - y0) * (sampleU - x2) + (x0 - x2) * (sampleV - y2)) / denom;
+                                        float w2 = 1.0f - w0 - w1;
+                                        if (w0 < -1e-4f || w1 < -1e-4f || w2 < -1e-4f) {
+                                            continue;
+                                        }
+
+                                        simd_float3 worldPos = simd_make_float3(triPositions[0].raw[0], triPositions[0].raw[1], triPositions[0].raw[2]) * w0 +
+                                                               simd_make_float3(triPositions[1].raw[0], triPositions[1].raw[1], triPositions[1].raw[2]) * w1 +
+                                                               simd_make_float3(triPositions[2].raw[0], triPositions[2].raw[1], triPositions[2].raw[2]) * w2;
+                                        simd_float3 normal = simd_make_float3(faceNormal.raw[0], faceNormal.raw[1], faceNormal.raw[2]);
+                                        simd_float3 albedo = simd_make_float3(faceColor.raw[0], faceColor.raw[1], faceColor.raw[2]);
+                                        size_t texelIndex = (size_t)py * (size_t)bakeWidth + (size_t)px;
+
+                                        if (accum[texelIndex].sourceTriangleIdPlusOne == 0u) {
+                                            accum[texelIndex].sourceTriangleIdPlusOne = trianglePrimitiveId + 1u;
+                                        }
+
+                                        accum[texelIndex].worldPosWeight.x += worldPos.x;
+                                        accum[texelIndex].worldPosWeight.y += worldPos.y;
+                                        accum[texelIndex].worldPosWeight.z += worldPos.z;
+                                        accum[texelIndex].worldPosWeight.w += 1.0f;
+                                        accum[texelIndex].normalSum.x += normal.x;
+                                        accum[texelIndex].normalSum.y += normal.y;
+                                        accum[texelIndex].normalSum.z += normal.z;
+                                        accum[texelIndex].albedoSum.x += albedo.x;
+                                        accum[texelIndex].albedoSum.y += albedo.y;
+                                        accum[texelIndex].albedoSum.z += albedo.z;
+                                    }
+                                }
+
+                                processedTriangles += 1u;
+                                trianglePrimitiveId += 1u;
+                                {
+                                    int percent = (int)((processedTriangles * 100u) / totalTriangles);
+                                    if (percent != lastPercent && (percent == 0 || percent % 5 == 0 || percent == 100)) {
+                                        int filled = percent / 5;
+                                        char bar[21];
+                                        for (int i = 0; i < 20; ++i) {
+                                            bar[i] = i < filled ? '#' : '-';
+                                        }
+                                        bar[20] = '\0';
+                                        NSLog(@"[lighting] bake unwrap [%s] %d%% (%u/%u triangles)", bar, percent, processedTriangles, totalTriangles);
+                                        lastPercent = percent;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    free(exposedFragments);
+                }
+            }
+
+            if (usedExposedReceiverFragments) {
+                continue;
+            }
 
             for (size_t triOffset = 0; triOffset + 2 < range.vertexCount; triOffset += 3) {
                 const ViewerVertex* v0 = &verticesSnapshot[range.vertexStart + triOffset + 0u];

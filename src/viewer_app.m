@@ -1206,6 +1206,7 @@ static bool sledgehammer_plugin_host_get_editor_stats(void* app_context,
     for (VmfViewport* viewport in self.viewports) {
         viewport.delegate = self;
         viewport.gridSize = self.gridSize;
+        [viewport setVmfScene:&_scene];
         [viewport setSceneWorld:_sceneWorld];
     }
 
@@ -4430,6 +4431,7 @@ static bool sledgehammer_plugin_host_get_editor_stats(void* app_context,
     }
 
     for (VmfViewport* viewport in self.viewports) {
+        [viewport setVmfScene:&_scene];
         [viewport updateMesh:&_mesh];
         if (self.materialsDirectory) {
             // Always clear miss-cache entries so newly added texture files are picked up
