@@ -296,7 +296,7 @@ static NSImage* sledgehammer_make_thumbnail_image(const NovaModelAssetThumbnail*
     bitmap.size = NSMakeSize((CGFloat)thumbnail->width, (CGFloat)thumbnail->height);
     NSImage* image = [[NSImage alloc] initWithSize:NSMakeSize((CGFloat)thumbnail->width, (CGFloat)thumbnail->height)];
     [image addRepresentation:bitmap];
-    image.template = NO;
+    [image setTemplate:NO];
     return image;
 }
 
@@ -328,7 +328,7 @@ static NSImage* sledgehammer_make_placeholder_thumbnail_image(NSString* title) {
     [@"No embedded thumbnail" drawInRect:NSMakeRect(20.0, 54.0, size.width - 40.0, 24.0) withAttributes:subtitleAttributes];
 
     [image unlockFocus];
-    image.template = NO;
+    [image setTemplate:NO];
     return image;
 }
 
@@ -2911,7 +2911,7 @@ static bool sledgehammer_plugin_host_get_editor_stats(void* app_context,
         if (thumbnailImage == nil) {
             thumbnailImage = sledgehammer_make_placeholder_thumbnail_image(button.title);
         }
-        thumbnailImage.template = NO;
+        [thumbnailImage setTemplate:NO];
         button.image = thumbnailImage;
         button.target = nil;
         [self.contentBrowserGridView addSubview:button];
