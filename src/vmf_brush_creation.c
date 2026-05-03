@@ -8,24 +8,6 @@
 
 #include "vmf_editor.h"
 
-typedef struct EditorPlane {
-    Vec3 normal;
-    float distance;
-} EditorPlane;
-
-typedef struct EditorSolidPlane {
-    EditorPlane plane;
-    char material[128];
-    int sideId;
-    Vec3 uaxis;
-    float uoffset;
-    Vec3 vaxis;
-    float voffset;
-    float uscale;
-    float vscale;
-    int preserveTextureFrame;
-} EditorSolidPlane;
-
 static int remaining_axis(VmfBrushAxis first, VmfBrushAxis second) {
     for (int axis = 0; axis < 3; ++axis) {
         if (axis != (int)first && axis != (int)second) {
@@ -41,13 +23,12 @@ static void assign_material(char destination[128], const char* material) {
     destination[127] = '\0';
 }
 
-static EditorPlane orient_plane_toward_interior(EditorPlane plane, Vec3 interiorPoint) {
-    float signedDistance = vec3_dot(plane.normal, interiorPoint) - plane.distance;
+static void orient_plane_toward_interior(EditorSolidPlane* plane, Vec3 interiorPoint) {
+    float signedDistance = vec3_dot(plane->normal, interiorPoint) - plane->distance;
     if (signedDistance > 0.0f) {
-        plane.normal = vec3_scale(plane.normal, -1.0f);
-        plane.distance = -plane.distance;
+        plane->normal = vec3_scale(plane->normal, -1.0f);
+        plane->distance = -plane->distance;
     }
-    return plane;
 }
 
 static int set_plane_from_points(EditorSolidPlane* plane,
@@ -61,9 +42,9 @@ static int set_plane_from_points(EditorSolidPlane* plane,
         return 0;
     }
 
-    plane->plane.normal = vec3_normalize(normal);
-    plane->plane.distance = vec3_dot(plane->plane.normal, a);
-    plane->plane = orient_plane_toward_interior(plane->plane, interiorPoint);
+    plane->normal = vec3_normalize(normal);
+    plane->distance = vec3_dot(plane->normal, a);
+    orient_plane_toward_interior(plane, interiorPoint);
     assign_material(plane->material, material);
     plane->sideId = 0;
     return 1;

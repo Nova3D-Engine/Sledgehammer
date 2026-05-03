@@ -33,10 +33,7 @@ LOCAL_C_SOURCES := \
 	$(SRC_DIR)/vmf_editor.c \
 	$(SRC_DIR)/vmf_parser.c \
 	$(SRC_DIR)/vmf_geometry.c \
-	$(SRC_DIR)/file_index.c \
-	$(SRC_DIR)/vmf_brush_creation.c \
-	$(SRC_DIR)/vmf_solid_manipulation.c \
-	$(SRC_DIR)/vmf_texture_operations.c
+	$(SRC_DIR)/file_index.c
 
 LOCAL_CPP_SOURCES :=
 
