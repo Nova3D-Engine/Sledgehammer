@@ -5,8 +5,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "novamodel_asset.h"
-
 typedef struct Plane {
     Vec3 normal;
     float distance;
@@ -129,6 +127,7 @@ static Plane orient_plane_toward_interior(Plane plane, Vec3 interiorPoint) {
         plane.normal = vec3_scale(plane.normal, -1.0f);
         plane.distance = -plane.distance;
     }
+
     return plane;
 }
 
@@ -497,89 +496,80 @@ static int append_light_marker(ViewerMesh* mesh, const VmfEntity* entity, size_t
     return 1;
 }
 
-static Vec3 scene_bounds_center(const NovaSceneData* scene) {
-    Bounds3 bounds = bounds3_empty();
-    for (uint32_t vertexIndex = 0; vertexIndex < scene->vertexCount; ++vertexIndex) {
-        const NovaSceneVertex* vertex = &scene->vertices[vertexIndex];
-        bounds3_expand(&bounds, vec3_make(vertex->position[0], vertex->position[1], vertex->position[2]));
-    }
-    return bounds3_is_valid(bounds) ? bounds3_center(bounds) : vec3_make(0.0f, 0.0f, 0.0f);
-}
+static int append_model_marker(ViewerMesh* mesh, const VmfEntity* entity, size_t entityIndex) {
+    Vec3 center = entity->position;
+    Vec3 extents = entity->modelHalfExtents;
+    Vec3 color = vec3_make(0.30f, 0.78f, 0.98f);
+    size_t vertexStart = mesh->vertexCount;
+    size_t edgeVertexStart = mesh->edgeVertexCount;
 
-static int append_model_entity(ViewerMesh* mesh, const VmfEntity* entity, size_t entityIndex) {
-    if (entity->modelAssetPath[0] == '\0') {
-        return 1;
+    if (extents.raw[0] <= 1e-3f) {
+        extents.raw[0] = 16.0f;
+    }
+    if (extents.raw[1] <= 1e-3f) {
+        extents.raw[1] = 16.0f;
+    }
+    if (extents.raw[2] <= 1e-3f) {
+        extents.raw[2] = 16.0f;
     }
 
-    NovaSceneData scene;
-    nova_scene_data_init(&scene);
-    char errorText[512] = { 0 };
-    if (!nova_model_asset_load_scene(entity->modelAssetPath, &scene, errorText, (uint32_t)sizeof(errorText))) {
-        nova_scene_data_release(&scene);
+    Vec3 corners[8] = {
+        vec3_add(center, vec3_make(-extents.raw[0], -extents.raw[1], -extents.raw[2])),
+        vec3_add(center, vec3_make( extents.raw[0], -extents.raw[1], -extents.raw[2])),
+        vec3_add(center, vec3_make( extents.raw[0],  extents.raw[1], -extents.raw[2])),
+        vec3_add(center, vec3_make(-extents.raw[0],  extents.raw[1], -extents.raw[2])),
+        vec3_add(center, vec3_make(-extents.raw[0], -extents.raw[1],  extents.raw[2])),
+        vec3_add(center, vec3_make( extents.raw[0], -extents.raw[1],  extents.raw[2])),
+        vec3_add(center, vec3_make( extents.raw[0],  extents.raw[1],  extents.raw[2])),
+        vec3_add(center, vec3_make(-extents.raw[0],  extents.raw[1],  extents.raw[2])),
+    };
+
+    ViewerVertex v[8];
+    for (int i = 0; i < 8; ++i) {
+        v[i].position = corners[i];
+        v[i].normal = vec3_make(0.0f, 0.0f, 1.0f);
+        v[i].color = color;
+    }
+
+    if (!append_triangle(mesh, v[4], v[5], v[6]) ||
+        !append_triangle(mesh, v[4], v[6], v[7]) ||
+        !append_triangle(mesh, v[0], v[2], v[1]) ||
+        !append_triangle(mesh, v[0], v[3], v[2]) ||
+        !append_triangle(mesh, v[0], v[4], v[7]) ||
+        !append_triangle(mesh, v[0], v[7], v[3]) ||
+        !append_triangle(mesh, v[1], v[2], v[6]) ||
+        !append_triangle(mesh, v[1], v[6], v[5]) ||
+        !append_triangle(mesh, v[3], v[7], v[6]) ||
+        !append_triangle(mesh, v[3], v[6], v[2]) ||
+        !append_triangle(mesh, v[0], v[1], v[5]) ||
+        !append_triangle(mesh, v[0], v[5], v[4])) {
         return 0;
     }
 
-    Vec3 assetCenter = scene_bounds_center(&scene);
-    Vec3 baseColor = vec3_make(0.75f, 0.75f, 0.75f);
-    for (uint32_t primitiveIndex = 0; primitiveIndex < scene.primitiveCount; ++primitiveIndex) {
-        uint32_t vertexOffset = primitiveIndex * 3u;
-        if (vertexOffset + 2u >= scene.vertexCount) {
-            break;
-        }
-
-        const NovaSceneVertex* sourceA = &scene.vertices[vertexOffset + 0u];
-        const NovaSceneVertex* sourceB = &scene.vertices[vertexOffset + 1u];
-        const NovaSceneVertex* sourceC = &scene.vertices[vertexOffset + 2u];
-        uint32_t materialIndex = sourceA->materialIndex;
-        if (materialIndex < scene.materialCount) {
-            const NovaSceneMaterial* material = &scene.materials[materialIndex];
-            baseColor = vec3_make(material->baseColorFactor[0], material->baseColorFactor[1], material->baseColorFactor[2]);
-        }
-
-        ViewerVertex vertices[3];
-        const NovaSceneVertex* sourceVertices[3] = { sourceA, sourceB, sourceC };
-        for (int i = 0; i < 3; ++i) {
-            Vec3 localPosition = vec3_make(sourceVertices[i]->position[0], sourceVertices[i]->position[1], sourceVertices[i]->position[2]);
-            Vec3 localNormal = vec3_make(sourceVertices[i]->normal[0], sourceVertices[i]->normal[1], sourceVertices[i]->normal[2]);
-            vertices[i].position = vec3_add(vec3_sub(localPosition, assetCenter), entity->position);
-            vertices[i].normal = vec3_length(localNormal) > 1e-5f ? vec3_normalize(localNormal) : vec3_make(0.0f, 0.0f, 1.0f);
-            vertices[i].color = baseColor;
-            vertices[i].u = sourceVertices[i]->uv[0];
-            vertices[i].v = sourceVertices[i]->uv[1];
-        }
-
-        size_t vertexStart = mesh->vertexCount;
-        size_t edgeVertexStart = mesh->edgeVertexCount;
-        if (!append_triangle(mesh, vertices[0], vertices[1], vertices[2]) ||
-            !append_triangle_edges(mesh, vertices[0], vertices[1], vertices[2])) {
-            nova_scene_data_release(&scene);
-            return 0;
-        }
-        if (!reserve_face_ranges(mesh, mesh->faceRangeCount + 1)) {
-            nova_scene_data_release(&scene);
-            return 0;
-        }
-
-        ViewerFaceRange range = {
-            .entityIndex = entityIndex,
-            .solidIndex = 0,
-            .sideIndex = primitiveIndex,
-            .vertexStart = vertexStart,
-            .vertexCount = mesh->vertexCount - vertexStart,
-            .edgeVertexStart = edgeVertexStart,
-            .edgeVertexCount = mesh->edgeVertexCount - edgeVertexStart,
-            .sourceMaterialIndex = (int)materialIndex,
-        };
-        snprintf(range.modelAssetPath, sizeof(range.modelAssetPath), "%s", entity->modelAssetPath);
-        if (materialIndex < scene.materialCount && scene.materials[materialIndex].name[0] != '\0') {
-            snprintf(range.material, sizeof(range.material), "%s", scene.materials[materialIndex].name);
-        } else {
-            snprintf(range.material, sizeof(range.material), "%s", "model_default");
-        }
-        mesh->faceRanges[mesh->faceRangeCount++] = range;
+    if (!append_line(mesh, v[0], v[1]) || !append_line(mesh, v[1], v[2]) ||
+        !append_line(mesh, v[2], v[3]) || !append_line(mesh, v[3], v[0]) ||
+        !append_line(mesh, v[4], v[5]) || !append_line(mesh, v[5], v[6]) ||
+        !append_line(mesh, v[6], v[7]) || !append_line(mesh, v[7], v[4]) ||
+        !append_line(mesh, v[0], v[4]) || !append_line(mesh, v[1], v[5]) ||
+        !append_line(mesh, v[2], v[6]) || !append_line(mesh, v[3], v[7])) {
+        return 0;
     }
 
-    nova_scene_data_release(&scene);
+    if (!reserve_face_ranges(mesh, mesh->faceRangeCount + 1)) {
+        return 0;
+    }
+
+    ViewerFaceRange modelRange = {
+        .entityIndex = entityIndex,
+        .solidIndex = 0,
+        .sideIndex = 0,
+        .vertexStart = vertexStart,
+        .vertexCount = mesh->vertexCount - vertexStart,
+        .edgeVertexStart = edgeVertexStart,
+        .edgeVertexCount = mesh->edgeVertexCount - edgeVertexStart,
+    };
+    snprintf(modelRange.material, sizeof(modelRange.material), "%s", "model_marker");
+    mesh->faceRanges[mesh->faceRangeCount++] = modelRange;
     return 1;
 }
 
@@ -598,9 +588,9 @@ int vmf_build_mesh(const VmfScene* scene, ViewerMesh* outMesh, char* errorBuffer
             continue;
         }
         if (entity->kind == VmfEntityKindModel) {
-            if (!append_model_entity(outMesh, entity, entityIndex)) {
+            if (!append_model_marker(outMesh, entity, entityIndex)) {
                 viewer_mesh_free(outMesh);
-                snprintf(errorBuffer, errorBufferSize, "failed to build model entity geometry");
+                snprintf(errorBuffer, errorBufferSize, "failed to build model marker geometry");
                 return 0;
             }
             continue;

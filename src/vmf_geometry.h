@@ -16,6 +16,8 @@ typedef struct ViewerVertex {
     Vec3 color;
     float u;
     float v;
+    float lightmapU;
+    float lightmapV;
 } ViewerVertex;
 
 typedef struct ViewerFaceRange {

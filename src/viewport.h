@@ -103,6 +103,7 @@ typedef NS_ENUM(NSUInteger, VmfViewportSelectionEdge) {
                         plane:(VmfViewportPlane)plane
                    renderMode:(VmfViewportRenderMode)renderMode;
 - (void)updateMesh:(const ViewerMesh*)mesh;
+- (void)updateMesh:(const ViewerMesh*)mesh syncHeavyRenderer:(BOOL)syncHeavyRenderer;
 - (void)setVmfScene:(const VmfScene*)scene;
 - (void)setSceneWorld:(NovaSceneWorld*)sceneWorld;
 - (void)setTextureDirectory:(NSString*)path;

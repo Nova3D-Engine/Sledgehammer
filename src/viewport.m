@@ -161,6 +161,8 @@ typedef struct ViewportBakePolygon {
 - (Vec3)rayDirectionForViewPoint:(NSPoint)point;
 - (nullable id<MTLTexture>)cachedTextureForMaterial:(NSString*)material;
 - (nullable NSDictionary<NSString*, id>*)cachedTextureDataForMaterial:(NSString*)material;
+- (nullable id<MTLTexture>)textureFromSceneTexture:(const NovaSceneTexture*)sceneTexture;
+- (nullable id<MTLTexture>)cachedTextureForModelAssetPath:(NSString*)assetPath sourceMaterialIndex:(int)sourceMaterialIndex;
 - (nullable id<MTLTexture>)previewBakedDebugTextureForKey:(NSString*)key;
 - (BOOL)shouldLogTextureMissAtPath:(NSString*)fullPath;
 - (void)applyBakedVertexLighting:(const Vec3*)bakedLighting count:(size_t)count;
@@ -220,6 +222,18 @@ static Bounds3 viewport_bounds_for_vertex_range(const ViewerVertex* vertices, si
         bounds3_expand(&bounds, vertices[start + index].position);
     }
     return bounds;
+}
+
+static Vec3 viewport_scene_bounds_center(const NovaSceneData* scene) {
+    Bounds3 bounds = bounds3_empty();
+    if (scene == NULL) {
+        return vec3_make(0.0f, 0.0f, 0.0f);
+    }
+    for (uint32_t vertexIndex = 0u; vertexIndex < scene->vertexCount; ++vertexIndex) {
+        const NovaSceneVertex* vertex = &scene->vertices[vertexIndex];
+        bounds3_expand(&bounds, vec3_make(vertex->position[0], vertex->position[1], vertex->position[2]));
+    }
+    return bounds3_is_valid(bounds) ? bounds3_center(bounds) : vec3_make(0.0f, 0.0f, 0.0f);
 }
 
 static void viewport_init_imported_material_gpu_defaults(NovaSceneGpuMaterial* material) {
@@ -325,7 +339,8 @@ static BOOL viewport_face_range_is_bake_excluded(const ViewerFaceRange* range) {
     if (range == NULL) {
         return YES;
     }
-    return strcasecmp(range->material, "light_marker") == 0;
+    return strcasecmp(range->material, "light_marker") == 0 ||
+           strcasecmp(range->material, "model_marker") == 0;
 }
 
 static ViewportBakePlane viewport_bake_plane_from_side(const VmfSide* side) {
@@ -823,6 +838,33 @@ static uint32_t viewport_preview_bake_power_of_two_value(int exponent, uint32_t 
         value <<= 1u;
     }
     return viewport_clamp_preview_bake_power_of_two(value, minValue, maxValue);
+}
+
+static int viewport_next_power_of_two_int(int value, int minValue, int maxValue) {
+    uint32_t clampedMin = minValue > 0 ? (uint32_t)minValue : 1u;
+    uint32_t clampedMax = maxValue > 0 ? (uint32_t)maxValue : clampedMin;
+    uint32_t normalized = value > 0 ? (uint32_t)value : clampedMin;
+
+    if (normalized < clampedMin) {
+        normalized = clampedMin;
+    }
+
+    uint32_t powerOfTwo = 1u;
+    while (powerOfTwo < normalized && powerOfTwo < clampedMax) {
+        if (powerOfTwo > UINT32_MAX / 2u) {
+            powerOfTwo = clampedMax;
+            break;
+        }
+        powerOfTwo <<= 1u;
+    }
+
+    if (powerOfTwo < clampedMin) {
+        powerOfTwo = clampedMin;
+    }
+    if (powerOfTwo > clampedMax) {
+        powerOfTwo = clampedMax;
+    }
+    return (int)powerOfTwo;
 }
 
 static void viewport_preview_bake_face_world_extents(const ViewerVertex* vertices,
@@ -1407,8 +1449,8 @@ viewport_build_lightmap_page_layout(NSArray<NSString*>* orderedKeys,
 
         NSMutableDictionary<NSString*, id>* page = [NSMutableDictionary dictionary];
         page[@"key"] = [NSString stringWithFormat:@"lightmap_%d", pageIndex++];
-        page[@"width"] = @(MAX(usedWidth, 1));
-        page[@"height"] = @(MAX(usedHeight, 1));
+        page[@"width"] = @(viewport_next_power_of_two_int(MAX(usedWidth, 1), kPreviewBakeMinResolution, atlasMaxExtent));
+        page[@"height"] = @(viewport_next_power_of_two_int(MAX(usedHeight, 1), kPreviewBakeMinResolution, atlasMaxExtent));
         page[@"charts"] = [currentCharts mutableCopy];
         [pages addObject:page];
 
@@ -1795,6 +1837,8 @@ static NovaToolMetalEditorFaceRange viewport_metal_face_range_from_viewer_face_r
     converted.sideIndex = range.sideIndex;
     converted.vertexStart = range.vertexStart;
     converted.vertexCount = range.vertexCount;
+    converted.sourceMaterialIndex = range.sourceMaterialIndex;
+    memcpy(converted.modelAssetPath, range.modelAssetPath, sizeof(converted.modelAssetPath));
     memcpy(converted.material, range.material, sizeof(converted.material));
     return converted;
 }
@@ -1848,14 +1892,21 @@ static NovaToolMetalEditorVertex* viewport_create_editor_vertex_array(const View
     return converted;
 }
 
-static void* viewport_resolve_texture(const char* materialName, void* userData) {
-    if (materialName == NULL || userData == NULL) {
+static void* viewport_resolve_texture(const NovaToolMetalEditorFaceRange* faceRange, void* userData) {
+    if (faceRange == NULL || userData == NULL) {
         return NULL;
     }
 
     VmfViewport* viewport = (__bridge VmfViewport*)userData;
-    NSString* material = [NSString stringWithUTF8String:materialName];
-    id<MTLTexture> texture = [viewport cachedTextureForMaterial:material];
+    id<MTLTexture> texture = nil;
+    if (faceRange->modelAssetPath[0] != '\0' && faceRange->sourceMaterialIndex >= 0) {
+        NSString* assetPath = [NSString stringWithUTF8String:faceRange->modelAssetPath];
+        texture = [viewport cachedTextureForModelAssetPath:assetPath sourceMaterialIndex:faceRange->sourceMaterialIndex];
+        return texture != nil ? (__bridge void*)texture : NULL;
+    }
+
+    NSString* material = [NSString stringWithUTF8String:faceRange->material];
+    texture = [viewport cachedTextureForMaterial:material];
     return texture != nil ? (__bridge void*)texture : NULL;
 }
 
@@ -2165,6 +2216,10 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
 @property(nonatomic, assign) UiGizmoState fullRendererUiState;
 @property(nonatomic, assign) const VmfScene* vmfScene;
 @property(nonatomic, assign) NovaSceneWorld* sceneWorld;
+@property(nonatomic, assign) uint32_t* heavyObjectEntityIndices;
+@property(nonatomic, assign) Vec3* heavyObjectModelBasePositions;
+@property(nonatomic, assign) uint8_t* heavyObjectModelFlags;
+@property(nonatomic, assign) uint32_t heavyObjectMappingCount;
 @property(nonatomic, assign) BOOL fullRendererInitialized;
 @property(nonatomic, assign) uint32_t fullRendererFrameIndex;
 @property(nonatomic, assign) void* imguiContext;
@@ -2207,6 +2262,9 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     free(self.cpuEdgeVertices);
     free(self.baseVertexColors);
     free(self.faceRanges);
+    free(self.heavyObjectEntityIndices);
+    free(self.heavyObjectModelBasePositions);
+    free(self.heavyObjectModelFlags);
     free(self.selectionVertices);
     free(self.selectionEdges);
 }
@@ -2459,8 +2517,61 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     }
 }
 
+- (void)clearHeavyObjectModelMappings {
+    free(self.heavyObjectEntityIndices);
+    free(self.heavyObjectModelBasePositions);
+    free(self.heavyObjectModelFlags);
+    self.heavyObjectEntityIndices = NULL;
+    self.heavyObjectModelBasePositions = NULL;
+    self.heavyObjectModelFlags = NULL;
+    self.heavyObjectMappingCount = 0u;
+}
+
+- (void)applyModelTransformsToSceneWorld {
+    if (self.sceneWorld == NULL || self.vmfScene == NULL || self.heavyObjectMappingCount == 0u ||
+        self.heavyObjectEntityIndices == NULL || self.heavyObjectModelBasePositions == NULL || self.heavyObjectModelFlags == NULL) {
+        return;
+    }
+
+    for (uint32_t objectIndex = 0u; objectIndex < self.heavyObjectMappingCount; ++objectIndex) {
+        if (self.heavyObjectModelFlags[objectIndex] == 0u) {
+            continue;
+        }
+
+        uint32_t entityIndex = self.heavyObjectEntityIndices[objectIndex];
+        if (entityIndex >= self.vmfScene->entityCount) {
+            continue;
+        }
+
+        const VmfEntity* entity = &self.vmfScene->entities[entityIndex];
+        if (entity->kind != VmfEntityKindModel) {
+            continue;
+        }
+
+        Vec3 delta = vec3_sub(entity->position, self.heavyObjectModelBasePositions[objectIndex]);
+        if (fabsf(delta.raw[0]) < 1e-6f && fabsf(delta.raw[1]) < 1e-6f && fabsf(delta.raw[2]) < 1e-6f) {
+            continue;
+        }
+
+        if (_importedSceneData.objects != NULL && objectIndex < _importedSceneData.objectCount) {
+            float worldMatrix[16];
+            viewport_identity_matrix(worldMatrix);
+            worldMatrix[12] = entity->position.raw[0];
+            worldMatrix[13] = entity->position.raw[1];
+            worldMatrix[14] = entity->position.raw[2];
+            memcpy(_importedSceneData.objects[objectIndex].worldMatrix,
+                   worldMatrix,
+                   sizeof(_importedSceneData.objects[objectIndex].worldMatrix));
+            nova_scene_world_set_object_world_matrix(self.sceneWorld, objectIndex, worldMatrix);
+        }
+
+        self.heavyObjectModelBasePositions[objectIndex] = entity->position;
+    }
+}
+
 - (void)setVmfScene:(const VmfScene*)scene {
     _vmfScene = scene;
+    [self applyModelTransformsToSceneWorld];
 }
 
 - (void)buildUI {
@@ -3452,6 +3563,67 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     return nil;
 }
 
+- (nullable id<MTLTexture>)textureFromSceneTexture:(const NovaSceneTexture*)sceneTexture {
+    if (sceneTexture == NULL || sceneTexture->width <= 0 || sceneTexture->height <= 0) {
+        return nil;
+    }
+
+    MTLPixelFormat pixelFormat = sceneTexture->format == NOVA_SCENE_TEXTURE_FORMAT_RGBA32_FLOAT ? MTLPixelFormatRGBA32Float : MTLPixelFormatRGBA8Unorm;
+    MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pixelFormat
+                                                                                     width:(NSUInteger)sceneTexture->width
+                                                                                    height:(NSUInteger)sceneTexture->height
+                                                                                 mipmapped:NO];
+    desc.usage = MTLTextureUsageShaderRead;
+
+    id<MTLTexture> texture = [self.device newTextureWithDescriptor:desc];
+    if (texture == nil) {
+        return nil;
+    }
+
+    MTLRegion fullRegion = MTLRegionMake2D(0, 0, (NSUInteger)sceneTexture->width, (NSUInteger)sceneTexture->height);
+    if (sceneTexture->format == NOVA_SCENE_TEXTURE_FORMAT_RGBA32_FLOAT && sceneTexture->rgba32f != NULL) {
+        NSUInteger bytesPerRow = (NSUInteger)sceneTexture->width * sizeof(float) * 4u;
+        [texture replaceRegion:fullRegion mipmapLevel:0 withBytes:sceneTexture->rgba32f bytesPerRow:bytesPerRow];
+        return texture;
+    }
+    if (sceneTexture->rgba8 != NULL) {
+        NSUInteger bytesPerRow = (NSUInteger)sceneTexture->width * 4u;
+        [texture replaceRegion:fullRegion mipmapLevel:0 withBytes:sceneTexture->rgba8 bytesPerRow:bytesPerRow];
+        return texture;
+    }
+    return nil;
+}
+
+- (nullable id<MTLTexture>)cachedTextureForModelAssetPath:(NSString*)assetPath sourceMaterialIndex:(int)sourceMaterialIndex {
+    if (assetPath.length == 0 || sourceMaterialIndex < 0) {
+        return nil;
+    }
+
+    NSString* cacheKey = [NSString stringWithFormat:@"__modelvp__/%@#%d", assetPath, sourceMaterialIndex];
+    id entry = self.textureCache[cacheKey];
+    if (entry != nil) {
+        return entry == (id)NSNull.null ? nil : (id<MTLTexture>)entry;
+    }
+
+    NovaSceneData scene;
+    char errorText[512] = {0};
+    id<MTLTexture> texture = nil;
+
+    nova_scene_data_init(&scene);
+    if (nova_model_asset_load_scene(assetPath.fileSystemRepresentation, &scene, errorText, (uint32_t)sizeof(errorText))) {
+        if ((uint32_t)sourceMaterialIndex < scene.materialCount) {
+            const NovaSceneMaterial* material = &scene.materials[sourceMaterialIndex];
+            if (material->baseColorTexture >= 0 && (uint32_t)material->baseColorTexture < scene.textureCount) {
+                texture = [self textureFromSceneTexture:&scene.textures[material->baseColorTexture]];
+            }
+        }
+    }
+    nova_scene_data_release(&scene);
+
+    self.textureCache[cacheKey] = texture != nil ? texture : (id)NSNull.null;
+    return texture;
+}
+
 - (BOOL)shouldLogTextureMissAtPath:(NSString*)fullPath {
     if (fullPath.length == 0) {
         return YES;
@@ -3600,6 +3772,10 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
 }
 
 - (void)updateMesh:(const ViewerMesh*)mesh {
+    [self updateMesh:mesh syncHeavyRenderer:YES];
+}
+
+- (void)updateMesh:(const ViewerMesh*)mesh syncHeavyRenderer:(BOOL)syncHeavyRenderer {
     free(self.cpuVertices);
     self.cpuVertices = NULL;
     free(self.cpuEdgeVertices);
@@ -3609,20 +3785,26 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     free(self.faceRanges);
     self.faceRanges = NULL;
     self.faceRangeCount = 0;
-    self.previewBakeInProgress = NO;
-    self.previewBakePauseRequested = NO;
-    self.previewBakeCancelRequested = NO;
-    self.previewBakeRestartQueued = NO;
-    self.previewBakeAccumulatedSamplesPerTexel = 0u;
-    self.previewBakeRunningTargetSamplesPerTexel = 0u;
-    self.previewBakeRunningBounceCount = 0u;
-    self.previewBakedLightingEnabled = NO;
-    _fullRendererUiState.previewBakeLightingEnabled = 0;
-    [self.previewBakedLightmaps removeAllObjects];
-    [self.previewBakedDebugTextures removeAllObjects];
-    self.previewBakeDebugSelectedKey = @"";
+    if (syncHeavyRenderer) {
+        self.previewBakeInProgress = NO;
+        self.previewBakePauseRequested = NO;
+        self.previewBakeCancelRequested = NO;
+        self.previewBakeRestartQueued = NO;
+        self.previewBakeAccumulatedSamplesPerTexel = 0u;
+        self.previewBakeRunningTargetSamplesPerTexel = 0u;
+        self.previewBakeRunningBounceCount = 0u;
+        self.previewBakedLightingEnabled = NO;
+        _fullRendererUiState.previewBakeLightingEnabled = 0;
+        [self.previewBakedLightmaps removeAllObjects];
+        [self.previewBakedDebugTextures removeAllObjects];
+        self.previewBakeDebugSelectedKey = @"";
+    }
     self.meshRevision += 1u;
     if (!mesh || (mesh->vertexCount == 0 && mesh->edgeVertexCount == 0)) {
+        [self clearHeavyObjectModelMappings];
+        if (syncHeavyRenderer && mesh != NULL) {
+            [self syncHeavyRendererSceneFromMesh:mesh];
+        }
         self.vertexBuffer = nil;
         self.edgeVertexBuffer = nil;
         self.selectedFaceBuffer = nil;
@@ -3683,7 +3865,11 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     free(convertedVertices);
     free(convertedEdgeVertices);
     free(convertedFaceRanges);
-    [self syncHeavyRendererSceneFromMesh:mesh];
+    if (syncHeavyRenderer) {
+        [self syncHeavyRendererSceneFromMesh:mesh];
+    } else {
+        [self applyModelTransformsToSceneWorld];
+    }
     [self rebuildSelectedFaceBuffer];
     [self rebuildHighlightedFaceBuffer];
 }
@@ -3755,6 +3941,13 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     float diffuseBounceIntensity;
     uint64_t bakeGeneration;
     const VmfScene* vmfSceneSnapshot;
+    const NovaSceneVertex* importedVerticesSnapshot;
+    uint32_t importedVertexCountSnapshot;
+    const NovaSceneObject* importedObjectsSnapshot;
+    uint32_t importedObjectCountSnapshot;
+    const uint8_t* modelObjectFlagsSnapshot;
+    const uint32_t* modelObjectEntitySnapshot;
+    uint32_t modelObjectMappingCountSnapshot;
 
     if (self.previewBakeInProgress ||
         self.dimension != VmfViewportDimension3D ||
@@ -3802,6 +3995,13 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     diffuseBounceIntensity = self.previewBakeDiffuseBounceIntensity;
     revision = self.meshRevision;
     vmfSceneSnapshot = self.vmfScene;
+    importedVerticesSnapshot = _importedSceneData.vertices;
+    importedVertexCountSnapshot = _importedSceneData.vertexCount;
+    importedObjectsSnapshot = _importedSceneData.objects;
+    importedObjectCountSnapshot = _importedSceneData.objectCount;
+    modelObjectFlagsSnapshot = self.heavyObjectModelFlags;
+    modelObjectEntitySnapshot = self.heavyObjectEntityIndices;
+    modelObjectMappingCountSnapshot = self.heavyObjectMappingCount;
     bakeGeneration = self.previewBakeGeneration + 1u;
     self.previewBakeGeneration = bakeGeneration;
 
@@ -3834,6 +4034,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         NSMutableArray<NSMutableData*>* bakeTexelDatas = [NSMutableArray array];
         NSMutableArray<NSNumber*>* bakeValidTexelCounts = [NSMutableArray array];
         NSMutableArray<NSMutableData*>* bakeAccumulatedLighting = [NSMutableArray array];
+        NSMutableArray<NSString*>* bakeableBrushKeys = [NSMutableArray array];
         NSMutableArray<NSMutableDictionary<NSString*, id>*>* lightmapPages = nil;
         NSMutableArray<NSString*>* lightmapPageKeys = [NSMutableArray array];
         NSMutableArray<NSNumber*>* lightmapPageWidths = [NSMutableArray array];
@@ -4158,6 +4359,93 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
             brushTriangleCountByKey[brushKey] = @(emittedTriangleCount);
         }
 
+        if (importedVerticesSnapshot != NULL && importedObjectsSnapshot != NULL &&
+            modelObjectFlagsSnapshot != NULL && modelObjectEntitySnapshot != NULL) {
+            uint32_t modelObjectCount = importedObjectCountSnapshot;
+            if (modelObjectCount > modelObjectMappingCountSnapshot) {
+                modelObjectCount = modelObjectMappingCountSnapshot;
+            }
+
+            for (uint32_t objectIndex = 0u; objectIndex < modelObjectCount; ++objectIndex) {
+                if (modelObjectFlagsSnapshot[objectIndex] == 0u) {
+                    continue;
+                }
+
+                const NovaSceneObject* object = &importedObjectsSnapshot[objectIndex];
+                uint32_t objectVertexOffset = object->vertexOffset;
+                uint32_t objectVertexCount = object->vertexCount;
+                if (objectVertexOffset >= importedVertexCountSnapshot) {
+                    continue;
+                }
+                if (objectVertexOffset + objectVertexCount > importedVertexCountSnapshot) {
+                    objectVertexCount = importedVertexCountSnapshot - objectVertexOffset;
+                }
+                objectVertexCount -= objectVertexCount % 3u;
+                if (objectVertexCount < 3u) {
+                    continue;
+                }
+
+                uint32_t entityIndex = modelObjectEntitySnapshot[objectIndex];
+                NSString* modelKey = [NSString stringWithFormat:@"model_%u_%u", entityIndex, objectIndex];
+                uint32_t triangleStart = (uint32_t)(rtBakeVertexCount / 3u);
+                uint32_t emittedTriangleCount = 0u;
+                float translationX = object->worldMatrix[12];
+                float translationY = object->worldMatrix[13];
+                float translationZ = object->worldMatrix[14];
+
+                brushTriangleStartByKey[modelKey] = @(triangleStart);
+
+                if (!viewport_reserve_hwrt_bake_geometry(&rtBakeVertices,
+                                                         &rtBakePositions,
+                                                         &rtBakeVertexCapacity,
+                                                         rtBakeVertexCount + objectVertexCount)) {
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        self.previewBakeInProgress = NO;
+                        self.previewBakeRunningTargetSamplesPerTexel = 0u;
+                        self.previewBakeRunningBounceCount = 0u;
+                        [self syncPreviewBakePanel];
+                        NSLog(@"[lighting] HWRT preview bake failed to grow model bake geometry buffers");
+                    });
+                    free(rtBakeVertices);
+                    free(rtBakePositions);
+                    free(verticesSnapshot);
+                    free(baseColorSnapshot);
+                    free(faceRangesSnapshot);
+                    return;
+                }
+
+                for (uint32_t localVertex = 0u; localVertex < objectVertexCount; ++localVertex) {
+                    uint32_t sourceVertexIndex = objectVertexOffset + localVertex;
+                    const NovaSceneVertex* sourceVertex = &importedVerticesSnapshot[sourceVertexIndex];
+                    uint32_t materialIndex = sourceVertex->materialIndex;
+
+                    rtBakeVertices[rtBakeVertexCount].position = simd_make_float4(sourceVertex->position[0] + translationX,
+                                                                                   sourceVertex->position[1] + translationY,
+                                                                                   sourceVertex->position[2] + translationZ,
+                                                                                   1.0f);
+                    rtBakeVertices[rtBakeVertexCount].normal = simd_make_float4(sourceVertex->normal[0],
+                                                                                 sourceVertex->normal[1],
+                                                                                 sourceVertex->normal[2],
+                                                                                 0.0f);
+                    rtBakeVertices[rtBakeVertexCount].tangent = simd_make_float4(sourceVertex->tangent[0],
+                                                                                  sourceVertex->tangent[1],
+                                                                                  sourceVertex->tangent[2],
+                                                                                  sourceVertex->tangent[3]);
+                    rtBakeVertices[rtBakeVertexCount].uv = simd_make_float4(sourceVertex->uv[0],
+                                                                            sourceVertex->uv[1],
+                                                                            (float)materialIndex,
+                                                                            0.0f);
+                    rtBakePositions[rtBakeVertexCount] = simd_make_float3(sourceVertex->position[0] + translationX,
+                                                                          sourceVertex->position[1] + translationY,
+                                                                          sourceVertex->position[2] + translationZ);
+                    rtBakeVertexCount += 1u;
+                }
+
+                emittedTriangleCount = objectVertexCount / 3u;
+                brushTriangleCountByKey[modelKey] = @(emittedTriangleCount);
+            }
+        }
+
         if (rtBakeVertexCount < 3u) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 self.previewBakeInProgress = NO;
@@ -4295,6 +4583,59 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                 }
             }
         }
+
+        if (importedVerticesSnapshot != NULL && importedObjectsSnapshot != NULL &&
+            modelObjectFlagsSnapshot != NULL && modelObjectEntitySnapshot != NULL) {
+            uint32_t modelObjectCount = importedObjectCountSnapshot;
+            if (modelObjectCount > modelObjectMappingCountSnapshot) {
+                modelObjectCount = modelObjectMappingCountSnapshot;
+            }
+
+            for (uint32_t objectIndex = 0u; objectIndex < modelObjectCount; ++objectIndex) {
+                if (modelObjectFlagsSnapshot[objectIndex] == 0u) {
+                    continue;
+                }
+
+                const NovaSceneObject* object = &importedObjectsSnapshot[objectIndex];
+                uint32_t objectVertexOffset = object->vertexOffset;
+                uint32_t objectVertexCount = object->vertexCount;
+                if (objectVertexOffset >= importedVertexCountSnapshot) {
+                    continue;
+                }
+                if (objectVertexOffset + objectVertexCount > importedVertexCountSnapshot) {
+                    objectVertexCount = importedVertexCountSnapshot - objectVertexOffset;
+                }
+                objectVertexCount -= objectVertexCount % 3u;
+                if (objectVertexCount < 3u) {
+                    continue;
+                }
+
+                uint32_t entityIndex = modelObjectEntitySnapshot[objectIndex];
+                NSString* modelKey = [NSString stringWithFormat:@"model_%u_%u", entityIndex, objectIndex];
+
+                totalTriangles += objectVertexCount / 3u;
+                for (uint32_t localVertex = 0u; localVertex < objectVertexCount; ++localVertex) {
+                    const NovaSceneVertex* v = &importedVerticesSnapshot[objectVertexOffset + localVertex];
+                    NSNumber* minUExisting = brushUvMinUByKey[modelKey];
+                    NSNumber* minVExisting = brushUvMinVByKey[modelKey];
+                    NSNumber* maxUExisting = brushUvMaxUByKey[modelKey];
+                    NSNumber* maxVExisting = brushUvMaxVByKey[modelKey];
+                    float minU = minUExisting != nil ? minUExisting.floatValue : v->lightmapUv[0];
+                    float minV = minVExisting != nil ? minVExisting.floatValue : v->lightmapUv[1];
+                    float maxU = maxUExisting != nil ? maxUExisting.floatValue : v->lightmapUv[0];
+                    float maxV = maxVExisting != nil ? maxVExisting.floatValue : v->lightmapUv[1];
+                    minU = fminf(minU, v->lightmapUv[0]);
+                    minV = fminf(minV, v->lightmapUv[1]);
+                    maxU = fmaxf(maxU, v->lightmapUv[0]);
+                    maxV = fmaxf(maxV, v->lightmapUv[1]);
+                    brushUvMinUByKey[modelKey] = @(minU);
+                    brushUvMinVByKey[modelKey] = @(minV);
+                    brushUvMaxUByKey[modelKey] = @(maxU);
+                    brushUvMaxVByKey[modelKey] = @(maxV);
+                }
+            }
+        }
+
         if (totalTriangles == 0u) {
             totalTriangles = 1u;
         }
@@ -4411,6 +4752,48 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                                 float maxV = ceilf(fmaxf(fmaxf(y0, y1), y2));
 
                                 if (fabsf(denom) < 1e-6f) {
+                                    int px = (int)lrintf((x0 + x1 + x2) / 3.0f);
+                                    int py = (int)lrintf((y0 + y1 + y2) / 3.0f);
+                                    px = (int)fmin((double)(bakeWidth - 1), fmax(0.0, (double)px));
+                                    py = (int)fmin((double)(bakeHeight - 1), fmax(0.0, (double)py));
+                                    size_t texelIndex = (size_t)py * (size_t)bakeWidth + (size_t)px;
+
+                                    simd_float3 worldPos = (simd_make_float3(triPositions[0].raw[0], triPositions[0].raw[1], triPositions[0].raw[2]) +
+                                                            simd_make_float3(triPositions[1].raw[0], triPositions[1].raw[1], triPositions[1].raw[2]) +
+                                                            simd_make_float3(triPositions[2].raw[0], triPositions[2].raw[1], triPositions[2].raw[2])) / 3.0f;
+                                    simd_float3 normal = simd_make_float3(faceNormal.raw[0], faceNormal.raw[1], faceNormal.raw[2]);
+                                    simd_float3 albedo = simd_make_float3(faceColor.raw[0], faceColor.raw[1], faceColor.raw[2]);
+
+                                    if (accum[texelIndex].sourceTriangleIdPlusOne == 0u) {
+                                        accum[texelIndex].sourceTriangleIdPlusOne = trianglePrimitiveId + 1u;
+                                    }
+
+                                    accum[texelIndex].worldPosWeight.x += worldPos.x;
+                                    accum[texelIndex].worldPosWeight.y += worldPos.y;
+                                    accum[texelIndex].worldPosWeight.z += worldPos.z;
+                                    accum[texelIndex].worldPosWeight.w += 1.0f;
+                                    accum[texelIndex].normalSum.x += normal.x;
+                                    accum[texelIndex].normalSum.y += normal.y;
+                                    accum[texelIndex].normalSum.z += normal.z;
+                                    accum[texelIndex].albedoSum.x += albedo.x;
+                                    accum[texelIndex].albedoSum.y += albedo.y;
+                                    accum[texelIndex].albedoSum.z += albedo.z;
+
+                                    processedTriangles += 1u;
+                                    trianglePrimitiveId += 1u;
+                                    {
+                                        int percent = (int)((processedTriangles * 100u) / totalTriangles);
+                                        if (percent != lastPercent && (percent == 0 || percent % 5 == 0 || percent == 100)) {
+                                            int filled = percent / 5;
+                                            char bar[21];
+                                            for (int i = 0; i < 20; ++i) {
+                                                bar[i] = i < filled ? '#' : '-';
+                                            }
+                                            bar[20] = '\0';
+                                            NSLog(@"[lighting] bake unwrap [%s] %d%% (%u/%u triangles)", bar, percent, processedTriangles, totalTriangles);
+                                            lastPercent = percent;
+                                        }
+                                    }
                                     continue;
                                 }
 
@@ -4604,6 +4987,244 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
             }
         }
 
+        if (importedVerticesSnapshot != NULL && importedObjectsSnapshot != NULL &&
+            modelObjectFlagsSnapshot != NULL && modelObjectEntitySnapshot != NULL) {
+            uint32_t modelObjectCount = importedObjectCountSnapshot;
+            if (modelObjectCount > modelObjectMappingCountSnapshot) {
+                modelObjectCount = modelObjectMappingCountSnapshot;
+            }
+
+            for (uint32_t objectIndex = 0u; objectIndex < modelObjectCount; ++objectIndex) {
+                const NovaSceneObject* object;
+                uint32_t objectVertexOffset;
+                uint32_t objectVertexCount;
+                NSString* modelKey;
+                NSNumber* slotValue;
+                uint32_t slot;
+                NSMutableData* accumData;
+                HwrtBakeTexelAccum* accum;
+                int bakeWidth;
+                int bakeHeight;
+                uint32_t trianglePrimitiveId;
+                float uvMinU;
+                float uvMinV;
+                float uvMaxU;
+                float uvMaxV;
+                float uvSpanU;
+                float uvSpanV;
+                float translationX;
+                float translationY;
+                float translationZ;
+                int resolution;
+
+                if (modelObjectFlagsSnapshot[objectIndex] == 0u) {
+                    continue;
+                }
+
+                object = &importedObjectsSnapshot[objectIndex];
+                objectVertexOffset = object->vertexOffset;
+                objectVertexCount = object->vertexCount;
+                if (objectVertexOffset >= importedVertexCountSnapshot) {
+                    continue;
+                }
+                if (objectVertexOffset + objectVertexCount > importedVertexCountSnapshot) {
+                    objectVertexCount = importedVertexCountSnapshot - objectVertexOffset;
+                }
+                objectVertexCount -= objectVertexCount % 3u;
+                if (objectVertexCount < 3u) {
+                    continue;
+                }
+
+                modelKey = [NSString stringWithFormat:@"model_%u_%u", modelObjectEntitySnapshot[objectIndex], objectIndex];
+                slotValue = brushSlotByKey[modelKey];
+                if (slotValue == nil) {
+                    float minU = FLT_MAX;
+                    float minV = FLT_MAX;
+                    float maxU = -FLT_MAX;
+                    float maxV = -FLT_MAX;
+                    float worldArea = 0.0f;
+                    int chartWidth;
+                    int chartHeight;
+
+                    for (uint32_t localVertex = 0u; localVertex < objectVertexCount; ++localVertex) {
+                        const NovaSceneVertex* vertex = &importedVerticesSnapshot[objectVertexOffset + localVertex];
+                        minU = fminf(minU, vertex->lightmapUv[0]);
+                        minV = fminf(minV, vertex->lightmapUv[1]);
+                        maxU = fmaxf(maxU, vertex->lightmapUv[0]);
+                        maxV = fmaxf(maxV, vertex->lightmapUv[1]);
+                    }
+
+                    for (uint32_t triOffset = 0u; triOffset + 2u < objectVertexCount; triOffset += 3u) {
+                        const NovaSceneVertex* v0 = &importedVerticesSnapshot[objectVertexOffset + triOffset + 0u];
+                        const NovaSceneVertex* v1 = &importedVerticesSnapshot[objectVertexOffset + triOffset + 1u];
+                        const NovaSceneVertex* v2 = &importedVerticesSnapshot[objectVertexOffset + triOffset + 2u];
+                        Vec3 p0 = vec3_make(v0->position[0], v0->position[1], v0->position[2]);
+                        Vec3 p1 = vec3_make(v1->position[0], v1->position[1], v1->position[2]);
+                        Vec3 p2 = vec3_make(v2->position[0], v2->position[1], v2->position[2]);
+                        Vec3 crossEdge = vec3_cross(vec3_sub(p1, p0), vec3_sub(p2, p0));
+                        worldArea += 0.5f * vec3_length(crossEdge);
+                    }
+
+                    resolution = (int)fmin((double)kPreviewBakeDensityMax, fmax((double)kPreviewBakeDensityMin, (double)bakeDensity));
+                    {
+                        float uvSpanU = fmaxf(maxU - minU, 1e-4f);
+                        float uvSpanV = fmaxf(maxV - minV, 1e-4f);
+                        float aspect = uvSpanU / uvSpanV;
+                        float targetTexelCount = fmaxf(worldArea, 1.0f) * (float)resolution * (float)resolution;
+                        chartWidth = (int)ceilf(sqrtf(targetTexelCount * aspect));
+                        chartHeight = (int)ceilf(sqrtf(targetTexelCount / fmaxf(aspect, 1e-4f)));
+                    }
+                    chartWidth = chartWidth < kPreviewBakeMinResolution ? kPreviewBakeMinResolution : chartWidth;
+                    chartHeight = chartHeight < kPreviewBakeMinResolution ? kPreviewBakeMinResolution : chartHeight;
+                    if (chartWidth > kPreviewBakeMaxResolution) {
+                        chartWidth = kPreviewBakeMaxResolution;
+                    }
+                    if (chartHeight > kPreviewBakeMaxResolution) {
+                        chartHeight = kPreviewBakeMaxResolution;
+                    }
+
+                    slot = (uint32_t)brushAccums.count;
+                    brushSlotByKey[modelKey] = @(slot);
+                    [brushKeys addObject:modelKey];
+                    [brushWidths addObject:@(chartWidth)];
+                    [brushHeights addObject:@(chartHeight)];
+                    [brushTriangleStarts addObject:brushTriangleStartByKey[modelKey] != nil ? brushTriangleStartByKey[modelKey] : @(0u)];
+                    [brushTriangleCounts addObject:brushTriangleCountByKey[modelKey] != nil ? brushTriangleCountByKey[modelKey] : @(0u)];
+                    [brushAccums addObject:[NSMutableData dataWithLength:(NSUInteger)chartWidth * (NSUInteger)chartHeight * sizeof(HwrtBakeTexelAccum)]];
+                } else {
+                    slot = slotValue.unsignedIntValue;
+                }
+
+                bakeWidth = brushWidths[slot].intValue;
+                bakeHeight = brushHeights[slot].intValue;
+                accumData = brushAccums[slot];
+                accum = (HwrtBakeTexelAccum*)accumData.mutableBytes;
+                trianglePrimitiveId = (brushTriangleStartByKey[modelKey] != nil ? brushTriangleStartByKey[modelKey].unsignedIntValue : 0u);
+                uvMinU = brushUvMinUByKey[modelKey] != nil ? brushUvMinUByKey[modelKey].floatValue : 0.0f;
+                uvMinV = brushUvMinVByKey[modelKey] != nil ? brushUvMinVByKey[modelKey].floatValue : 0.0f;
+                uvMaxU = brushUvMaxUByKey[modelKey] != nil ? brushUvMaxUByKey[modelKey].floatValue : 1.0f;
+                uvMaxV = brushUvMaxVByKey[modelKey] != nil ? brushUvMaxVByKey[modelKey].floatValue : 1.0f;
+                uvSpanU = fmaxf(uvMaxU - uvMinU, 1e-4f);
+                uvSpanV = fmaxf(uvMaxV - uvMinV, 1e-4f);
+                translationX = object->worldMatrix[12];
+                translationY = object->worldMatrix[13];
+                translationZ = object->worldMatrix[14];
+
+                for (uint32_t triOffset = 0u; triOffset + 2u < objectVertexCount; triOffset += 3u) {
+                    const NovaSceneVertex* v0 = &importedVerticesSnapshot[objectVertexOffset + triOffset + 0u];
+                    const NovaSceneVertex* v1 = &importedVerticesSnapshot[objectVertexOffset + triOffset + 1u];
+                    const NovaSceneVertex* v2 = &importedVerticesSnapshot[objectVertexOffset + triOffset + 2u];
+                    float x0 = ((v0->lightmapUv[0] - uvMinU) / uvSpanU) * (float)bakeWidth;
+                    float y0 = ((v0->lightmapUv[1] - uvMinV) / uvSpanV) * (float)bakeHeight;
+                    float x1 = ((v1->lightmapUv[0] - uvMinU) / uvSpanU) * (float)bakeWidth;
+                    float y1 = ((v1->lightmapUv[1] - uvMinV) / uvSpanV) * (float)bakeHeight;
+                    float x2 = ((v2->lightmapUv[0] - uvMinU) / uvSpanU) * (float)bakeWidth;
+                    float y2 = ((v2->lightmapUv[1] - uvMinV) / uvSpanV) * (float)bakeHeight;
+                    float minU = floorf(fminf(x0, fminf(x1, x2)));
+                    float minV = floorf(fminf(y0, fminf(y1, y2)));
+                    float maxU = ceilf(fmaxf(x0, fmaxf(x1, x2)));
+                    float maxV = ceilf(fmaxf(y0, fmaxf(y1, y2)));
+                    float denom = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2);
+                    simd_float3 a0 = simd_make_float3(1.0f, 1.0f, 1.0f);
+                    simd_float3 a1 = simd_make_float3(1.0f, 1.0f, 1.0f);
+                    simd_float3 a2 = simd_make_float3(1.0f, 1.0f, 1.0f);
+
+                    if (fabsf(denom) < 1e-6f) {
+                        int px = (int)fminf(fmaxf(x0, 0.0f), (float)(bakeWidth - 1));
+                        int py = (int)fminf(fmaxf(y0, 0.0f), (float)(bakeHeight - 1));
+                        size_t texelIndex = (size_t)py * (size_t)bakeWidth + (size_t)px;
+                        simd_float3 worldPos = simd_make_float3(v0->position[0] + translationX,
+                                                                v0->position[1] + translationY,
+                                                                v0->position[2] + translationZ);
+                        simd_float3 normal = simd_make_float3(v0->normal[0], v0->normal[1], v0->normal[2]);
+
+                        if (accum[texelIndex].sourceTriangleIdPlusOne == 0u) {
+                            accum[texelIndex].sourceTriangleIdPlusOne = trianglePrimitiveId + 1u;
+                        }
+
+                        accum[texelIndex].worldPosWeight.x += worldPos.x;
+                        accum[texelIndex].worldPosWeight.y += worldPos.y;
+                        accum[texelIndex].worldPosWeight.z += worldPos.z;
+                        accum[texelIndex].worldPosWeight.w += 1.0f;
+                        accum[texelIndex].normalSum.x += normal.x;
+                        accum[texelIndex].normalSum.y += normal.y;
+                        accum[texelIndex].normalSum.z += normal.z;
+                        accum[texelIndex].albedoSum.x += a0.x;
+                        accum[texelIndex].albedoSum.y += a0.y;
+                        accum[texelIndex].albedoSum.z += a0.z;
+
+                        trianglePrimitiveId += 1u;
+                        processedTriangles += 1u;
+                        continue;
+                    }
+
+                    if (minU < 0.0f) minU = 0.0f;
+                    if (minV < 0.0f) minV = 0.0f;
+                    if (maxU > (float)(bakeWidth - 1)) maxU = (float)(bakeWidth - 1);
+                    if (maxV > (float)(bakeHeight - 1)) maxV = (float)(bakeHeight - 1);
+
+                    for (int py = (int)minV; py <= (int)maxV; ++py) {
+                        for (int px = (int)minU; px <= (int)maxU; ++px) {
+                            float sampleU = (float)px + 0.5f;
+                            float sampleV = (float)py + 0.5f;
+                            float w0 = ((y1 - y2) * (sampleU - x2) + (x2 - x1) * (sampleV - y2)) / denom;
+                            float w1 = ((y2 - y0) * (sampleU - x2) + (x0 - x2) * (sampleV - y2)) / denom;
+                            float w2 = 1.0f - w0 - w1;
+                            if (w0 < -1e-4f || w1 < -1e-4f || w2 < -1e-4f) {
+                                continue;
+                            }
+
+                            simd_float3 worldPos = simd_make_float3(v0->position[0] + translationX,
+                                                                    v0->position[1] + translationY,
+                                                                    v0->position[2] + translationZ) * w0 +
+                                                   simd_make_float3(v1->position[0] + translationX,
+                                                                    v1->position[1] + translationY,
+                                                                    v1->position[2] + translationZ) * w1 +
+                                                   simd_make_float3(v2->position[0] + translationX,
+                                                                    v2->position[1] + translationY,
+                                                                    v2->position[2] + translationZ) * w2;
+                            simd_float3 normal = simd_make_float3(v0->normal[0], v0->normal[1], v0->normal[2]) * w0 +
+                                                 simd_make_float3(v1->normal[0], v1->normal[1], v1->normal[2]) * w1 +
+                                                 simd_make_float3(v2->normal[0], v2->normal[1], v2->normal[2]) * w2;
+                            simd_float3 albedo = a0 * w0 + a1 * w1 + a2 * w2;
+                            size_t texelIndex = (size_t)py * (size_t)bakeWidth + (size_t)px;
+
+                            if (accum[texelIndex].sourceTriangleIdPlusOne == 0u) {
+                                accum[texelIndex].sourceTriangleIdPlusOne = trianglePrimitiveId + 1u;
+                            }
+
+                            accum[texelIndex].worldPosWeight.x += worldPos.x;
+                            accum[texelIndex].worldPosWeight.y += worldPos.y;
+                            accum[texelIndex].worldPosWeight.z += worldPos.z;
+                            accum[texelIndex].worldPosWeight.w += 1.0f;
+                            accum[texelIndex].normalSum.x += normal.x;
+                            accum[texelIndex].normalSum.y += normal.y;
+                            accum[texelIndex].normalSum.z += normal.z;
+                            accum[texelIndex].albedoSum.x += albedo.x;
+                            accum[texelIndex].albedoSum.y += albedo.y;
+                            accum[texelIndex].albedoSum.z += albedo.z;
+                        }
+                    }
+
+                    trianglePrimitiveId += 1u;
+                    processedTriangles += 1u;
+                    {
+                        int percent = (int)((processedTriangles * 100u) / totalTriangles);
+                        if (percent != lastPercent && (percent == 0 || percent % 5 == 0 || percent == 100)) {
+                            int filled = percent / 5;
+                            char bar[21];
+                            for (int i = 0; i < 20; ++i) {
+                                bar[i] = i < filled ? '#' : '-';
+                            }
+                            bar[20] = '\0';
+                            NSLog(@"[lighting] bake unwrap [%s] %d%% (%u/%u triangles)", bar, percent, processedTriangles, totalTriangles);
+                            lastPercent = percent;
+                        }
+                    }
+                }
+            }
+        }
+
         for (NSUInteger slot = 0; slot < brushAccums.count; ++slot) {
             HwrtBakeTexelAccum* accum = (HwrtBakeTexelAccum*)brushAccums[slot].mutableBytes;
             NSString* key = brushKeys[slot];
@@ -4635,6 +5256,13 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                         normal = simd_make_float3(0.0f, 0.0f, 1.0f);
                     }
 
+                    uint32_t sourceTriangleStart = sourceTriangleCount > 0u ? sourceTriangleStart : 0u;
+                    uint32_t sourceTriangleCountForTexel = sourceTriangleCount;
+                    if (accum[texelIndex].sourceTriangleIdPlusOne > 0u) {
+                        sourceTriangleStart = accum[texelIndex].sourceTriangleIdPlusOne - 1u;
+                        sourceTriangleCountForTexel = 1u;
+                    }
+
                     texels[texelIndex].worldPosValid = simd_make_float4(worldPos.x, worldPos.y, worldPos.z, 1.0f);
                     texels[texelIndex].normal = simd_make_float4(normal.x, normal.y, normal.z, 0.0f);
                     texels[texelIndex].albedo = simd_make_float4(fminf(fmaxf(albedo.x, 0.0f), 1.0f),
@@ -4642,7 +5270,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                                                                  fminf(fmaxf(albedo.z, 0.0f), 1.0f),
                                                                  0.0f);
                     texels[texelIndex].sourceTriangleData = simd_make_uint4(sourceTriangleStart,
-                                                                            sourceTriangleCount,
+                                                                            sourceTriangleCountForTexel,
                                                                             0u,
                                                                             0u);
                     validTexelCount += 1u;
@@ -4672,9 +5300,10 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
             [bakeTexelDatas addObject:texelData];
             [bakeValidTexelCounts addObject:@(validTexelCount)];
             [bakeAccumulatedLighting addObject:[NSMutableData dataWithLength:texelCount * sizeof(simd_float4)]];
+            [bakeableBrushKeys addObject:key];
         }
 
-        lightmapPages = viewport_build_lightmap_page_layout(brushKeys, brushWidths, brushHeights, kPreviewBakeAtlasTileExtent);
+        lightmapPages = viewport_build_lightmap_page_layout(bakeableBrushKeys, brushWidths, brushHeights, kPreviewBakeAtlasTileExtent);
         for (NSMutableDictionary<NSString*, id>* page in lightmapPages) {
             NSString* pageKey = page[@"key"];
             NSDictionary<NSString*, NSArray<NSNumber*>*>* charts = page[@"charts"];
@@ -4689,7 +5318,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                 continue;
             }
             memset(dstTexels, 0, pageTexelData.length);
-            for (NSString* faceKey in brushKeys) {
+            for (NSString* faceKey in bakeableBrushKeys) {
                 NSArray<NSNumber*>* chartInfo = charts[faceKey];
                 NSNumber* slotValue = brushSlotByKey[faceKey];
                 if (chartInfo == nil || slotValue == nil) {
@@ -4697,6 +5326,9 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                 }
                 NSUInteger slot = slotValue.unsignedIntegerValue;
                 NSMutableData* faceTexelData = slot < bakeTexelDatas.count ? bakeTexelDatas[slot] : nil;
+                if (faceTexelData.length == 0u) {
+                    continue;
+                }
                 int chartX = chartInfo[0].intValue;
                 int chartY = chartInfo[1].intValue;
                 int chartW = chartInfo[2].intValue;
@@ -4879,7 +5511,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                 }
 
                 NSDictionary<NSString*, NSArray<NSNumber*>*>* charts = pageIndex < lightmapPages.count ? lightmapPages[pageIndex][@"charts"] : nil;
-                for (NSString* faceKey in brushKeys) {
+                for (NSString* faceKey in bakeableBrushKeys) {
                     NSArray<NSNumber*>* chartInfo = charts[faceKey];
                     if (chartInfo == nil) {
                         continue;
@@ -4948,7 +5580,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                 }
 
                 // Assemble per-face bakes into a small number of shared global lightmap pages.
-                [progressiveMaps addEntriesFromDictionary:viewport_assemble_global_lightmap_atlases(progressiveFacePayloads, brushKeys, kPreviewBakeAtlasTileExtent)];
+                [progressiveMaps addEntriesFromDictionary:viewport_assemble_global_lightmap_atlases(progressiveFacePayloads, bakeableBrushKeys, kPreviewBakeAtlasTileExtent)];
 
                 accumulatedSamples = newAccumulatedSamples;
                 bakedMaps = progressiveMaps;
@@ -5091,26 +5723,116 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     int32_t materialTextureIndices[UI_MAX_LIGHTS];
     int32_t materialSourceMaterialIndices[UI_MAX_LIGHTS];
     uint8_t materialUsesSourceModel[UI_MAX_LIGHTS] = {0};
+    uint8_t materialHasSourceModelMaterial[UI_MAX_LIGHTS] = {0};
+    NovaSceneMaterial materialSourceModelMaterials[UI_MAX_LIGHTS] = {0};
+    int32_t materialBaseColorTextureIndices[UI_MAX_LIGHTS];
+    int32_t materialMetallicRoughnessTextureIndices[UI_MAX_LIGHTS];
+    int32_t materialNormalTextureIndices[UI_MAX_LIGHTS];
+    int32_t materialEmissiveTextureIndices[UI_MAX_LIGHTS];
+    int32_t materialOcclusionTextureIndices[UI_MAX_LIGHTS];
+    int32_t materialTransmissionTextureIndices[UI_MAX_LIGHTS];
     int32_t* objectBakedLightmapIndices = NULL;
     uint32_t* objectBrushEntity = NULL;
     uint32_t* objectBrushSolid = NULL;
     uint32_t* objectBrushSide = NULL;
     NSMutableDictionary<NSString*, NSNumber*>* importedTextureIndices = [NSMutableDictionary dictionary];
     NSMutableArray<NSDictionary<NSString*, id>*>* importedTextures = [NSMutableArray array];
+    NSMutableDictionary<NSString*, id>* sourceModelSceneCache = [NSMutableDictionary dictionary];
+    NSMutableArray<NSValue*>* ownedSourceModelScenes = [NSMutableArray array];
+    NSMutableSet<NSString*>* uniqueModelAssetPaths = [NSMutableSet set];
+    NSMutableDictionary<NSString*, NSValue*>* modelAssetVertexStarts = [NSMutableDictionary dictionary];
+    NSMutableDictionary<NSString*, NSValue*>* modelAssetPrimitiveStarts = [NSMutableDictionary dictionary];
+    NSMutableDictionary<NSString*, NSValue*>* modelAssetVertexCounts = [NSMutableDictionary dictionary];
+    NSMutableDictionary<NSString*, NSValue*>* modelAssetPrimitiveCounts = [NSMutableDictionary dictionary];
+    uint32_t totalModelVertexCount = 0u;
+    uint32_t totalModelPrimitiveCount = 0u;
+    uint32_t totalModelObjectCount = 0u;
+    uint32_t objectCapacity = 0u;
     uint32_t objectCount = 0u;
     uint32_t materialCount = 0u;
     uint32_t maxSupportedObjects = UI_MAX_SCENE_OBJECTS;
+    const uint32_t maxModelPrimitivesPerDrawObject = 2048u;
     NovaSceneImportedRuntime* importedRuntime = nova_scene_world_imported_runtime(self.sceneWorld);
+
+    [self clearHeavyObjectModelMappings];
 
     for (uint32_t index = 0u; index < UI_MAX_LIGHTS; ++index) {
         materialTextureIndices[index] = -1;
         materialSourceMaterialIndices[index] = -1;
+        materialBaseColorTextureIndices[index] = -1;
+        materialMetallicRoughnessTextureIndices[index] = -1;
+        materialNormalTextureIndices[index] = -1;
+        materialEmissiveTextureIndices[index] = -1;
+        materialOcclusionTextureIndices[index] = -1;
+        materialTransmissionTextureIndices[index] = -1;
     }
 
     nova_scene_data_release(&_importedSceneData);
     nova_scene_data_init(&_importedSceneData);
 
-    if (self.sceneWorld == NULL || mesh == NULL || mesh->vertices == NULL || mesh->vertexCount == 0 || mesh->faceRanges == NULL || mesh->faceRangeCount == 0) {
+    if (self.vmfScene != NULL) {
+        for (size_t entityIndex = 0; entityIndex < self.vmfScene->entityCount; ++entityIndex) {
+            const VmfEntity* entity = &self.vmfScene->entities[entityIndex];
+            NSString* assetPathString;
+            id cachedSceneValue;
+            NovaSceneData* loadedScene;
+            char loadError[512] = {0};
+
+            if (entity->kind != VmfEntityKindModel || entity->modelAssetPath[0] == '\0') {
+                continue;
+            }
+
+            assetPathString = [NSString stringWithUTF8String:entity->modelAssetPath];
+            if (assetPathString.length == 0) {
+                continue;
+            }
+
+            cachedSceneValue = sourceModelSceneCache[assetPathString];
+            if (cachedSceneValue == nil) {
+                loadedScene = (NovaSceneData*)malloc(sizeof(NovaSceneData));
+                if (loadedScene != NULL) {
+                    nova_scene_data_init(loadedScene);
+                    if (!nova_model_asset_load_scene(entity->modelAssetPath, loadedScene, loadError, (uint32_t)sizeof(loadError))) {
+                        nova_scene_data_release(loadedScene);
+                        free(loadedScene);
+                        loadedScene = NULL;
+                    }
+                }
+                cachedSceneValue = loadedScene != NULL ? [NSValue valueWithPointer:loadedScene] : (id)NSNull.null;
+                sourceModelSceneCache[assetPathString] = cachedSceneValue;
+                if (loadedScene != NULL) {
+                    [ownedSourceModelScenes addObject:[NSValue valueWithPointer:loadedScene]];
+                }
+            }
+
+            if (cachedSceneValue == (id)NSNull.null) {
+                continue;
+            }
+
+            loadedScene = (NovaSceneData*)[(NSValue*)cachedSceneValue pointerValue];
+            if (loadedScene->primitiveCount > 0u) {
+                if (loadedScene->objectCount > 0u) {
+                    for (uint32_t sourceObjectIndex = 0u; sourceObjectIndex < loadedScene->objectCount; ++sourceObjectIndex) {
+                        uint32_t primitiveCount = loadedScene->objects[sourceObjectIndex].primitiveCount;
+                        if (primitiveCount == 0u) {
+                            continue;
+                        }
+                        totalModelObjectCount += (primitiveCount + maxModelPrimitivesPerDrawObject - 1u) / maxModelPrimitivesPerDrawObject;
+                    }
+                } else {
+                    totalModelObjectCount += (loadedScene->primitiveCount + maxModelPrimitivesPerDrawObject - 1u) / maxModelPrimitivesPerDrawObject;
+                }
+            }
+            if (![uniqueModelAssetPaths containsObject:assetPathString]) {
+                [uniqueModelAssetPaths addObject:assetPathString];
+                totalModelVertexCount += loadedScene->primitiveCount * 3u;
+                totalModelPrimitiveCount += loadedScene->primitiveCount;
+            }
+        }
+    }
+
+    if (self.sceneWorld == NULL || mesh == NULL ||
+        ((mesh->vertices == NULL || mesh->vertexCount == 0 || mesh->faceRanges == NULL || mesh->faceRangeCount == 0) && totalModelObjectCount == 0u)) {
         _fullRendererUiState.importedSceneActive = 0;
         if (importedRuntime != NULL) {
             importedRuntime->active = 0u;
@@ -5121,11 +5843,16 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         return;
     }
 
-    objectRecords = (NovaSceneObjectRecord*)calloc(mesh->faceRangeCount > 0u ? mesh->faceRangeCount : 1u, sizeof(*objectRecords));
-    objectBakedLightmapIndices = (int32_t*)malloc((mesh->faceRangeCount > 0u ? mesh->faceRangeCount : 1u) * sizeof(int32_t));
-    objectBrushEntity = (uint32_t*)malloc((mesh->faceRangeCount > 0u ? mesh->faceRangeCount : 1u) * sizeof(uint32_t));
-    objectBrushSolid = (uint32_t*)malloc((mesh->faceRangeCount > 0u ? mesh->faceRangeCount : 1u) * sizeof(uint32_t));
-    objectBrushSide = (uint32_t*)malloc((mesh->faceRangeCount > 0u ? mesh->faceRangeCount : 1u) * sizeof(uint32_t));
+    objectCapacity = (uint32_t)(mesh->faceRangeCount + totalModelObjectCount);
+    if (objectCapacity == 0u) {
+        objectCapacity = 1u;
+    }
+
+    objectRecords = (NovaSceneObjectRecord*)calloc(objectCapacity, sizeof(*objectRecords));
+    objectBakedLightmapIndices = (int32_t*)malloc((size_t)objectCapacity * sizeof(int32_t));
+    objectBrushEntity = (uint32_t*)malloc((size_t)objectCapacity * sizeof(uint32_t));
+    objectBrushSolid = (uint32_t*)malloc((size_t)objectCapacity * sizeof(uint32_t));
+    objectBrushSide = (uint32_t*)malloc((size_t)objectCapacity * sizeof(uint32_t));
     if (objectRecords == NULL || objectBakedLightmapIndices == NULL || objectBrushEntity == NULL || objectBrushSolid == NULL || objectBrushSide == NULL) {
         _fullRendererUiState.importedSceneActive = 0;
         free(objectRecords);
@@ -5140,16 +5867,16 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         }
         return;
     }
-    for (size_t i = 0; i < (mesh->faceRangeCount > 0u ? mesh->faceRangeCount : 1u); ++i) {
+    for (size_t i = 0; i < objectCapacity; ++i) {
         objectBakedLightmapIndices[i] = -1;
         objectBrushEntity[i] = UINT32_MAX;
         objectBrushSolid[i] = UINT32_MAX;
         objectBrushSide[i] = UINT32_MAX;
     }
 
-    _importedSceneData.vertexCount = (uint32_t)mesh->vertexCount;
-    _importedSceneData.primitiveCount = (uint32_t)(mesh->vertexCount / 3u);
-    _importedSceneData.objectCount = (uint32_t)mesh->faceRangeCount;
+    _importedSceneData.vertexCount = (uint32_t)mesh->vertexCount + totalModelVertexCount;
+    _importedSceneData.primitiveCount = (uint32_t)(mesh->vertexCount / 3u) + totalModelPrimitiveCount;
+    _importedSceneData.objectCount = objectCapacity;
     _importedSceneData.vertices = (NovaSceneVertex*)calloc(_importedSceneData.vertexCount, sizeof(NovaSceneVertex));
     _importedSceneData.primitiveMaterialIndices = (uint32_t*)calloc(_importedSceneData.primitiveCount > 0u ? _importedSceneData.primitiveCount : 1u, sizeof(uint32_t));
     _importedSceneData.objects = (NovaSceneObject*)calloc(_importedSceneData.objectCount, sizeof(NovaSceneObject));
@@ -5170,14 +5897,21 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         Bounds3 objectBounds;
         const char* modelAssetPath = NULL;
         BOOL isModelRange = NO;
+        NovaSceneData* sourceModelScene = NULL;
+        const VmfEntity* sourceEntity = NULL;
+        Vec3 sourceModelCenter = vec3_make(0.0f, 0.0f, 0.0f);
 
-        if (strncmp(range.material, "light_marker", sizeof(range.material)) == 0) {
+        if (strncmp(range.material, "light_marker", sizeof(range.material)) == 0 ||
+            strncmp(range.material, "model_marker", sizeof(range.material)) == 0) {
             continue;
         }
 
         if (range.modelAssetPath[0] != '\0' && range.sourceMaterialIndex >= 0) {
             isModelRange = YES;
             modelAssetPath = range.modelAssetPath;
+            if (self.vmfScene != NULL && range.entityIndex < self.vmfScene->entityCount) {
+                sourceEntity = &self.vmfScene->entities[range.entityIndex];
+            }
         }
 
         if (range.vertexStart >= mesh->vertexCount) {
@@ -5189,6 +5923,32 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         range.vertexCount -= range.vertexCount % 3u;
         if (range.vertexCount == 0u) {
             continue;
+        }
+
+        if (isModelRange) {
+            NSString* assetPathString = [NSString stringWithUTF8String:modelAssetPath];
+            id cachedSceneValue = sourceModelSceneCache[assetPathString];
+            if (cachedSceneValue == nil) {
+                NovaSceneData* loadedScene = (NovaSceneData*)malloc(sizeof(NovaSceneData));
+                char loadError[512] = {0};
+                if (loadedScene != NULL) {
+                    nova_scene_data_init(loadedScene);
+                    if (!nova_model_asset_load_scene(modelAssetPath, loadedScene, loadError, (uint32_t)sizeof(loadError))) {
+                        nova_scene_data_release(loadedScene);
+                        free(loadedScene);
+                        loadedScene = NULL;
+                    }
+                }
+                cachedSceneValue = loadedScene != NULL ? [NSValue valueWithPointer:loadedScene] : (id)NSNull.null;
+                sourceModelSceneCache[assetPathString] = cachedSceneValue;
+                if (loadedScene != NULL) {
+                    [ownedSourceModelScenes addObject:[NSValue valueWithPointer:loadedScene]];
+                }
+            }
+            if (cachedSceneValue != (id)NSNull.null) {
+                sourceModelScene = (NovaSceneData*)[(NSValue*)cachedSceneValue pointerValue];
+                sourceModelCenter = viewport_scene_bounds_center(sourceModelScene);
+            }
         }
 
         for (; materialIndex < materialCount; ++materialIndex) {
@@ -5216,34 +5976,134 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
             materialCount += 1u;
         }
 
+        if (isModelRange) {
+            snprintf(materialModelAssetPaths[materialIndex], sizeof(materialModelAssetPaths[materialIndex]), "%s", modelAssetPath);
+            materialSourceMaterialIndices[materialIndex] = range.sourceMaterialIndex;
+            materialUsesSourceModel[materialIndex] = 1u;
+
+            if (sourceModelScene != NULL && range.sourceMaterialIndex >= 0 && (uint32_t)range.sourceMaterialIndex < sourceModelScene->materialCount) {
+                const NovaSceneMaterial* sourceMaterial = &sourceModelScene->materials[range.sourceMaterialIndex];
+                NSString* assetPathString = [NSString stringWithUTF8String:modelAssetPath];
+                NSDictionary<NSString*, id>* modelTextureInfo = nil;
+
+                materialSourceModelMaterials[materialIndex] = *sourceMaterial;
+                materialHasSourceModelMaterial[materialIndex] = 1u;
+
+                if (materialBaseColorTextureIndices[materialIndex] < 0 &&
+                    sourceMaterial->baseColorTexture >= 0 &&
+                    (uint32_t)sourceMaterial->baseColorTexture < sourceModelScene->textureCount) {
+                    NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->baseColorTexture];
+                    modelTextureInfo = viewport_texture_dictionary_from_scene_texture(&sourceModelScene->textures[sourceMaterial->baseColorTexture]);
+                    materialBaseColorTextureIndices[materialIndex] = viewport_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
+                    NSString* viewportTextureKey = [NSString stringWithFormat:@"__modelvp__/%@#%d", assetPathString, range.sourceMaterialIndex];
+                    id<MTLTexture> viewportTexture = [self textureFromSceneTexture:&sourceModelScene->textures[sourceMaterial->baseColorTexture]];
+                    self.textureCache[viewportTextureKey] = viewportTexture != nil ? viewportTexture : (id)NSNull.null;
+                }
+                if (materialMetallicRoughnessTextureIndices[materialIndex] < 0 &&
+                    sourceMaterial->metallicRoughnessTexture >= 0 &&
+                    (uint32_t)sourceMaterial->metallicRoughnessTexture < sourceModelScene->textureCount) {
+                    NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->metallicRoughnessTexture];
+                    modelTextureInfo = viewport_texture_dictionary_from_scene_texture(&sourceModelScene->textures[sourceMaterial->metallicRoughnessTexture]);
+                    materialMetallicRoughnessTextureIndices[materialIndex] = viewport_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
+                }
+                if (materialNormalTextureIndices[materialIndex] < 0 &&
+                    sourceMaterial->normalTexture >= 0 &&
+                    (uint32_t)sourceMaterial->normalTexture < sourceModelScene->textureCount) {
+                    NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->normalTexture];
+                    modelTextureInfo = viewport_texture_dictionary_from_scene_texture(&sourceModelScene->textures[sourceMaterial->normalTexture]);
+                    materialNormalTextureIndices[materialIndex] = viewport_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
+                }
+                if (materialEmissiveTextureIndices[materialIndex] < 0 &&
+                    sourceMaterial->emissiveTexture >= 0 &&
+                    (uint32_t)sourceMaterial->emissiveTexture < sourceModelScene->textureCount) {
+                    NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->emissiveTexture];
+                    modelTextureInfo = viewport_texture_dictionary_from_scene_texture(&sourceModelScene->textures[sourceMaterial->emissiveTexture]);
+                    materialEmissiveTextureIndices[materialIndex] = viewport_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
+                }
+                if (materialOcclusionTextureIndices[materialIndex] < 0 &&
+                    sourceMaterial->occlusionTexture >= 0 &&
+                    (uint32_t)sourceMaterial->occlusionTexture < sourceModelScene->textureCount) {
+                    NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->occlusionTexture];
+                    modelTextureInfo = viewport_texture_dictionary_from_scene_texture(&sourceModelScene->textures[sourceMaterial->occlusionTexture]);
+                    materialOcclusionTextureIndices[materialIndex] = viewport_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
+                }
+                if (materialTransmissionTextureIndices[materialIndex] < 0 &&
+                    sourceMaterial->transmissionTexture >= 0 &&
+                    (uint32_t)sourceMaterial->transmissionTexture < sourceModelScene->textureCount) {
+                    NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->transmissionTexture];
+                    modelTextureInfo = viewport_texture_dictionary_from_scene_texture(&sourceModelScene->textures[sourceMaterial->transmissionTexture]);
+                    materialTransmissionTextureIndices[materialIndex] = viewport_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
+                }
+            }
+        }
+
+        objectBounds = bounds3_empty();
         for (size_t vertexOffset = 0; vertexOffset < range.vertexCount; ++vertexOffset) {
             size_t sourceIndex = range.vertexStart + vertexOffset;
             const ViewerVertex* source = &mesh->vertices[sourceIndex];
             NovaSceneVertex* destination = &_importedSceneData.vertices[sourceIndex];
-            destination->position[0] = source->position.raw[0];
-            destination->position[1] = source->position.raw[1];
-            destination->position[2] = source->position.raw[2];
-            destination->normal[0] = source->normal.raw[0];
-            destination->normal[1] = source->normal.raw[1];
-            destination->normal[2] = source->normal.raw[2];
-            destination->uv[0] = source->u;
-            destination->uv[1] = source->v;
-            destination->tangent[0] = 1.0f;
-            destination->tangent[1] = 0.0f;
-            destination->tangent[2] = 0.0f;
-            destination->tangent[3] = 1.0f;
+            if (isModelRange && sourceModelScene != NULL) {
+                uint32_t modelVertexStart = (uint32_t)range.sideIndex * 3u;
+                if (modelVertexStart + vertexOffset < sourceModelScene->vertexCount) {
+                    const NovaSceneVertex* modelVertex = &sourceModelScene->vertices[modelVertexStart + vertexOffset];
+                    destination->position[0] = modelVertex->position[0] - sourceModelCenter.raw[0];
+                    destination->position[1] = modelVertex->position[1] - sourceModelCenter.raw[1];
+                    destination->position[2] = modelVertex->position[2] - sourceModelCenter.raw[2];
+                    destination->normal[0] = modelVertex->normal[0];
+                    destination->normal[1] = modelVertex->normal[1];
+                    destination->normal[2] = modelVertex->normal[2];
+                    destination->uv[0] = modelVertex->uv[0];
+                    destination->uv[1] = modelVertex->uv[1];
+                    destination->lightmapUv[0] = modelVertex->lightmapUv[0];
+                    destination->lightmapUv[1] = modelVertex->lightmapUv[1];
+                    destination->tangent[0] = modelVertex->tangent[0];
+                    destination->tangent[1] = modelVertex->tangent[1];
+                    destination->tangent[2] = modelVertex->tangent[2];
+                    destination->tangent[3] = modelVertex->tangent[3];
+                } else {
+                    destination->position[0] = source->position.raw[0];
+                    destination->position[1] = source->position.raw[1];
+                    destination->position[2] = source->position.raw[2];
+                    destination->normal[0] = source->normal.raw[0];
+                    destination->normal[1] = source->normal.raw[1];
+                    destination->normal[2] = source->normal.raw[2];
+                    destination->uv[0] = source->u;
+                    destination->uv[1] = source->v;
+                    destination->lightmapUv[0] = source->lightmapU;
+                    destination->lightmapUv[1] = source->lightmapV;
+                    destination->tangent[0] = 1.0f;
+                    destination->tangent[1] = 0.0f;
+                    destination->tangent[2] = 0.0f;
+                    destination->tangent[3] = 1.0f;
+                }
+            } else {
+                destination->position[0] = source->position.raw[0];
+                destination->position[1] = source->position.raw[1];
+                destination->position[2] = source->position.raw[2];
+                destination->normal[0] = source->normal.raw[0];
+                destination->normal[1] = source->normal.raw[1];
+                destination->normal[2] = source->normal.raw[2];
+                destination->uv[0] = source->u;
+                destination->uv[1] = source->v;
+                destination->lightmapUv[0] = source->lightmapU;
+                destination->lightmapUv[1] = source->lightmapV;
+                destination->tangent[0] = 1.0f;
+                destination->tangent[1] = 0.0f;
+                destination->tangent[2] = 0.0f;
+                destination->tangent[3] = 1.0f;
+            }
             destination->materialIndex = materialIndex;
             materialColors[materialIndex][0] += source->color.raw[0];
             materialColors[materialIndex][1] += source->color.raw[1];
             materialColors[materialIndex][2] += source->color.raw[2];
             materialSamples[materialIndex] += 1u;
+            bounds3_expand(&objectBounds, vec3_make(destination->position[0], destination->position[1], destination->position[2]));
         }
 
         for (size_t primitiveIndex = 0; primitiveIndex < range.vertexCount / 3u; ++primitiveIndex) {
             _importedSceneData.primitiveMaterialIndices[(range.vertexStart / 3u) + primitiveIndex] = materialIndex;
         }
 
-        objectBounds = viewport_bounds_for_vertex_range(mesh->vertices, range.vertexStart, range.vertexCount);
         if (objectCount > 0u) {
             NovaSceneObject* lastObject = &_importedSceneData.objects[objectCount - 1u];
             NovaSceneObjectRecord* lastRecord = &objectRecords[objectCount - 1u];
@@ -5290,9 +6150,19 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         _importedSceneData.objects[objectCount].vertexOffset = (uint32_t)range.vertexStart;
         _importedSceneData.objects[objectCount].vertexCount = (uint32_t)range.vertexCount;
         viewport_identity_matrix(_importedSceneData.objects[objectCount].worldMatrix);
+        if (isModelRange && sourceEntity != NULL) {
+            _importedSceneData.objects[objectCount].worldMatrix[12] = sourceEntity->position.raw[0];
+            _importedSceneData.objects[objectCount].worldMatrix[13] = sourceEntity->position.raw[1];
+            _importedSceneData.objects[objectCount].worldMatrix[14] = sourceEntity->position.raw[2];
+        }
 
         snprintf(objectRecords[objectCount].name, sizeof(objectRecords[objectCount].name), "%s", _importedSceneData.objects[objectCount].name);
         viewport_identity_matrix(objectRecords[objectCount].worldMatrix);
+        if (isModelRange && sourceEntity != NULL) {
+            objectRecords[objectCount].worldMatrix[12] = sourceEntity->position.raw[0];
+            objectRecords[objectCount].worldMatrix[13] = sourceEntity->position.raw[1];
+            objectRecords[objectCount].worldMatrix[14] = sourceEntity->position.raw[2];
+        }
         objectRecords[objectCount].aabbMin[0] = objectBounds.min.raw[0];
         objectRecords[objectCount].aabbMin[1] = objectBounds.min.raw[1];
         objectRecords[objectCount].aabbMin[2] = objectBounds.min.raw[2];
@@ -5312,6 +6182,429 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         objectBrushSolid[objectCount] = (uint32_t)range.solidIndex;
         objectBrushSide[objectCount] = (uint32_t)range.sideIndex;
         objectCount += 1u;
+    }
+
+    {
+        uint32_t modelVertexCursor = (uint32_t)mesh->vertexCount;
+        uint32_t modelPrimitiveCursor = (uint32_t)(mesh->vertexCount / 3u);
+
+        if (self.vmfScene != NULL) {
+            for (size_t entityIndex = 0; entityIndex < self.vmfScene->entityCount; ++entityIndex) {
+                const VmfEntity* entity = &self.vmfScene->entities[entityIndex];
+                NSString* assetPathString;
+                id cachedSceneValue;
+                NovaSceneData* sourceModelScene;
+                NSValue* vertexStartValue;
+                NSValue* primitiveStartValue;
+                NSValue* vertexCountValue;
+                NSValue* primitiveCountValue;
+                uint32_t modelVertexStart;
+                uint32_t modelPrimitiveStart;
+                uint32_t modelVertexCount;
+                uint32_t modelPrimitiveCount;
+
+                if (entity->kind != VmfEntityKindModel || entity->modelAssetPath[0] == '\0') {
+                    continue;
+                }
+
+                assetPathString = [NSString stringWithUTF8String:entity->modelAssetPath];
+                if (assetPathString.length == 0) {
+                    continue;
+                }
+
+                cachedSceneValue = sourceModelSceneCache[assetPathString];
+                if (cachedSceneValue == nil || cachedSceneValue == (id)NSNull.null) {
+                    continue;
+                }
+                sourceModelScene = (NovaSceneData*)[(NSValue*)cachedSceneValue pointerValue];
+                if (sourceModelScene == NULL || sourceModelScene->vertexCount == 0u || sourceModelScene->primitiveCount == 0u) {
+                    continue;
+                }
+
+                vertexStartValue = modelAssetVertexStarts[assetPathString];
+                primitiveStartValue = modelAssetPrimitiveStarts[assetPathString];
+                vertexCountValue = modelAssetVertexCounts[assetPathString];
+                primitiveCountValue = modelAssetPrimitiveCounts[assetPathString];
+
+                if (vertexStartValue == nil || primitiveStartValue == nil || vertexCountValue == nil || primitiveCountValue == nil) {
+                    Vec3 modelCenter = viewport_scene_bounds_center(sourceModelScene);
+                    uint32_t sourceMaterialCount = sourceModelScene->materialCount > 0u ? sourceModelScene->materialCount : 1u;
+                    uint32_t defaultModelMaterialIndex = 0u;
+                    uint32_t* materialRemap = (uint32_t*)malloc(sizeof(uint32_t) * sourceMaterialCount);
+                    uint32_t assetFallbackMaterialIndex = UINT32_MAX;
+
+                    modelVertexStart = modelVertexCursor;
+                    modelPrimitiveStart = modelPrimitiveCursor;
+                    modelVertexCount = sourceModelScene->primitiveCount * 3u;
+                    modelPrimitiveCount = sourceModelScene->primitiveCount;
+
+                    if (materialRemap == NULL ||
+                        modelVertexStart + modelVertexCount > _importedSceneData.vertexCount ||
+                        modelPrimitiveStart + modelPrimitiveCount > _importedSceneData.primitiveCount) {
+                        free(materialRemap);
+                        continue;
+                    }
+
+                    for (uint32_t materialIndex = 0u; materialIndex < materialCount; ++materialIndex) {
+                        if (materialUsesSourceModel[materialIndex] != 0u &&
+                            strncmp(materialModelAssetPaths[materialIndex], entity->modelAssetPath, sizeof(materialModelAssetPaths[materialIndex])) == 0) {
+                            assetFallbackMaterialIndex = materialIndex;
+                            break;
+                        }
+                    }
+
+                    for (uint32_t sourceMaterialIndex = 0u; sourceMaterialIndex < sourceMaterialCount; ++sourceMaterialIndex) {
+                        uint32_t resolvedMaterialIndex = UINT32_MAX;
+                        const char* sourceMaterialName = "model_default";
+
+                        if (sourceModelScene->materialCount > 0u && sourceMaterialIndex < sourceModelScene->materialCount &&
+                            sourceModelScene->materials[sourceMaterialIndex].name[0] != '\0') {
+                            sourceMaterialName = sourceModelScene->materials[sourceMaterialIndex].name;
+                        }
+
+                        for (uint32_t materialIndex = 0u; materialIndex < materialCount; ++materialIndex) {
+                            if (materialUsesSourceModel[materialIndex] != 0u &&
+                                materialSourceMaterialIndices[materialIndex] == (int32_t)sourceMaterialIndex &&
+                                strncmp(materialModelAssetPaths[materialIndex], entity->modelAssetPath, sizeof(materialModelAssetPaths[materialIndex])) == 0) {
+                                resolvedMaterialIndex = materialIndex;
+                                break;
+                            }
+                        }
+
+                        if (resolvedMaterialIndex == UINT32_MAX) {
+                            if (materialCount >= UI_MAX_LIGHTS) {
+                                resolvedMaterialIndex = assetFallbackMaterialIndex != UINT32_MAX ? assetFallbackMaterialIndex : 0u;
+                            } else {
+                                const NovaSceneMaterial* sourceMaterial = NULL;
+                                NSString* assetPathString = [NSString stringWithUTF8String:entity->modelAssetPath];
+                                NSDictionary<NSString*, id>* modelTextureInfo = nil;
+
+                                resolvedMaterialIndex = materialCount;
+                                snprintf(materialNames[resolvedMaterialIndex], sizeof(materialNames[resolvedMaterialIndex]), "%s", sourceMaterialName);
+                                snprintf(materialModelAssetPaths[resolvedMaterialIndex], sizeof(materialModelAssetPaths[resolvedMaterialIndex]), "%s", entity->modelAssetPath);
+                                materialSourceMaterialIndices[resolvedMaterialIndex] = (int32_t)sourceMaterialIndex;
+                                materialUsesSourceModel[resolvedMaterialIndex] = 1u;
+
+                                if (sourceModelScene->materialCount > 0u && sourceMaterialIndex < sourceModelScene->materialCount) {
+                                    sourceMaterial = &sourceModelScene->materials[sourceMaterialIndex];
+                                    materialSourceModelMaterials[resolvedMaterialIndex] = *sourceMaterial;
+                                    materialHasSourceModelMaterial[resolvedMaterialIndex] = 1u;
+
+                                    if (sourceMaterial->baseColorTexture >= 0 &&
+                                        (uint32_t)sourceMaterial->baseColorTexture < sourceModelScene->textureCount) {
+                                        NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->baseColorTexture];
+                                        modelTextureInfo = viewport_texture_dictionary_from_scene_texture(&sourceModelScene->textures[sourceMaterial->baseColorTexture]);
+                                        materialBaseColorTextureIndices[resolvedMaterialIndex] = viewport_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
+                                    }
+                                    if (sourceMaterial->metallicRoughnessTexture >= 0 &&
+                                        (uint32_t)sourceMaterial->metallicRoughnessTexture < sourceModelScene->textureCount) {
+                                        NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->metallicRoughnessTexture];
+                                        modelTextureInfo = viewport_texture_dictionary_from_scene_texture(&sourceModelScene->textures[sourceMaterial->metallicRoughnessTexture]);
+                                        materialMetallicRoughnessTextureIndices[resolvedMaterialIndex] = viewport_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
+                                    }
+                                    if (sourceMaterial->normalTexture >= 0 &&
+                                        (uint32_t)sourceMaterial->normalTexture < sourceModelScene->textureCount) {
+                                        NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->normalTexture];
+                                        modelTextureInfo = viewport_texture_dictionary_from_scene_texture(&sourceModelScene->textures[sourceMaterial->normalTexture]);
+                                        materialNormalTextureIndices[resolvedMaterialIndex] = viewport_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
+                                    }
+                                    if (sourceMaterial->emissiveTexture >= 0 &&
+                                        (uint32_t)sourceMaterial->emissiveTexture < sourceModelScene->textureCount) {
+                                        NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->emissiveTexture];
+                                        modelTextureInfo = viewport_texture_dictionary_from_scene_texture(&sourceModelScene->textures[sourceMaterial->emissiveTexture]);
+                                        materialEmissiveTextureIndices[resolvedMaterialIndex] = viewport_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
+                                    }
+                                    if (sourceMaterial->occlusionTexture >= 0 &&
+                                        (uint32_t)sourceMaterial->occlusionTexture < sourceModelScene->textureCount) {
+                                        NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->occlusionTexture];
+                                        modelTextureInfo = viewport_texture_dictionary_from_scene_texture(&sourceModelScene->textures[sourceMaterial->occlusionTexture]);
+                                        materialOcclusionTextureIndices[resolvedMaterialIndex] = viewport_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
+                                    }
+                                    if (sourceMaterial->transmissionTexture >= 0 &&
+                                        (uint32_t)sourceMaterial->transmissionTexture < sourceModelScene->textureCount) {
+                                        NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->transmissionTexture];
+                                        modelTextureInfo = viewport_texture_dictionary_from_scene_texture(&sourceModelScene->textures[sourceMaterial->transmissionTexture]);
+                                        materialTransmissionTextureIndices[resolvedMaterialIndex] = viewport_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
+                                    }
+                                }
+
+                                if (assetFallbackMaterialIndex == UINT32_MAX) {
+                                    assetFallbackMaterialIndex = resolvedMaterialIndex;
+                                }
+                                materialCount += 1u;
+                            }
+                        }
+
+                        materialRemap[sourceMaterialIndex] = resolvedMaterialIndex;
+                    }
+                    defaultModelMaterialIndex = materialRemap[0u];
+
+                    for (uint32_t primitiveIndex = 0u; primitiveIndex < modelPrimitiveCount; ++primitiveIndex) {
+                        uint32_t primitiveVertexStart = modelVertexStart + primitiveIndex * 3u;
+                        uint32_t sourceIndices[3] = {
+                            primitiveIndex * 3u,
+                            primitiveIndex * 3u + 1u,
+                            primitiveIndex * 3u + 2u,
+                        };
+                        uint32_t sourceMaterialIndex = 0u;
+                        uint32_t resolvedMaterialIndex;
+
+                        if (sourceModelScene->indices != NULL && sourceModelScene->indexCount >= (primitiveIndex * 3u + 3u)) {
+                            sourceIndices[0] = sourceModelScene->indices[primitiveIndex * 3u + 0u];
+                            sourceIndices[1] = sourceModelScene->indices[primitiveIndex * 3u + 1u];
+                            sourceIndices[2] = sourceModelScene->indices[primitiveIndex * 3u + 2u];
+                        }
+
+                        if (sourceModelScene->primitiveMaterialIndices != NULL && primitiveIndex < sourceModelScene->primitiveCount) {
+                            sourceMaterialIndex = sourceModelScene->primitiveMaterialIndices[primitiveIndex];
+                        } else if (sourceIndices[0] < sourceModelScene->vertexCount) {
+                            sourceMaterialIndex = sourceModelScene->vertices[sourceIndices[0]].materialIndex;
+                        }
+
+                        resolvedMaterialIndex = sourceMaterialIndex < sourceMaterialCount
+                            ? materialRemap[sourceMaterialIndex]
+                            : defaultModelMaterialIndex;
+
+                        _importedSceneData.primitiveMaterialIndices[modelPrimitiveStart + primitiveIndex] = resolvedMaterialIndex;
+                        if (primitiveVertexStart + 2u < _importedSceneData.vertexCount) {
+                            for (uint32_t corner = 0u; corner < 3u; ++corner) {
+                                uint32_t sourceVertexIndex = sourceIndices[corner];
+                                NovaSceneVertex* destination = &_importedSceneData.vertices[primitiveVertexStart + corner];
+
+                                if (sourceVertexIndex < sourceModelScene->vertexCount) {
+                                    const NovaSceneVertex* sourceVertex = &sourceModelScene->vertices[sourceVertexIndex];
+                                    destination->position[0] = sourceVertex->position[0] - modelCenter.raw[0];
+                                    destination->position[1] = sourceVertex->position[1] - modelCenter.raw[1];
+                                    destination->position[2] = sourceVertex->position[2] - modelCenter.raw[2];
+                                    destination->normal[0] = sourceVertex->normal[0];
+                                    destination->normal[1] = sourceVertex->normal[1];
+                                    destination->normal[2] = sourceVertex->normal[2];
+                                    destination->uv[0] = sourceVertex->uv[0];
+                                    destination->uv[1] = sourceVertex->uv[1];
+                                    destination->lightmapUv[0] = sourceVertex->lightmapUv[0];
+                                    destination->lightmapUv[1] = sourceVertex->lightmapUv[1];
+                                    destination->tangent[0] = sourceVertex->tangent[0];
+                                    destination->tangent[1] = sourceVertex->tangent[1];
+                                    destination->tangent[2] = sourceVertex->tangent[2];
+                                    destination->tangent[3] = sourceVertex->tangent[3];
+                                }
+
+                                destination->materialIndex = resolvedMaterialIndex;
+                            }
+                        }
+                    }
+
+                    free(materialRemap);
+
+                    modelAssetVertexStarts[assetPathString] = [NSValue valueWithBytes:&modelVertexStart objCType:@encode(uint32_t)];
+                    modelAssetPrimitiveStarts[assetPathString] = [NSValue valueWithBytes:&modelPrimitiveStart objCType:@encode(uint32_t)];
+                    modelAssetVertexCounts[assetPathString] = [NSValue valueWithBytes:&modelVertexCount objCType:@encode(uint32_t)];
+                    modelAssetPrimitiveCounts[assetPathString] = [NSValue valueWithBytes:&modelPrimitiveCount objCType:@encode(uint32_t)];
+
+                    modelVertexCursor += modelVertexCount;
+                    modelPrimitiveCursor += modelPrimitiveCount;
+                } else {
+                    [vertexStartValue getValue:&modelVertexStart];
+                    [primitiveStartValue getValue:&modelPrimitiveStart];
+                    [vertexCountValue getValue:&modelVertexCount];
+                    [primitiveCountValue getValue:&modelPrimitiveCount];
+                }
+
+                if (objectCount >= objectCapacity) {
+                    continue;
+                }
+
+                if (sourceModelScene->objectCount == 0u) {
+                    uint32_t chunkCount = modelPrimitiveCount > 0u
+                        ? (modelPrimitiveCount + maxModelPrimitivesPerDrawObject - 1u) / maxModelPrimitivesPerDrawObject
+                        : 0u;
+
+                    for (uint32_t chunkIndex = 0u; chunkIndex < chunkCount && objectCount < objectCapacity; ++chunkIndex) {
+                        Bounds3 objectBounds = bounds3_empty();
+                        uint32_t chunkPrimitiveStart = chunkIndex * maxModelPrimitivesPerDrawObject;
+                        uint32_t objectPrimitiveCount = modelPrimitiveCount - chunkPrimitiveStart;
+                        uint32_t objectPrimitiveOffset = modelPrimitiveStart + chunkPrimitiveStart;
+                        uint32_t objectVertexOffset;
+                        uint32_t objectVertexCount;
+                        int materialIndex = -1;
+                        int materialMixed = 0;
+
+                        if (objectPrimitiveCount > maxModelPrimitivesPerDrawObject) {
+                            objectPrimitiveCount = maxModelPrimitivesPerDrawObject;
+                        }
+
+                        objectVertexOffset = modelVertexStart + chunkPrimitiveStart * 3u;
+                        objectVertexCount = objectPrimitiveCount * 3u;
+
+                        if (objectVertexOffset >= _importedSceneData.vertexCount || objectPrimitiveOffset >= _importedSceneData.primitiveCount) {
+                            continue;
+                        }
+                        if (objectVertexOffset + objectVertexCount > _importedSceneData.vertexCount) {
+                            objectVertexCount = _importedSceneData.vertexCount - objectVertexOffset;
+                        }
+                        if (objectPrimitiveOffset + objectPrimitiveCount > _importedSceneData.primitiveCount) {
+                            objectPrimitiveCount = _importedSceneData.primitiveCount - objectPrimitiveOffset;
+                        }
+                        if (objectVertexCount == 0u || objectPrimitiveCount == 0u) {
+                            continue;
+                        }
+
+                        for (uint32_t localVertex = 0u; localVertex < objectVertexCount; ++localVertex) {
+                            const NovaSceneVertex* vertex = &_importedSceneData.vertices[objectVertexOffset + localVertex];
+                            bounds3_expand(&objectBounds, vec3_make(vertex->position[0], vertex->position[1], vertex->position[2]));
+                        }
+
+                        for (uint32_t localPrimitive = 0u; localPrimitive < objectPrimitiveCount; ++localPrimitive) {
+                            int primitiveMaterial = (int)_importedSceneData.primitiveMaterialIndices[objectPrimitiveOffset + localPrimitive];
+                            if (materialIndex < 0) {
+                                materialIndex = primitiveMaterial;
+                            } else if (materialIndex != primitiveMaterial) {
+                                materialMixed = 1;
+                            }
+                        }
+
+                        snprintf(_importedSceneData.objects[objectCount].name,
+                                 sizeof(_importedSceneData.objects[objectCount].name),
+                                 "model_%zu_0_%u",
+                                 entityIndex,
+                                 chunkIndex);
+                        _importedSceneData.objects[objectCount].primitiveOffset = objectPrimitiveOffset;
+                        _importedSceneData.objects[objectCount].primitiveCount = objectPrimitiveCount;
+                        _importedSceneData.objects[objectCount].vertexOffset = objectVertexOffset;
+                        _importedSceneData.objects[objectCount].vertexCount = objectVertexCount;
+                        viewport_identity_matrix(_importedSceneData.objects[objectCount].worldMatrix);
+                        _importedSceneData.objects[objectCount].worldMatrix[12] = entity->position.raw[0];
+                        _importedSceneData.objects[objectCount].worldMatrix[13] = entity->position.raw[1];
+                        _importedSceneData.objects[objectCount].worldMatrix[14] = entity->position.raw[2];
+
+                        snprintf(objectRecords[objectCount].name, sizeof(objectRecords[objectCount].name), "%s", _importedSceneData.objects[objectCount].name);
+                        viewport_identity_matrix(objectRecords[objectCount].worldMatrix);
+                        objectRecords[objectCount].worldMatrix[12] = entity->position.raw[0];
+                        objectRecords[objectCount].worldMatrix[13] = entity->position.raw[1];
+                        objectRecords[objectCount].worldMatrix[14] = entity->position.raw[2];
+                        objectRecords[objectCount].aabbMin[0] = objectBounds.min.raw[0];
+                        objectRecords[objectCount].aabbMin[1] = objectBounds.min.raw[1];
+                        objectRecords[objectCount].aabbMin[2] = objectBounds.min.raw[2];
+                        objectRecords[objectCount].aabbMax[0] = objectBounds.max.raw[0];
+                        objectRecords[objectCount].aabbMax[1] = objectBounds.max.raw[1];
+                        objectRecords[objectCount].aabbMax[2] = objectBounds.max.raw[2];
+                        objectRecords[objectCount].vertexOffset = objectVertexOffset;
+                        objectRecords[objectCount].vertexCount = objectVertexCount;
+                        objectRecords[objectCount].primitiveOffset = objectPrimitiveOffset;
+                        objectRecords[objectCount].primitiveCount = objectPrimitiveCount;
+                        objectRecords[objectCount].materialIndex = materialIndex;
+                        objectRecords[objectCount].materialMixed = materialMixed;
+                        objectRecords[objectCount].bakedLightmap[0] = -1.0f;
+                        objectRecords[objectCount].bakedLightmap[1] = 0.0f;
+                        objectRecords[objectCount].bakedLightmap[2] = 0.0f;
+                        objectBrushEntity[objectCount] = (uint32_t)entityIndex;
+                        objectBrushSolid[objectCount] = UINT32_MAX;
+                        objectBrushSide[objectCount] = UINT32_MAX;
+                        objectCount += 1u;
+                    }
+                    continue;
+                }
+
+                for (uint32_t sourceObjectIndex = 0u; sourceObjectIndex < sourceModelScene->objectCount && objectCount < objectCapacity; ++sourceObjectIndex) {
+                    const NovaSceneObject* sourceObject = &sourceModelScene->objects[sourceObjectIndex];
+                    uint32_t basePrimitiveOffset = sourceObject->primitiveOffset;
+                    uint32_t remainingPrimitives = sourceObject->primitiveCount;
+                    uint32_t chunkIndex = 0u;
+
+                    while (remainingPrimitives > 0u && objectCount < objectCapacity) {
+                        Bounds3 objectBounds = bounds3_empty();
+                        uint32_t chunkPrimitiveCount = remainingPrimitives > maxModelPrimitivesPerDrawObject
+                            ? maxModelPrimitivesPerDrawObject
+                            : remainingPrimitives;
+                        uint32_t localPrimitiveOffset = basePrimitiveOffset + chunkIndex * maxModelPrimitivesPerDrawObject;
+                        uint32_t objectVertexOffset = modelVertexStart + localPrimitiveOffset * 3u;
+                        uint32_t objectVertexCount = chunkPrimitiveCount * 3u;
+                        uint32_t objectPrimitiveOffset = modelPrimitiveStart + localPrimitiveOffset;
+                        uint32_t objectPrimitiveCount = chunkPrimitiveCount;
+                        int materialIndex = -1;
+                        int materialMixed = 0;
+
+                        if (objectVertexOffset >= _importedSceneData.vertexCount || objectPrimitiveOffset >= _importedSceneData.primitiveCount) {
+                            break;
+                        }
+                        if (objectVertexOffset + objectVertexCount > _importedSceneData.vertexCount) {
+                            objectVertexCount = _importedSceneData.vertexCount - objectVertexOffset;
+                        }
+                        if (objectPrimitiveOffset + objectPrimitiveCount > _importedSceneData.primitiveCount) {
+                            objectPrimitiveCount = _importedSceneData.primitiveCount - objectPrimitiveOffset;
+                        }
+                        if (objectVertexCount == 0u || objectPrimitiveCount == 0u) {
+                            break;
+                        }
+
+                        for (uint32_t localVertex = 0u; localVertex < objectVertexCount; ++localVertex) {
+                            const NovaSceneVertex* vertex = &_importedSceneData.vertices[objectVertexOffset + localVertex];
+                            bounds3_expand(&objectBounds, vec3_make(vertex->position[0], vertex->position[1], vertex->position[2]));
+                        }
+
+                        for (uint32_t localPrimitive = 0u; localPrimitive < objectPrimitiveCount; ++localPrimitive) {
+                            int primitiveMaterial = (int)_importedSceneData.primitiveMaterialIndices[objectPrimitiveOffset + localPrimitive];
+                            if (materialIndex < 0) {
+                                materialIndex = primitiveMaterial;
+                            } else if (materialIndex != primitiveMaterial) {
+                                materialMixed = 1;
+                            }
+                        }
+
+                        snprintf(_importedSceneData.objects[objectCount].name,
+                                 sizeof(_importedSceneData.objects[objectCount].name),
+                                 "model_%zu_%u_%u",
+                                 entityIndex,
+                                 sourceObjectIndex,
+                                 chunkIndex);
+                        _importedSceneData.objects[objectCount].primitiveOffset = objectPrimitiveOffset;
+                        _importedSceneData.objects[objectCount].primitiveCount = objectPrimitiveCount;
+                        _importedSceneData.objects[objectCount].vertexOffset = objectVertexOffset;
+                        _importedSceneData.objects[objectCount].vertexCount = objectVertexCount;
+                        viewport_identity_matrix(_importedSceneData.objects[objectCount].worldMatrix);
+                        _importedSceneData.objects[objectCount].worldMatrix[12] = entity->position.raw[0];
+                        _importedSceneData.objects[objectCount].worldMatrix[13] = entity->position.raw[1];
+                        _importedSceneData.objects[objectCount].worldMatrix[14] = entity->position.raw[2];
+
+                        snprintf(objectRecords[objectCount].name, sizeof(objectRecords[objectCount].name), "%s", _importedSceneData.objects[objectCount].name);
+                        viewport_identity_matrix(objectRecords[objectCount].worldMatrix);
+                        objectRecords[objectCount].worldMatrix[12] = entity->position.raw[0];
+                        objectRecords[objectCount].worldMatrix[13] = entity->position.raw[1];
+                        objectRecords[objectCount].worldMatrix[14] = entity->position.raw[2];
+                        objectRecords[objectCount].aabbMin[0] = objectBounds.min.raw[0];
+                        objectRecords[objectCount].aabbMin[1] = objectBounds.min.raw[1];
+                        objectRecords[objectCount].aabbMin[2] = objectBounds.min.raw[2];
+                        objectRecords[objectCount].aabbMax[0] = objectBounds.max.raw[0];
+                        objectRecords[objectCount].aabbMax[1] = objectBounds.max.raw[1];
+                        objectRecords[objectCount].aabbMax[2] = objectBounds.max.raw[2];
+                        objectRecords[objectCount].vertexOffset = objectVertexOffset;
+                        objectRecords[objectCount].vertexCount = objectVertexCount;
+                        objectRecords[objectCount].primitiveOffset = objectPrimitiveOffset;
+                        objectRecords[objectCount].primitiveCount = objectPrimitiveCount;
+                        objectRecords[objectCount].materialIndex = materialIndex;
+                        objectRecords[objectCount].materialMixed = materialMixed;
+                        objectRecords[objectCount].bakedLightmap[0] = -1.0f;
+                        objectRecords[objectCount].bakedLightmap[1] = 0.0f;
+                        objectRecords[objectCount].bakedLightmap[2] = 0.0f;
+                        objectBrushEntity[objectCount] = (uint32_t)entityIndex;
+                        objectBrushSolid[objectCount] = UINT32_MAX;
+                        objectBrushSide[objectCount] = UINT32_MAX;
+                        objectCount += 1u;
+
+                        remainingPrimitives -= chunkPrimitiveCount;
+                        chunkIndex += 1u;
+                    }
+                }
+            }
+        }
+    }
+
+    for (NSValue* ownedSceneValue in ownedSourceModelScenes) {
+        NovaSceneData* ownedScene = (NovaSceneData*)ownedSceneValue.pointerValue;
+        if (ownedScene != NULL) {
+            nova_scene_data_release(ownedScene);
+            free(ownedScene);
+        }
     }
 
     if (objectCount > maxSupportedObjects) {
@@ -5453,11 +6746,20 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         }
 
         for (uint32_t objectIndex = 0u; objectIndex < objectCount; ++objectIndex) {
-            if (objectBrushEntity[objectIndex] == UINT32_MAX || objectBrushSolid[objectIndex] == UINT32_MAX || objectBrushSide[objectIndex] == UINT32_MAX) {
+            NSString* faceSideKey = nil;
+            BOOL usesModelLightmapUv = NO;
+
+            if (objectBrushEntity[objectIndex] == UINT32_MAX) {
                 continue;
             }
 
-            NSString* faceSideKey = [NSString stringWithFormat:@"brush_%u_%u_%u", objectBrushEntity[objectIndex], objectBrushSolid[objectIndex], objectBrushSide[objectIndex]];
+            if (objectBrushSolid[objectIndex] == UINT32_MAX || objectBrushSide[objectIndex] == UINT32_MAX) {
+                faceSideKey = [NSString stringWithFormat:@"model_%u_%u", objectBrushEntity[objectIndex], objectIndex];
+                usesModelLightmapUv = YES;
+            } else {
+                faceSideKey = [NSString stringWithFormat:@"brush_%u_%u_%u", objectBrushEntity[objectIndex], objectBrushSolid[objectIndex], objectBrushSide[objectIndex]];
+            }
+
             NSDictionary<NSString*, id>* bakedFaceEntry = bakedFaceLookup[faceSideKey];
             NSString* atlasKey = bakedFaceEntry[@"atlasKey"];
             NSDictionary<NSString*, id>* bakedInfo = atlasKey.length > 0 ? self.previewBakedLightmaps[atlasKey] : nil;
@@ -5499,6 +6801,44 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
             objectRecords[objectIndex].bakedLightmap[2] = chartOriginV;
             objectRecords[objectIndex].bakedLightmap[3] = chartScaleU;
             objectRecords[objectIndex].bakedLightmap[4] = chartScaleV;
+
+            {
+                uint32_t vertexStart = _importedSceneData.objects[objectIndex].vertexOffset;
+                uint32_t vertexCount = _importedSceneData.objects[objectIndex].vertexCount;
+                if (vertexStart < _importedSceneData.vertexCount && vertexCount > 0u) {
+                    uint32_t maxVertexCount = _importedSceneData.vertexCount - vertexStart;
+                    if (vertexCount > maxVertexCount) {
+                        vertexCount = maxVertexCount;
+                    }
+                    if (vertexCount > 0u) {
+                        float minU = usesModelLightmapUv ? _importedSceneData.vertices[vertexStart].lightmapUv[0] : _importedSceneData.vertices[vertexStart].uv[0];
+                        float minV = usesModelLightmapUv ? _importedSceneData.vertices[vertexStart].lightmapUv[1] : _importedSceneData.vertices[vertexStart].uv[1];
+                        float maxU = minU;
+                        float maxV = minV;
+                        for (uint32_t localVertex = 1u; localVertex < vertexCount; ++localVertex) {
+                            const NovaSceneVertex* vertex = &_importedSceneData.vertices[vertexStart + localVertex];
+                            float sourceU = usesModelLightmapUv ? vertex->lightmapUv[0] : vertex->uv[0];
+                            float sourceV = usesModelLightmapUv ? vertex->lightmapUv[1] : vertex->uv[1];
+                            minU = fminf(minU, sourceU);
+                            minV = fminf(minV, sourceV);
+                            maxU = fmaxf(maxU, sourceU);
+                            maxV = fmaxf(maxV, sourceV);
+                        }
+
+                        float invSpanU = 1.0f / fmaxf(maxU - minU, 1e-4f);
+                        float invSpanV = 1.0f / fmaxf(maxV - minV, 1e-4f);
+                        for (uint32_t localVertex = 0u; localVertex < vertexCount; ++localVertex) {
+                            NovaSceneVertex* vertex = &_importedSceneData.vertices[vertexStart + localVertex];
+                            float sourceU = usesModelLightmapUv ? vertex->lightmapUv[0] : vertex->uv[0];
+                            float sourceV = usesModelLightmapUv ? vertex->lightmapUv[1] : vertex->uv[1];
+                            float normalizedU = (sourceU - minU) * invSpanU;
+                            float normalizedV = (sourceV - minV) * invSpanV;
+                            vertex->lightmapUv[0] = chartOriginU + normalizedU * chartScaleU;
+                            vertex->lightmapUv[1] = chartOriginV + normalizedV * chartScaleV;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -5589,6 +6929,67 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         float baseColorG = materialColors[materialIndex][1] / sampleCount;
         float baseColorB = materialColors[materialIndex][2] / sampleCount;
 
+        if (materialHasSourceModelMaterial[materialIndex] != 0u) {
+            const NovaSceneMaterial* sourceMaterial = &materialSourceModelMaterials[materialIndex];
+            uint32_t materialFlags = 0u;
+
+            *material = *sourceMaterial;
+            if (material->name[0] == '\0') {
+                snprintf(material->name, sizeof(material->name), "%s", materialNames[materialIndex]);
+            }
+
+            material->baseColorTexture = materialBaseColorTextureIndices[materialIndex];
+            material->metallicRoughnessTexture = materialMetallicRoughnessTextureIndices[materialIndex];
+            material->normalTexture = materialNormalTextureIndices[materialIndex];
+            material->emissiveTexture = materialEmissiveTextureIndices[materialIndex];
+            material->occlusionTexture = materialOcclusionTextureIndices[materialIndex];
+            material->transmissionTexture = materialTransmissionTextureIndices[materialIndex];
+
+            snprintf(materialRecord->name, sizeof(materialRecord->name), "%s", material->name);
+            materialRecord->baseColor[0] = material->baseColorFactor[0];
+            materialRecord->baseColor[1] = material->baseColorFactor[1];
+            materialRecord->baseColor[2] = material->baseColorFactor[2];
+            materialRecord->baseColor[3] = material->baseColorFactor[3];
+            materialRecord->emissive[0] = material->emissiveFactor[0];
+            materialRecord->emissive[1] = material->emissiveFactor[1];
+            materialRecord->emissive[2] = material->emissiveFactor[2];
+            materialRecord->metallic = material->metallic;
+            materialRecord->roughness = material->roughness;
+            materialRecord->transmission = material->transmission;
+            materialRecord->ior = material->ior;
+
+            viewport_init_imported_material_gpu_defaults(materialGpu);
+            materialGpu->baseColor[0] = material->baseColorFactor[0];
+            materialGpu->baseColor[1] = material->baseColorFactor[1];
+            materialGpu->baseColor[2] = material->baseColorFactor[2];
+            materialGpu->baseColor[3] = material->baseColorFactor[3];
+            materialGpu->emissive[0] = material->emissiveFactor[0];
+            materialGpu->emissive[1] = material->emissiveFactor[1];
+            materialGpu->emissive[2] = material->emissiveFactor[2];
+            materialGpu->params[0] = material->metallic;
+            materialGpu->params[1] = material->roughness;
+            materialGpu->params[2] = material->transmission;
+            materialGpu->params[3] = material->ior;
+            materialGpu->texIndices[0] = (float)material->baseColorTexture;
+            materialGpu->texIndices[1] = (float)material->metallicRoughnessTexture;
+            materialGpu->texIndices[2] = (float)material->normalTexture;
+            materialGpu->texIndices[3] = (float)material->emissiveTexture;
+            if (material->alphaMode == 1) {
+                materialFlags |= 1u;
+            }
+            if (material->doubleSided != 0) {
+                materialFlags |= 2u;
+            }
+            if (material->normalTexture >= 0) {
+                materialFlags |= 4u;
+            }
+            materialGpu->extra[0] = material->normalScale;
+            materialGpu->extra[1] = (float)material->transmissionTexture;
+            materialGpu->extra[2] = material->alphaCutoff;
+            materialGpu->extra[3] = (float)materialFlags;
+            continue;
+        }
+
         if (materialUsesSourceModel[materialIndex] != 0u && materialModelAssetPaths[materialIndex][0] != '\0') {
             NovaSceneData sourceScene;
             char modelLoadError[512] = {0};
@@ -5617,6 +7018,9 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                     NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->baseColorTexture];
                     modelTextureInfo = viewport_texture_dictionary_from_scene_texture(&sourceScene.textures[sourceMaterial->baseColorTexture]);
                     baseColorTextureIndex = viewport_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
+                    NSString* viewportTextureKey = [NSString stringWithFormat:@"__modelvp__/%@#%d", assetPathString, materialSourceMaterialIndices[materialIndex]];
+                    id<MTLTexture> viewportTexture = [self textureFromSceneTexture:&sourceScene.textures[sourceMaterial->baseColorTexture]];
+                    self.textureCache[viewportTextureKey] = viewportTexture != nil ? viewportTexture : (id)NSNull.null;
                 }
                 if (sourceMaterial->metallicRoughnessTexture >= 0 && (uint32_t)sourceMaterial->metallicRoughnessTexture < sourceScene.textureCount) {
                     NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->metallicRoughnessTexture];
@@ -5754,7 +7158,30 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         importedRuntime->blasFlags[objectIndex] = objectRecords[objectIndex].flags;
     }
 
+    if (objectCount > 0u) {
+        self.heavyObjectEntityIndices = (uint32_t*)calloc(objectCount, sizeof(uint32_t));
+        self.heavyObjectModelBasePositions = (Vec3*)calloc(objectCount, sizeof(Vec3));
+        self.heavyObjectModelFlags = (uint8_t*)calloc(objectCount, sizeof(uint8_t));
+        if (self.heavyObjectEntityIndices != NULL && self.heavyObjectModelBasePositions != NULL && self.heavyObjectModelFlags != NULL) {
+            self.heavyObjectMappingCount = objectCount;
+            for (uint32_t objectIndex = 0u; objectIndex < objectCount; ++objectIndex) {
+                uint32_t entityIndex = objectBrushEntity[objectIndex];
+                self.heavyObjectEntityIndices[objectIndex] = entityIndex;
+                if (self.vmfScene != NULL && entityIndex != UINT32_MAX && entityIndex < self.vmfScene->entityCount) {
+                    const VmfEntity* entity = &self.vmfScene->entities[entityIndex];
+                    if (entity->kind == VmfEntityKindModel) {
+                        self.heavyObjectModelFlags[objectIndex] = 1u;
+                        self.heavyObjectModelBasePositions[objectIndex] = entity->position;
+                    }
+                }
+            }
+        } else {
+            [self clearHeavyObjectModelMappings];
+        }
+    }
+
     nova_scene_world_sync_objects(self.sceneWorld, objectRecords, objectCount);
+    [self applyModelTransformsToSceneWorld];
     _fullRendererUiState.importedSceneActive = objectCount > 0u ? 1 : 0;
     free(objectRecords);
     free(objectBakedLightmapIndices);

@@ -142,6 +142,49 @@ typedef NS_ENUM(NSUInteger, ViewerClipMode) {
 
 static NSString* const kAppDisplayName = @"Sledgehammer";
 static NSString* const kSledgehammerModelAssetExtension = @"novamodel";
+static NSString* sledgehammer_sanitized_model_asset_name(NSString* rawName) {
+    NSString* trimmedName;
+
+    if (rawName.length == 0) {
+        return nil;
+    }
+
+    trimmedName = [[rawName stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] stringByDeletingPathExtension];
+    if (trimmedName.length == 0) {
+        return nil;
+    }
+
+    trimmedName = [[trimmedName componentsSeparatedByCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"/:"]] componentsJoinedByString:@"_"];
+    trimmedName = [trimmedName stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return trimmedName.length > 0 ? trimmedName : nil;
+}
+
+static NSString* sledgehammer_default_model_asset_name_for_url(NSURL* url) {
+    NSString* sourceName;
+    NSString* parentName;
+    NSString* normalizedSourceName;
+
+    if (url == nil) {
+        return @"model";
+    }
+
+    sourceName = sledgehammer_sanitized_model_asset_name(url.lastPathComponent.stringByDeletingPathExtension);
+    parentName = sledgehammer_sanitized_model_asset_name(url.URLByDeletingLastPathComponent.lastPathComponent);
+    normalizedSourceName = sourceName.lowercaseString;
+
+    if (sourceName.length == 0) {
+        return parentName.length > 0 ? parentName : @"model";
+    }
+
+    if (([normalizedSourceName isEqualToString:@"scene"] ||
+         [normalizedSourceName isEqualToString:@"model"] ||
+         [normalizedSourceName isEqualToString:@"untitled"]) &&
+        parentName.length > 0) {
+        return parentName;
+    }
+
+    return sourceName;
+}
 
 @interface ContentBrowserAssetButton : NSButton <NSDraggingSource>
 
@@ -289,6 +332,44 @@ static NSImage* sledgehammer_make_placeholder_thumbnail_image(NSString* title) {
     return image;
 }
 
+static NSString* sledgehammer_model_import_unit_label(uint32_t unit, uint32_t hintSource) {
+    NSString* base = @"Unknown";
+    switch (unit) {
+        case NOVA_MODEL_IMPORT_UNIT_MILLIMETERS:
+            base = @"Millimetres";
+            break;
+        case NOVA_MODEL_IMPORT_UNIT_CENTIMETERS:
+            base = @"Centimetres";
+            break;
+        case NOVA_MODEL_IMPORT_UNIT_METERS:
+            base = @"Metres";
+            break;
+        case NOVA_MODEL_IMPORT_UNIT_INCHES:
+            base = @"Inches";
+            break;
+        case NOVA_MODEL_IMPORT_UNIT_FEET:
+            base = @"Feet";
+            break;
+        default:
+            break;
+    }
+
+    if (hintSource == NOVA_MODEL_IMPORT_UNIT_HINT_METADATA) {
+        return [base stringByAppendingString:@" (metadata)"];
+    }
+    if (hintSource == NOVA_MODEL_IMPORT_UNIT_HINT_GLTF_DEFAULT) {
+        return [base stringByAppendingString:@" (glTF default)"];
+    }
+    return base;
+}
+
+static NSString* sledgehammer_model_import_size_string(const float boundsMin[3], const float boundsMax[3], float scale) {
+    float sizeX = (boundsMax[0] - boundsMin[0]) * scale;
+    float sizeY = (boundsMax[1] - boundsMin[1]) * scale;
+    float sizeZ = (boundsMax[2] - boundsMin[2]) * scale;
+    return [NSString stringWithFormat:@"%.2f x %.2f x %.2f", sizeX, sizeY, sizeZ];
+}
+
 static BOOL sledgehammer_model_asset_bounds(NSString* assetPath, Vec3* outCenter, Vec3* outHalfExtents, NSString** outError) {
     if (outCenter != NULL) {
         *outCenter = vec3_make(0.0f, 0.0f, 0.0f);
@@ -405,6 +486,37 @@ static void sledgehammer_translate_mesh_for_entity(ViewerMesh* mesh, size_t enti
     for (size_t rangeIndex = 0; rangeIndex < mesh->faceRangeCount; ++rangeIndex) {
         const ViewerFaceRange* range = &mesh->faceRanges[rangeIndex];
         if (range->entityIndex != entityIndex) {
+            continue;
+        }
+
+        if (range->vertexStart < mesh->vertexCount) {
+            size_t vertexCount = range->vertexCount;
+            if (range->vertexStart + vertexCount > mesh->vertexCount) {
+                vertexCount = mesh->vertexCount - range->vertexStart;
+            }
+            sledgehammer_translate_mesh_range(mesh->vertices, range->vertexStart, vertexCount, delta);
+        }
+
+        if (mesh->edgeVertices != NULL && range->edgeVertexStart < mesh->edgeVertexCount) {
+            size_t edgeVertexCount = range->edgeVertexCount;
+            if (range->edgeVertexStart + edgeVertexCount > mesh->edgeVertexCount) {
+                edgeVertexCount = mesh->edgeVertexCount - range->edgeVertexStart;
+            }
+            sledgehammer_translate_mesh_range(mesh->edgeVertices, range->edgeVertexStart, edgeVertexCount, delta);
+        }
+    }
+
+    sledgehammer_recompute_mesh_bounds(mesh);
+}
+
+static void sledgehammer_translate_mesh_for_solid(ViewerMesh* mesh, size_t entityIndex, size_t solidIndex, Vec3 delta) {
+    if (mesh == NULL || mesh->faceRanges == NULL || mesh->vertices == NULL) {
+        return;
+    }
+
+    for (size_t rangeIndex = 0; rangeIndex < mesh->faceRangeCount; ++rangeIndex) {
+        const ViewerFaceRange* range = &mesh->faceRanges[rangeIndex];
+        if (range->entityIndex != entityIndex || range->solidIndex != solidIndex) {
             continue;
         }
 
@@ -613,8 +725,11 @@ static NSString* clip_mode_label(ViewerClipMode mode) {
 @property(nonatomic, strong) NSMutableArray<SledgehammerPluginCommandTarget*>* pluginCommandTargets;
 
 - (void)showError:(NSString*)message;
+- (NSModalResponse)runModelImportSettingsModalForURL:(NSURL*)url outAssetName:(NSString**)outAssetName outScale:(float*)outScale error:(NSString**)outError;
 - (void)frameAllViewports;
 - (BOOL)rebuildMeshFromScene;
+- (BOOL)rebuildMeshFromSceneSyncHeavyRenderer:(BOOL)syncHeavyRenderer;
+- (void)refreshViewportsFromCurrentMeshSyncHeavyRenderer:(BOOL)syncHeavyRenderer clearingMaterialMisses:(BOOL)clearMaterialMisses;
 - (void)reloadDocument:(id)sender;
 - (void)invokePluginRecord:(SledgehammerLoadedPluginRecord*)plugin commandIndex:(NSUInteger)commandIndex;
 - (void)buildContentBrowserUI;
@@ -2827,29 +2942,146 @@ static bool sledgehammer_plugin_host_get_editor_stats(void* app_context,
         [UTType typeWithFilenameExtension:@"glb"],
         [UTType typeWithFilenameExtension:@"obj"],
     ];
-    [panel beginSheetModalForWindow:self.window completionHandler:^(NSModalResponse response) {
-        if (response != NSModalResponseOK) {
-            return;
+    if ([panel runModal] != NSModalResponseOK) {
+        return;
+    }
+
+    NSFileManager* fileManager = [NSFileManager defaultManager];
+    NSString* modelsDirectory = [self contentBrowserRootDirectory];
+    [fileManager createDirectoryAtPath:modelsDirectory withIntermediateDirectories:YES attributes:nil error:nil];
+    NSMutableArray<NSString*>* failures = [NSMutableArray array];
+    for (NSURL* url in panel.URLs) {
+        float importScale = 1.0f;
+        NSString* assetName = nil;
+        NSString* modalError = nil;
+        NSModalResponse modalResponse = [self runModelImportSettingsModalForURL:url outAssetName:&assetName outScale:&importScale error:&modalError];
+        if (modalResponse == NSAlertThirdButtonReturn) {
+            break;
         }
-        NSFileManager* fileManager = [NSFileManager defaultManager];
-        NSString* modelsDirectory = [self contentBrowserRootDirectory];
-        [fileManager createDirectoryAtPath:modelsDirectory withIntermediateDirectories:YES attributes:nil error:nil];
-        NSMutableArray<NSString*>* failures = [NSMutableArray array];
-        for (NSURL* url in panel.URLs) {
-            NSString* targetPath = [[modelsDirectory stringByAppendingPathComponent:url.lastPathComponent.stringByDeletingPathExtension] stringByAppendingPathExtension:kSledgehammerModelAssetExtension];
-            char compileMessage[512] = {0};
-            if (!nova_model_asset_compile_from_source(url.path.fileSystemRepresentation, targetPath.fileSystemRepresentation, compileMessage, (uint32_t)sizeof(compileMessage))) {
-                NSString* filename = url.lastPathComponent ?: @"<unknown>";
-                NSString* reason = compileMessage[0] != '\0' ? [NSString stringWithUTF8String:compileMessage] : @"Unknown error";
-                [failures addObject:[NSString stringWithFormat:@"%@: %@", filename, reason]];
+        if (modalResponse != NSAlertFirstButtonReturn) {
+            continue;
+        }
+        if (modalError.length > 0) {
+            NSString* filename = url.lastPathComponent ?: @"<unknown>";
+            [failures addObject:[NSString stringWithFormat:@"%@: %@", filename, modalError]];
+            continue;
+        }
+
+        NSString* targetPath = [[modelsDirectory stringByAppendingPathComponent:assetName] stringByAppendingPathExtension:kSledgehammerModelAssetExtension];
+        NovaModelAssetImportOptions options = {};
+        options.uniformScale = importScale > 0.0f ? importScale : 1.0f;
+        char compileMessage[512] = {0};
+        if (!nova_model_asset_compile_from_source_with_options(url.path.fileSystemRepresentation,
+                                                               targetPath.fileSystemRepresentation,
+                                                               &options,
+                                                               compileMessage,
+                                                               (uint32_t)sizeof(compileMessage))) {
+            NSString* filename = url.lastPathComponent ?: @"<unknown>";
+            NSString* reason = compileMessage[0] != '\0' ? [NSString stringWithUTF8String:compileMessage] : @"Unknown error";
+            [failures addObject:[NSString stringWithFormat:@"%@: %@", filename, reason]];
+        }
+    }
+    [self setContentBrowserCollapsed:NO animated:YES];
+    [self reloadContentBrowser];
+    if (failures.count > 0) {
+        [self showError:[NSString stringWithFormat:@"Model import failed for:\n%@", [failures componentsJoinedByString:@"\n"]]];
+    }
+}
+
+- (NSModalResponse)runModelImportSettingsModalForURL:(NSURL*)url outAssetName:(NSString**)outAssetName outScale:(float*)outScale error:(NSString**)outError {
+    NSString* defaultAssetName;
+
+    if (outAssetName != NULL) {
+        *outAssetName = nil;
+    }
+    if (outScale != NULL) {
+        *outScale = 1.0f;
+    }
+    if (outError != NULL) {
+        *outError = nil;
+    }
+    if (url == nil || url.path.length == 0) {
+        if (outError != NULL) {
+            *outError = @"Model path is empty.";
+        }
+        return NSAlertSecondButtonReturn;
+    }
+
+    NovaModelAssetImportInfo info = {};
+    char inspectMessage[512] = {0};
+    if (!nova_model_asset_inspect_source(url.path.fileSystemRepresentation, &info, inspectMessage, (uint32_t)sizeof(inspectMessage))) {
+        if (outError != NULL) {
+            *outError = inspectMessage[0] != '\0' ? [NSString stringWithUTF8String:inspectMessage] : @"Failed to inspect source model.";
+        }
+        return NSAlertSecondButtonReturn;
+    }
+
+    float suggestedScale = info.recommendedScale > 0.0f ? info.recommendedScale : 1.0f;
+    NSAlert* alert = [[NSAlert alloc] init];
+    alert.alertStyle = NSAlertStyleInformational;
+    alert.messageText = [NSString stringWithFormat:@"Import %@", url.lastPathComponent ?: @"Model"];
+    alert.informativeText = @"Editor world units use centimetres. Review the detected source units, bounds, and import scale before compiling the model asset.";
+    [alert addButtonWithTitle:@"Import"];
+    [alert addButtonWithTitle:@"Skip"];
+    [alert addButtonWithTitle:@"Cancel"];
+
+    NSStackView* stack = [[NSStackView alloc] initWithFrame:NSMakeRect(0.0, 0.0, 360.0, 220.0)];
+    stack.orientation = NSUserInterfaceLayoutOrientationVertical;
+    stack.alignment = NSLayoutAttributeLeading;
+    stack.distribution = NSStackViewDistributionFill;
+    stack.spacing = 8.0;
+
+    NSTextField* summaryLabel = [NSTextField wrappingLabelWithString:[NSString stringWithFormat:@"Detected units: %@\nSource bounds: %@\nImported bounds at suggested scale: %@ cm",
+        sledgehammer_model_import_unit_label(info.detectedUnit, info.unitHintSource),
+        sledgehammer_model_import_size_string(info.boundsMin, info.boundsMax, 1.0f),
+        sledgehammer_model_import_size_string(info.boundsMin, info.boundsMax, suggestedScale)]];
+    summaryLabel.preferredMaxLayoutWidth = 360.0;
+
+    NSTextField* scaleLabel = [NSTextField labelWithString:@"Scale Factor"];
+    NSTextField* scaleField = [[NSTextField alloc] initWithFrame:NSMakeRect(0.0, 0.0, 120.0, 24.0)];
+    scaleField.stringValue = [NSString stringWithFormat:@"%.4f", suggestedScale];
+    scaleField.placeholderString = @"1.0";
+
+    NSTextField* nameLabel = [NSTextField labelWithString:@"Asset Name"];
+    NSTextField* nameField = [[NSTextField alloc] initWithFrame:NSMakeRect(0.0, 0.0, 220.0, 24.0)];
+    nameField.stringValue = defaultAssetName ?: @"model";
+    nameField.placeholderString = @"model";
+
+    NSTextField* hintLabel = [NSTextField wrappingLabelWithString:[NSString stringWithFormat:@"Suggested because source metres per unit = %.6g and editor units are centimetres.",
+        info.sourceMetersPerUnit > 0.0f ? info.sourceMetersPerUnit : 0.0f]];
+    hintLabel.textColor = NSColor.secondaryLabelColor;
+    hintLabel.preferredMaxLayoutWidth = 360.0;
+
+    [stack addArrangedSubview:summaryLabel];
+    [stack addArrangedSubview:nameLabel];
+    [stack addArrangedSubview:nameField];
+    [stack addArrangedSubview:scaleLabel];
+    [stack addArrangedSubview:scaleField];
+    [stack addArrangedSubview:hintLabel];
+    alert.accessoryView = stack;
+
+    NSModalResponse response = [alert runModal];
+    if (response == NSAlertFirstButtonReturn) {
+        NSString* chosenAssetName = sledgehammer_sanitized_model_asset_name(nameField.stringValue);
+        float chosenScale = scaleField.floatValue;
+
+        if (chosenAssetName.length == 0) {
+            if (outError != NULL) {
+                *outError = @"Asset name is empty.";
             }
+            return response;
         }
-        [self setContentBrowserCollapsed:NO animated:YES];
-        [self reloadContentBrowser];
-        if (failures.count > 0) {
-            [self showError:[NSString stringWithFormat:@"Model import failed for:\n%@", [failures componentsJoinedByString:@"\n"]]];
+        if (!(chosenScale > 0.0f)) {
+            chosenScale = suggestedScale > 0.0f ? suggestedScale : 1.0f;
         }
-    }];
+        if (outAssetName != NULL) {
+            *outAssetName = chosenAssetName;
+        }
+        if (outScale != NULL) {
+            *outScale = chosenScale;
+        }
+    }
+    return response;
 }
 
 - (BOOL)applyShapeTool:(VmfViewportEditorTool)tool
@@ -3246,9 +3478,9 @@ static bool sledgehammer_plugin_host_get_editor_stats(void* app_context,
     return NO;
 }
 
-- (void)refreshViewportsFromCurrentMeshClearingMaterialMisses:(BOOL)clearMaterialMisses {
+- (void)refreshViewportsFromCurrentMeshSyncHeavyRenderer:(BOOL)syncHeavyRenderer clearingMaterialMisses:(BOOL)clearMaterialMisses {
     for (VmfViewport* viewport in self.viewports) {
-        [viewport updateMesh:&_mesh];
+        [viewport updateMesh:&_mesh syncHeavyRenderer:syncHeavyRenderer];
         if (self.materialsDirectory) {
             if (clearMaterialMisses) {
                 [viewport clearTextureMissCache];
@@ -3261,6 +3493,10 @@ static bool sledgehammer_plugin_host_get_editor_stats(void* app_context,
     [self updateMaterialBrowser];
     [self updateWindowTitle];
     [self updateChrome];
+}
+
+- (void)refreshViewportsFromCurrentMeshClearingMaterialMisses:(BOOL)clearMaterialMisses {
+    [self refreshViewportsFromCurrentMeshSyncHeavyRenderer:YES clearingMaterialMisses:clearMaterialMisses];
 }
 
 - (void)applyMaterialToCurrentMesh:(NSString*)materialName entityIndex:(size_t)entityIndex solidIndex:(size_t)solidIndex sideIndex:(size_t)sideIndex wholeSolid:(BOOL)wholeSolid {
@@ -3744,7 +3980,7 @@ static bool sledgehammer_plugin_host_get_editor_stats(void* app_context,
         return NO;
     }
 
-    [self rebuildMeshFromScene];
+    [self rebuildMeshFromSceneSyncHeavyRenderer:commit];
     if (commit) {
         [self commitPendingHistoryEntry];
     }
@@ -4702,6 +4938,10 @@ static bool sledgehammer_plugin_host_get_editor_stats(void* app_context,
 }
 
 - (BOOL)rebuildMeshFromScene {
+    return [self rebuildMeshFromSceneSyncHeavyRenderer:YES];
+}
+
+- (BOOL)rebuildMeshFromSceneSyncHeavyRenderer:(BOOL)syncHeavyRenderer {
     _hasPointEntityDragPreview = NO;
     viewer_mesh_free(&_mesh);
     char errorBuffer[512] = { 0 };
@@ -4712,18 +4952,8 @@ static bool sledgehammer_plugin_host_get_editor_stats(void* app_context,
 
     for (VmfViewport* viewport in self.viewports) {
         [viewport setVmfScene:&_scene];
-        [viewport updateMesh:&_mesh];
-        if (self.materialsDirectory) {
-            // Always clear miss-cache entries so newly added texture files are picked up
-            [viewport clearTextureMissCache];
-            [viewport setTextureDirectory:self.materialsDirectory];
-        }
     }
-    [self syncSceneWorldLightsFromScene];
-    [self syncSelectionOverlay];
-    [self updateMaterialBrowser];
-    [self updateWindowTitle];
-    [self updateChrome];
+    [self refreshViewportsFromCurrentMeshSyncHeavyRenderer:syncHeavyRenderer clearingMaterialMisses:YES];
     return YES;
 }
 
@@ -6217,64 +6447,34 @@ static bool sledgehammer_plugin_host_get_editor_stats(void* app_context,
         if (transform != VmfViewportSelectionTransformMove) {
             return;
         }
-
-        if (commit) {
-            Bounds3 sceneBounds = bounds3_empty();
-            if (![self selectedEntityBounds:&sceneBounds]) {
-                if (self.pendingHistoryEntry) {
-                    [self discardPendingHistoryEntry];
-                }
-                _hasPointEntityDragPreview = NO;
-                [self syncSelectionOverlay];
-                return;
-            }
-
-            Vec3 commitDelta = vec3_sub(bounds3_center(bounds), bounds3_center(sceneBounds));
-            if (vec3_length(commitDelta) < 0.001f) {
-                _hasPointEntityDragPreview = NO;
-                if (self.pendingHistoryEntry) {
-                    [self discardPendingHistoryEntry];
-                }
-                [self syncSelectionOverlay];
-                return;
-            }
-            if (![self beginPendingHistoryEntryWithLabel:@"Move Entity"]) {
-                return;
-            }
-
-            char errorBuffer[256] = { 0 };
-            if (!vmf_scene_translate_entity(&_scene, self.selectedEntityIndex, commitDelta, self.textureLockEnabled ? 1 : 0, errorBuffer, sizeof(errorBuffer))) {
-                _hasPointEntityDragPreview = NO;
-                [self discardPendingHistoryEntry];
-                [self syncSelectionOverlay];
-                return;
-            }
-            _hasPointEntityDragPreview = NO;
-            sledgehammer_translate_mesh_for_entity(&_mesh, self.selectedEntityIndex, commitDelta);
-            [self refreshViewportsFromCurrentMeshClearingMaterialMisses:NO];
-            [self commitPendingHistoryEntry];
-            return;
-        }
-
         Bounds3 currentBounds = bounds3_empty();
-        if (_hasPointEntityDragPreview && _pointEntityDragEntityIndex == self.selectedEntityIndex) {
-            currentBounds = _pointEntityDragBounds;
-        } else if (![self selectedEntityBounds:&currentBounds]) {
+        if (![self selectedEntityBounds:&currentBounds]) {
             return;
         }
 
         Vec3 delta = vec3_sub(bounds3_center(bounds), bounds3_center(currentBounds));
         if (vec3_length(delta) < 0.001f) {
+            if (commit && self.pendingHistoryEntry) {
+                [self commitPendingHistoryEntry];
+            }
             return;
         }
         if (![self beginPendingHistoryEntryWithLabel:@"Move Entity"]) {
             return;
         }
 
-        _hasPointEntityDragPreview = YES;
-        _pointEntityDragEntityIndex = self.selectedEntityIndex;
-        _pointEntityDragBounds = bounds;
-        [self syncSelectionOverlay];
+        char errorBuffer[256] = { 0 };
+        if (!vmf_scene_translate_entity(&_scene, self.selectedEntityIndex, delta, self.textureLockEnabled ? 1 : 0, errorBuffer, sizeof(errorBuffer))) {
+            [self discardPendingHistoryEntry];
+            return;
+        }
+
+        _hasPointEntityDragPreview = NO;
+        sledgehammer_translate_mesh_for_entity(&_mesh, self.selectedEntityIndex, delta);
+        [self refreshViewportsFromCurrentMeshSyncHeavyRenderer:NO clearingMaterialMisses:NO];
+        if (commit) {
+            [self commitPendingHistoryEntry];
+        }
         return;
     }
 
@@ -6304,7 +6504,9 @@ static bool sledgehammer_plugin_host_get_editor_stats(void* app_context,
             [self discardPendingHistoryEntry];
             return;
         }
-        [self rebuildMeshFromScene];
+
+        sledgehammer_translate_mesh_for_entity(&_mesh, self.selectedEntityIndex, delta);
+        [self refreshViewportsFromCurrentMeshSyncHeavyRenderer:commit clearingMaterialMisses:NO];
         if (commit) {
             [self commitPendingHistoryEntry];
         }
@@ -6375,6 +6577,8 @@ static bool sledgehammer_plugin_host_get_editor_stats(void* app_context,
             [self discardPendingHistoryEntry];
             return;
         }
+        sledgehammer_translate_mesh_for_solid(&_mesh, self.selectedEntityIndex, self.selectedSolidIndex, delta);
+        [self refreshViewportsFromCurrentMeshSyncHeavyRenderer:commit clearingMaterialMisses:NO];
     } else {
         if (![self restoreSceneFromPendingHistorySnapshot:errorBuffer size:sizeof(errorBuffer)]) {
             [self discardPendingHistoryEntry];
@@ -6384,8 +6588,11 @@ static bool sledgehammer_plugin_host_get_editor_stats(void* app_context,
             [self discardPendingHistoryEntry];
             return;
         }
+        if (![self rebuildMeshFromSceneSyncHeavyRenderer:commit]) {
+            [self discardPendingHistoryEntry];
+            return;
+        }
     }
-    [self rebuildMeshFromScene];
     if (commit) {
         [self commitPendingHistoryEntry];
     }
