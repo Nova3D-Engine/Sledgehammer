@@ -16,6 +16,7 @@
 
 #include <imgui.h>
 #include <ImGuizmo.h>
+#include "external/ImGizmo2D.h"
 #include <backends/imgui_impl_metal.h>
 #include <backends/imgui_impl_osx.h>
 
@@ -2024,28 +2025,26 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         [self.overlayView.bottomAnchor constraintEqualToAnchor:self.metalView.bottomAnchor],
     ]];
 
-    if (self.dimension == VmfViewportDimension3D) {
-        IMGUI_CHECKVERSION();
-        ImGuiContext* context = ImGui::CreateContext();
-        if (context != NULL) {
-            self.imguiContext = context;
-            ImGui::SetCurrentContext(context);
-            ImGuiIO& io = ImGui::GetIO();
-            io.IniFilename = NULL;
-            io.LogFilename = NULL;
-            io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
-            if (!ImGui_ImplOSX_Init(self.metalView) || !ImGui_ImplMetal_Init(self.device)) {
-                ImGui_ImplMetal_Shutdown();
-                ImGui_ImplOSX_Shutdown();
-                ImGui::DestroyContext(context);
-                self.imguiContext = NULL;
-            }
+    IMGUI_CHECKVERSION();
+    ImGuiContext* context = ImGui::CreateContext();
+    if (context != NULL) {
+        self.imguiContext = context;
+        ImGui::SetCurrentContext(context);
+        ImGuiIO& io = ImGui::GetIO();
+        io.IniFilename = NULL;
+        io.LogFilename = NULL;
+        io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
+        if (!ImGui_ImplOSX_Init(self.metalView) || !ImGui_ImplMetal_Init(self.device)) {
+            ImGui_ImplMetal_Shutdown();
+            ImGui_ImplOSX_Shutdown();
+            ImGui::DestroyContext(context);
+            self.imguiContext = NULL;
         }
     }
 }
 
 - (BOOL)gizmoConsumesPrimaryMouse {
-    return self.dimension == VmfViewportDimension3D && (self.gizmoHovered || self.gizmoInteractionActive);
+    return self.gizmoHovered || self.gizmoInteractionActive;
 }
 
 - (NSArray<NSString*>*)previewBakeOrderedKeys {
@@ -2468,7 +2467,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
 }
 
 - (BOOL)encodeGizmoOverlayOnCommandBuffer:(id<MTLCommandBuffer>)commandBuffer drawable:(id<CAMetalDrawable>)drawable errorMessage:(char*)errorMessage capacity:(size_t)errorMessageCapacity {
-    if (self.imguiContext == NULL || self.dimension != VmfViewportDimension3D || drawable == nil) {
+    if (self.imguiContext == NULL || drawable == nil) {
         self.gizmoHovered = NO;
         self.gizmoInteractionActive = NO;
         return YES;
@@ -2486,7 +2485,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     ImGuizmo::BeginFrame();
 
     BOOL shouldDrawGizmo = self.selectionVisible && self.selectionEditable && self.editorTool == VmfViewportEditorToolSelect && !self.freeLookActive;
-    if (shouldDrawGizmo) {
+    if (shouldDrawGizmo && self.dimension == VmfViewportDimension3D) {
         float viewportWidth = fmaxf((float)self.metalView.bounds.size.width, 1.0f);
         float viewportHeight = fmaxf((float)self.metalView.bounds.size.height, 1.0f);
         float aspect = viewportWidth / viewportHeight;
@@ -2532,6 +2531,78 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         BOOL isUsing = ImGuizmo::IsUsing();
         if (!isUsing && self.gizmoInteractionActive && self.delegate) {
             [self.delegate viewport:self updateSelectionBounds:self.selectionBounds commit:YES transform:VmfViewportSelectionTransformMove];
+        }
+        self.gizmoInteractionActive = isUsing;
+    } else if (shouldDrawGizmo && self.dimension == VmfViewportDimension2D) {
+        float viewportWidth = fmaxf((float)self.metalView.bounds.size.width, 1.0f);
+        float viewportHeight = fmaxf((float)self.metalView.bounds.size.height, 1.0f);
+        float aspect = viewportWidth / viewportHeight;
+        float visibleWidth = self.orthoSize * aspect;
+        float centerU = plane_u_value(self.plane, self.orthoCenter);
+        float centerV = plane_v_value(self.plane, self.orthoCenter);
+        float zoom = viewportHeight / fmaxf(self.orthoSize, 1e-6f);
+
+        float minU = plane_u_value(self.plane, self.selectionBounds.min);
+        float minV = plane_v_value(self.plane, self.selectionBounds.min);
+        float maxU = plane_u_value(self.plane, self.selectionBounds.max);
+        float maxV = plane_v_value(self.plane, self.selectionBounds.max);
+        float x = fminf(minU, maxU);
+        float y = fminf(minV, maxV);
+        float w = fabsf(maxU - minU);
+        float h = fabsf(maxV - minV);
+        float originX = x;
+        float originY = y;
+        float originW = w;
+        float originH = h;
+
+        ImGizmo2D::SetDrawList(ImGui::GetForegroundDrawList());
+        ImGizmo2D::SetViewRect(ImVec2(0.0f, 0.0f), ImVec2(viewportWidth, viewportHeight));
+        ImGizmo2D::SetViewTransform(centerU, centerV, zoom);
+        ImGizmo2D::SetSnapGrid((float)fmax(1.0, self.gridSize));
+        ImGizmo2D::BeginFrame();
+
+        BOOL translated = ImGizmo2D::Translate("selection_translate", &x, &y) ? YES : NO;
+        BOOL resized = ImGizmo2D::Rect("selection_rect", &x, &y, &w, &h) ? YES : NO;
+        self.gizmoHovered = ImGizmo2D::IsHovered() ? YES : NO;
+
+        if ((translated || resized) && self.delegate) {
+            Bounds3 updated = self.selectionBounds;
+            float newMinU = x;
+            float newMaxU = x + w;
+            float newMinV = y;
+            float newMaxV = y + h;
+
+            switch (self.plane) {
+                case VmfViewportPlaneXY:
+                    updated.min.raw[0] = fminf(newMinU, newMaxU);
+                    updated.max.raw[0] = fmaxf(newMinU, newMaxU);
+                    updated.min.raw[1] = fminf(newMinV, newMaxV);
+                    updated.max.raw[1] = fmaxf(newMinV, newMaxV);
+                    break;
+                case VmfViewportPlaneXZ:
+                    updated.min.raw[0] = fminf(newMinU, newMaxU);
+                    updated.max.raw[0] = fmaxf(newMinU, newMaxU);
+                    updated.min.raw[2] = fminf(newMinV, newMaxV);
+                    updated.max.raw[2] = fmaxf(newMinV, newMaxV);
+                    break;
+                case VmfViewportPlaneZY:
+                    updated.min.raw[1] = fminf(newMinU, newMaxU);
+                    updated.max.raw[1] = fmaxf(newMinU, newMaxU);
+                    updated.min.raw[2] = fminf(newMinV, newMaxV);
+                    updated.max.raw[2] = fmaxf(newMinV, newMaxV);
+                    break;
+            }
+
+            VmfViewportSelectionTransform transform = resized ? VmfViewportSelectionTransformResize : VmfViewportSelectionTransformMove;
+            [self.delegate viewport:self updateSelectionBounds:updated commit:NO transform:transform];
+        }
+
+        BOOL isUsing = ImGizmo2D::IsActive() ? YES : NO;
+        if (!isUsing && self.gizmoInteractionActive && self.delegate) {
+            float moved = fabsf(x - originX) + fabsf(y - originY);
+            float scaled = fabsf(w - originW) + fabsf(h - originH);
+            VmfViewportSelectionTransform commitTransform = scaled > moved ? VmfViewportSelectionTransformResize : VmfViewportSelectionTransformMove;
+            [self.delegate viewport:self updateSelectionBounds:self.selectionBounds commit:YES transform:commitTransform];
         }
         self.gizmoInteractionActive = isUsing;
     } else {

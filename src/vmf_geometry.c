@@ -1,5 +1,7 @@
 #include "vmf_geometry.h"
 
+#include "novamodel_asset.h"
+#include "nova_scene_data.h"
 #include "sledgehammer_geometry.h"
 
 #include <math.h>
@@ -11,6 +13,34 @@ typedef struct Plane {
     Vec3 normal;
     float distance;
 } Plane;
+
+static Vec3 transform_point_matrix(const float matrix[16], Vec3 point) {
+    Vec3 result;
+    result.raw[0] = matrix[0] * point.raw[0] + matrix[4] * point.raw[1] + matrix[8] * point.raw[2] + matrix[12];
+    result.raw[1] = matrix[1] * point.raw[0] + matrix[5] * point.raw[1] + matrix[9] * point.raw[2] + matrix[13];
+    result.raw[2] = matrix[2] * point.raw[0] + matrix[6] * point.raw[1] + matrix[10] * point.raw[2] + matrix[14];
+    return result;
+}
+
+static Vec3 transform_direction_matrix(const float matrix[16], Vec3 direction) {
+    Vec3 result;
+    result.raw[0] = matrix[0] * direction.raw[0] + matrix[4] * direction.raw[1] + matrix[8] * direction.raw[2];
+    result.raw[1] = matrix[1] * direction.raw[0] + matrix[5] * direction.raw[1] + matrix[9] * direction.raw[2];
+    result.raw[2] = matrix[2] * direction.raw[0] + matrix[6] * direction.raw[1] + matrix[10] * direction.raw[2];
+    return result;
+}
+
+static Bounds3 scene_vertex_bounds(const NovaSceneData* scene) {
+    Bounds3 bounds = bounds3_empty();
+    if (scene == NULL || scene->vertices == NULL) {
+        return bounds;
+    }
+    for (uint32_t i = 0u; i < scene->vertexCount; ++i) {
+        const NovaSceneVertex* vertex = &scene->vertices[i];
+        bounds3_expand(&bounds, vec3_make(vertex->position[0], vertex->position[1], vertex->position[2]));
+    }
+    return bounds;
+}
 
 static int reserve_vertices(ViewerMesh* mesh, size_t minimum) {
     if (mesh->vertexCapacity >= minimum) {
@@ -524,11 +554,95 @@ static int append_light_marker(ViewerMesh* mesh, const VmfEntity* entity, size_t
 }
 
 static int append_model_marker(ViewerMesh* mesh, const VmfEntity* entity, size_t entityIndex) {
+    NovaSceneData scene;
+    char errorText[512] = {0};
+    size_t vertexStart = mesh->vertexCount;
+    size_t edgeVertexStart = mesh->edgeVertexCount;
+
+    if (entity != NULL && entity->modelAssetPath[0] != '\0') {
+        nova_scene_data_init(&scene);
+        if (nova_model_asset_load_scene(entity->modelAssetPath, &scene, errorText, (uint32_t)sizeof(errorText))) {
+            Bounds3 modelBounds = scene_vertex_bounds(&scene);
+            Vec3 sceneCenter = bounds3_is_valid(modelBounds) ? bounds3_center(modelBounds) : vec3_make(0.0f, 0.0f, 0.0f);
+            Vec3 color = vec3_make(0.30f, 0.78f, 0.98f);
+
+            if (scene.objectCount > 0u && scene.objects != NULL) {
+                for (uint32_t objectIndex = 0u; objectIndex < scene.objectCount; ++objectIndex) {
+                    const NovaSceneObject* object = &scene.objects[objectIndex];
+                    uint32_t vertexOffset = object->vertexOffset;
+                    uint32_t vertexCount = object->vertexCount;
+                    if (vertexOffset >= scene.vertexCount) {
+                        continue;
+                    }
+                    if (vertexOffset + vertexCount > scene.vertexCount) {
+                        vertexCount = scene.vertexCount - vertexOffset;
+                    }
+                    vertexCount -= vertexCount % 3u;
+                    if (vertexCount < 3u) {
+                        continue;
+                    }
+
+                    for (uint32_t tri = 0u; tri < vertexCount; tri += 3u) {
+                        ViewerVertex triangle[3];
+                        for (uint32_t triVertex = 0u; triVertex < 3u; ++triVertex) {
+                            const NovaSceneVertex* src = &scene.vertices[vertexOffset + tri + triVertex];
+                            Vec3 localPosition = vec3_sub(vec3_make(src->position[0], src->position[1], src->position[2]), sceneCenter);
+                            Vec3 worldPosition = transform_point_matrix(object->worldMatrix, localPosition);
+                            worldPosition = vec3_add(worldPosition, entity->position);
+                            Vec3 normal = vec3_make(src->normal[0], src->normal[1], src->normal[2]);
+                            normal = transform_direction_matrix(object->worldMatrix, normal);
+                            if (vec3_length(normal) < 1e-5f) {
+                                normal = vec3_make(0.0f, 0.0f, 1.0f);
+                            } else {
+                                normal = vec3_normalize(normal);
+                            }
+
+                            triangle[triVertex].position = worldPosition;
+                            triangle[triVertex].normal = normal;
+                            triangle[triVertex].color = color;
+                            triangle[triVertex].u = src->uv[0];
+                            triangle[triVertex].v = src->uv[1];
+                            triangle[triVertex].lightmapU = src->lightmapUv[0];
+                            triangle[triVertex].lightmapV = src->lightmapUv[1];
+                        }
+
+                        if (!append_triangle(mesh, triangle[0], triangle[1], triangle[2]) ||
+                            !append_triangle_edges(mesh, triangle[0], triangle[1], triangle[2])) {
+                            nova_scene_data_release(&scene);
+                            return 0;
+                        }
+                    }
+                }
+
+                if (mesh->vertexCount > vertexStart) {
+                    if (!reserve_face_ranges(mesh, mesh->faceRangeCount + 1)) {
+                        nova_scene_data_release(&scene);
+                        return 0;
+                    }
+
+                    ViewerFaceRange modelRange = {
+                        .entityIndex = entityIndex,
+                        .solidIndex = 0,
+                        .sideIndex = 0,
+                        .vertexStart = vertexStart,
+                        .vertexCount = mesh->vertexCount - vertexStart,
+                        .edgeVertexStart = edgeVertexStart,
+                        .edgeVertexCount = mesh->edgeVertexCount - edgeVertexStart,
+                    };
+                    snprintf(modelRange.material, sizeof(modelRange.material), "%s", "model_marker");
+                    snprintf(modelRange.modelAssetPath, sizeof(modelRange.modelAssetPath), "%s", entity->modelAssetPath);
+                    mesh->faceRanges[mesh->faceRangeCount++] = modelRange;
+                    nova_scene_data_release(&scene);
+                    return 1;
+                }
+            }
+            nova_scene_data_release(&scene);
+        }
+    }
+
     Vec3 center = entity->position;
     Vec3 extents = entity->modelHalfExtents;
     Vec3 color = vec3_make(0.30f, 0.78f, 0.98f);
-    size_t vertexStart = mesh->vertexCount;
-    size_t edgeVertexStart = mesh->edgeVertexCount;
 
     if (extents.raw[0] <= 1e-3f) {
         extents.raw[0] = 16.0f;

@@ -2182,11 +2182,41 @@ static BOOL sledgehammer_model_asset_bounds(NSString* path, void* unused, Vec3* 
     }
     float bMin[3] = { FLT_MAX,  FLT_MAX,  FLT_MAX};
     float bMax[3] = {-FLT_MAX, -FLT_MAX, -FLT_MAX};
-    for (uint32_t i = 0; i < scene.vertexCount; ++i) {
-        const float* p = scene.vertices[i].position;
-        for (int k = 0; k < 3; ++k) {
-            if (p[k] < bMin[k]) bMin[k] = p[k];
-            if (p[k] > bMax[k]) bMax[k] = p[k];
+    if (scene.objectCount > 0u && scene.objects != NULL) {
+        for (uint32_t objectIndex = 0u; objectIndex < scene.objectCount; ++objectIndex) {
+            const NovaSceneObject* object = &scene.objects[objectIndex];
+            uint32_t vertexOffset = object->vertexOffset;
+            uint32_t vertexCount = object->vertexCount;
+            if (vertexOffset >= scene.vertexCount) {
+                continue;
+            }
+            if (vertexOffset + vertexCount > scene.vertexCount) {
+                vertexCount = scene.vertexCount - vertexOffset;
+            }
+            for (uint32_t localVertex = 0u; localVertex < vertexCount; ++localVertex) {
+                const NovaSceneVertex* vertex = &scene.vertices[vertexOffset + localVertex];
+                const float* m = object->worldMatrix;
+                float x = vertex->position[0];
+                float y = vertex->position[1];
+                float z = vertex->position[2];
+                float wx = m[0] * x + m[4] * y + m[8] * z + m[12];
+                float wy = m[1] * x + m[5] * y + m[9] * z + m[13];
+                float wz = m[2] * x + m[6] * y + m[10] * z + m[14];
+                if (wx < bMin[0]) bMin[0] = wx;
+                if (wy < bMin[1]) bMin[1] = wy;
+                if (wz < bMin[2]) bMin[2] = wz;
+                if (wx > bMax[0]) bMax[0] = wx;
+                if (wy > bMax[1]) bMax[1] = wy;
+                if (wz > bMax[2]) bMax[2] = wz;
+            }
+        }
+    } else {
+        for (uint32_t i = 0; i < scene.vertexCount; ++i) {
+            const float* p = scene.vertices[i].position;
+            for (int k = 0; k < 3; ++k) {
+                if (p[k] < bMin[k]) bMin[k] = p[k];
+                if (p[k] > bMax[k]) bMax[k] = p[k];
+            }
         }
     }
     nova_scene_data_release(&scene);
