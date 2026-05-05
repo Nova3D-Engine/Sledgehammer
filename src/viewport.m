@@ -1,7 +1,4 @@
 #import "viewport.h"
-#include "sledgehammer_geometry.h"
-#include "sledgehammer_renderer_bridge.h"
-#import "sledgehammer_viewport_internal.h"
 
 #import <QuartzCore/QuartzCore.h>
 #import <Metal/MTLAccelerationStructure.h>
@@ -23,6 +20,39 @@
 
 typedef NovaToolMetalEditorViewportUniforms Uniforms;
 
+typedef NS_OPTIONS(NSUInteger, CameraMovement) {
+    CameraMovementForward = 1 << 0,
+    CameraMovementBackward = 1 << 1,
+    CameraMovementLeft = 1 << 2,
+    CameraMovementRight = 1 << 3,
+    CameraMovementUp = 1 << 4,
+    CameraMovementDown = 1 << 5,
+};
+
+typedef NS_ENUM(NSUInteger, ViewportDragMode) {
+    ViewportDragModeNone = 0,
+    ViewportDragModePan,
+    ViewportDragModeCreateBlock,
+    ViewportDragModeMoveSelection,
+    ViewportDragModeResizeSelection,
+    ViewportDragModeMoveVertex,
+    ViewportDragModeMoveEdge,
+    ViewportDragModeDrawClipLine,
+};
+
+typedef NS_ENUM(NSUInteger, ViewportHandle) {
+    ViewportHandleNone = 0,
+    ViewportHandleBody,
+    ViewportHandleMinUMinV,
+    ViewportHandleMaxUMinV,
+    ViewportHandleMaxUMaxV,
+    ViewportHandleMinUMaxV,
+    ViewportHandleMinUMidV,
+    ViewportHandleMaxUMidV,
+    ViewportHandleMidUMinV,
+    ViewportHandleMidUMaxV,
+};
+
 static const float kViewportPerspectiveFovRadians = 0.87266463f; // 50 degrees; matches heavy renderer camera FOV.
 static const CFTimeInterval kTextureMissLogThrottleSeconds = 10.0;
 static const uint32_t kPreviewBakeGiSamples = 24u;
@@ -40,16 +70,15 @@ static const int kPreviewBakeLightmapHeight = 512;
 static const int kPreviewBakeAtlasTileExtent = 2048;
 static const int kPreviewBakeMinResolution = 4;
 static const int kPreviewBakeMaxResolution = 2044;
-static const float kPreviewBakeDensityDefault = 4.0f;
-static const float kPreviewBakeDensityMin = 0.0625f; // 1/16
-static const float kPreviewBakeDensityMax = 16.0f;
-static const int   kPreviewBakeDensityIndexMin = 0;   // index for 1/16
-static const int   kPreviewBakeDensityIndexMax = 8;   // index for 16
+static const int kPreviewBakeDensityDefault = 4;
+static const int kPreviewBakeDensityMin = 1;
+static const int kPreviewBakeDensityMax = 16;
 static const int kChartBorderPadIterations = 8;
 static const int kPreviewBakeAtlasChartPadding = 2;
 static const float kPreviewBakeDebugExposureDefault = 12.0f;
 static const float kPreviewBakeDebugExposureMin = 0.125f;
 static const float kPreviewBakeDebugExposureMax = 64.0f;
+static const size_t kViewportBakeMaxFragments = 128u;
 static const int kPreviewBakeDisplayModeCombined = 0;
 static const int kPreviewBakeDisplayModeBakedOnly = 1;
 static const int kPreviewBakeDisplayModeDynamicOnly = 2;
@@ -101,7 +130,49 @@ typedef struct HwrtPathTraceVertex {
     simd_float4 uv;
 } HwrtPathTraceVertex;
 
+typedef struct ViewportBakePlane {
+    Vec3 normal;
+    float distance;
+} ViewportBakePlane;
+
+typedef struct ViewportBakePolygon {
+    Vec3 points[256];
+    size_t pointCount;
+} ViewportBakePolygon;
+
 @class VmfViewport;
+
+@interface VmfViewport (Internal)
+
+- (BOOL)handleViewportKeyDown:(NSEvent*)event;
+- (BOOL)handleViewportKeyUp:(NSEvent*)event;
+- (void)handleViewportMouseDownAtPoint:(NSPoint)point;
+- (void)handleViewportMouseUpAtPoint:(NSPoint)point;
+- (void)handleViewportPrimaryDragWithDelta:(NSPoint)delta alternate:(BOOL)alternate;
+- (BOOL)handleViewportSecondaryMouseDown;
+- (void)handleViewportSecondaryDragWithDelta:(NSPoint)delta;
+- (void)handleViewportSecondaryMouseUp;
+- (void)handleViewportScrollDelta:(CGFloat)deltaY;
+- (void)handleViewportDroppedPath:(NSString*)path;
+- (Vec3)dropPlacementPointForViewPoint:(NSPoint)point;
+- (void)handleViewportMouseHoverAtPoint:(NSPoint)point;
+- (void)handleViewportSecondaryClickAtPoint:(NSPoint)point modifierFlags:(NSEventModifierFlags)flags;
+- (void)drawEditorOverlay;
+- (Vec3)rayDirectionForViewPoint:(NSPoint)point;
+- (nullable id<MTLTexture>)cachedTextureForMaterial:(NSString*)material;
+- (nullable NSDictionary<NSString*, id>*)cachedTextureDataForMaterial:(NSString*)material;
+- (nullable id<MTLTexture>)textureFromSceneTexture:(const NovaSceneTexture*)sceneTexture;
+- (nullable id<MTLTexture>)cachedTextureForModelAssetPath:(NSString*)assetPath sourceMaterialIndex:(int)sourceMaterialIndex;
+- (nullable id<MTLTexture>)previewBakedDebugTextureForKey:(NSString*)key;
+- (BOOL)shouldLogTextureMissAtPath:(NSString*)fullPath;
+- (void)applyBakedVertexLighting:(const Vec3*)bakedLighting count:(size_t)count;
+- (nullable id<MTLComputePipelineState>)hwrtBakePipelineState;
+- (BOOL)encodeGizmoOverlayOnCommandBuffer:(id<MTLCommandBuffer>)commandBuffer drawable:(id<CAMetalDrawable>)drawable errorMessage:(char*)errorMessage capacity:(size_t)errorMessageCapacity;
+- (BOOL)gizmoConsumesPrimaryMouse;
+- (void)syncHeavyRendererSceneFromMesh:(const ViewerMesh*)mesh;
+- (BOOL)initializeHeavyRenderer;
+
+@end
 
 @interface ViewportMetalView : MTKView
 
@@ -153,6 +224,84 @@ static Bounds3 viewport_bounds_for_vertex_range(const ViewerVertex* vertices, si
     return bounds;
 }
 
+static Vec3 viewport_scene_bounds_center(const NovaSceneData* scene) {
+    Bounds3 bounds = bounds3_empty();
+    if (scene == NULL) {
+        return vec3_make(0.0f, 0.0f, 0.0f);
+    }
+    for (uint32_t vertexIndex = 0u; vertexIndex < scene->vertexCount; ++vertexIndex) {
+        const NovaSceneVertex* vertex = &scene->vertices[vertexIndex];
+        bounds3_expand(&bounds, vec3_make(vertex->position[0], vertex->position[1], vertex->position[2]));
+    }
+    return bounds3_is_valid(bounds) ? bounds3_center(bounds) : vec3_make(0.0f, 0.0f, 0.0f);
+}
+
+static void viewport_init_imported_material_gpu_defaults(NovaSceneGpuMaterial* material) {
+    if (material == NULL) {
+        return;
+    }
+
+    memset(material, 0, sizeof(*material));
+    material->baseColor[3] = 1.0f;
+    material->params[3] = 1.45f;
+    material->texIndices[0] = -1.0f;
+    material->texIndices[1] = -1.0f;
+    material->texIndices[2] = -1.0f;
+    material->texIndices[3] = -1.0f;
+    material->extra[0] = 1.0f;
+    material->extra[1] = -1.0f;
+    material->extra[2] = 0.5f;
+}
+
+static NSDictionary<NSString*, id>* viewport_texture_dictionary_from_scene_texture(const NovaSceneTexture* texture) {
+    NSMutableDictionary<NSString*, id>* textureInfo;
+    size_t pixelCount;
+
+    if (texture == NULL || texture->width <= 0 || texture->height <= 0) {
+        return nil;
+    }
+
+    textureInfo = [NSMutableDictionary dictionaryWithCapacity:4];
+    textureInfo[@"width"] = @(texture->width);
+    textureInfo[@"height"] = @(texture->height);
+    textureInfo[@"format"] = @(texture->format);
+    pixelCount = (size_t)texture->width * (size_t)texture->height;
+    if (texture->format == NOVA_SCENE_TEXTURE_FORMAT_RGBA32_FLOAT && texture->rgba32f != NULL) {
+        textureInfo[@"rgba32f"] = [NSData dataWithBytes:texture->rgba32f length:pixelCount * sizeof(float) * 4u];
+        return textureInfo;
+    }
+    if (texture->rgba8 != NULL) {
+        textureInfo[@"format"] = @(NOVA_SCENE_TEXTURE_FORMAT_RGBA8_UNORM);
+        textureInfo[@"rgba8"] = [NSData dataWithBytes:texture->rgba8 length:pixelCount * 4u];
+        return textureInfo;
+    }
+    return nil;
+}
+
+static int32_t viewport_import_texture_dictionary(NSMutableDictionary<NSString*, NSNumber*>* importedTextureIndices,
+                                                  NSMutableArray<NSDictionary<NSString*, id>*>* importedTextures,
+                                                  NSString* textureKey,
+                                                  NSDictionary<NSString*, id>* textureInfo) {
+    NSNumber* existingTextureIndex;
+
+    if (importedTextureIndices == nil || importedTextures == nil || textureKey.length == 0 || textureInfo == nil) {
+        return -1;
+    }
+
+    existingTextureIndex = importedTextureIndices[textureKey];
+    if (existingTextureIndex != nil) {
+        return existingTextureIndex.intValue;
+    }
+    if (importedTextures.count >= UI_MAX_LIGHTS) {
+        return -1;
+    }
+
+    existingTextureIndex = @(importedTextures.count);
+    importedTextureIndices[textureKey] = existingTextureIndex;
+    [importedTextures addObject:textureInfo];
+    return existingTextureIndex.intValue;
+}
+
 static Vec3 world_up(void) {
     return vec3_make(0.0f, 0.0f, 1.0f);
 }
@@ -184,6 +333,434 @@ static Vec3 viewport_clamp_vec3(Vec3 value, float minValue, float maxValue) {
         clamped.raw[axis] = fminf(maxValue, fmaxf(minValue, clamped.raw[axis]));
     }
     return clamped;
+}
+
+static BOOL viewport_face_range_is_bake_excluded(const ViewerFaceRange* range) {
+    if (range == NULL) {
+        return YES;
+    }
+    return strcasecmp(range->material, "light_marker") == 0 ||
+           strcasecmp(range->material, "model_marker") == 0;
+}
+
+static ViewportBakePlane viewport_bake_plane_from_side(const VmfSide* side) {
+    Vec3 edgeA = vec3_sub(side->points[1], side->points[0]);
+    Vec3 edgeB = vec3_sub(side->points[2], side->points[0]);
+    Vec3 normal = vec3_normalize(vec3_cross(edgeA, edgeB));
+    ViewportBakePlane plane = {
+        .normal = normal,
+        .distance = vec3_dot(normal, side->points[0]),
+    };
+    return plane;
+}
+
+static Vec3 viewport_bake_solid_reference_point(const VmfSolid* solid) {
+    Vec3 center = vec3_make(0.0f, 0.0f, 0.0f);
+    float sampleCount = 0.0f;
+    for (size_t sideIndex = 0; sideIndex < solid->sideCount; ++sideIndex) {
+        for (size_t pointIndex = 0; pointIndex < 3; ++pointIndex) {
+            center = vec3_add(center, solid->sides[sideIndex].points[pointIndex]);
+            sampleCount += 1.0f;
+        }
+    }
+    return sampleCount > 0.0f ? vec3_scale(center, 1.0f / sampleCount) : center;
+}
+
+static ViewportBakePlane viewport_bake_orient_plane_outward(ViewportBakePlane plane, Vec3 interiorPoint) {
+    float signedDistance = vec3_dot(plane.normal, interiorPoint) - plane.distance;
+    if (signedDistance > 0.0f) {
+        plane.normal = vec3_scale(plane.normal, -1.0f);
+        plane.distance = -plane.distance;
+    }
+    return plane;
+}
+
+static int viewport_bake_intersect_planes(ViewportBakePlane a, ViewportBakePlane b, ViewportBakePlane c, Vec3* outPoint) {
+    Vec3 bc = vec3_cross(b.normal, c.normal);
+    float determinant = vec3_dot(a.normal, bc);
+    if (fabsf(determinant) < 1e-5f) {
+        return 0;
+    }
+
+    Vec3 termA = vec3_scale(bc, a.distance);
+    Vec3 termB = vec3_scale(vec3_cross(c.normal, a.normal), b.distance);
+    Vec3 termC = vec3_scale(vec3_cross(a.normal, b.normal), c.distance);
+    *outPoint = vec3_scale(vec3_add(vec3_add(termA, termB), termC), 1.0f / determinant);
+    return 1;
+}
+
+static int viewport_bake_point_in_brush(const ViewportBakePlane* planes, size_t planeCount, Vec3 point) {
+    for (size_t planeIndex = 0; planeIndex < planeCount; ++planeIndex) {
+        float distance = vec3_dot(planes[planeIndex].normal, point) - planes[planeIndex].distance;
+        if (distance > 0.05f) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int viewport_bake_point_equals(Vec3 a, Vec3 b) {
+    return vec3_length(vec3_sub(a, b)) < 0.05f;
+}
+
+static void viewport_bake_append_unique(Vec3* points, size_t* pointCount, Vec3 point) {
+    for (size_t pointIndex = 0; pointIndex < *pointCount; ++pointIndex) {
+        if (viewport_bake_point_equals(points[pointIndex], point)) {
+            return;
+        }
+    }
+    if (*pointCount < 256u) {
+        points[*pointCount] = point;
+        *pointCount += 1u;
+    }
+}
+
+static void viewport_bake_sort_polygon(Vec3* points, size_t pointCount, Vec3 normal) {
+    if (pointCount < 3u) {
+        return;
+    }
+
+    Vec3 center = vec3_make(0.0f, 0.0f, 0.0f);
+    for (size_t pointIndex = 0; pointIndex < pointCount; ++pointIndex) {
+        center = vec3_add(center, points[pointIndex]);
+    }
+    center = vec3_scale(center, 1.0f / (float)pointCount);
+
+    Vec3 tangentSeed = fabsf(normal.raw[2]) < 0.99f ? vec3_make(0.0f, 0.0f, 1.0f) : vec3_make(0.0f, 1.0f, 0.0f);
+    Vec3 axisX = vec3_normalize(vec3_cross(tangentSeed, normal));
+    Vec3 axisY = vec3_cross(normal, axisX);
+
+    for (size_t i = 0; i + 1 < pointCount; ++i) {
+        for (size_t j = i + 1; j < pointCount; ++j) {
+            Vec3 ai = vec3_sub(points[i], center);
+            Vec3 aj = vec3_sub(points[j], center);
+            float angleI = atan2f(vec3_dot(ai, axisY), vec3_dot(ai, axisX));
+            float angleJ = atan2f(vec3_dot(aj, axisY), vec3_dot(aj, axisX));
+            if (angleJ < angleI) {
+                Vec3 tmp = points[i];
+                points[i] = points[j];
+                points[j] = tmp;
+            }
+        }
+    }
+}
+
+static void viewport_bake_compute_uv(Vec3 position, const VmfSide* side, float* outU, float* outV) {
+    if (fabsf(side->uscale) > 1e-5f) {
+        *outU = (vec3_dot(position, side->uaxis) + side->uoffset) / (side->uscale * 0.5f);
+    } else {
+        *outU = vec3_dot(position, side->uaxis) + side->uoffset;
+    }
+    if (fabsf(side->vscale) > 1e-5f) {
+        *outV = (vec3_dot(position, side->vaxis) + side->voffset) / (side->vscale * 0.5f);
+    } else {
+        *outV = vec3_dot(position, side->vaxis) + side->voffset;
+    }
+}
+
+static Bounds3 viewport_bake_solid_bounds(const VmfSolid* solid) {
+    Bounds3 bounds = bounds3_empty();
+    for (size_t sideIndex = 0; sideIndex < solid->sideCount; ++sideIndex) {
+        for (size_t pointIndex = 0; pointIndex < 3; ++pointIndex) {
+            bounds3_expand(&bounds, solid->sides[sideIndex].points[pointIndex]);
+        }
+    }
+    return bounds;
+}
+
+static Bounds3 viewport_bake_polygon_bounds(const ViewportBakePolygon* polygon) {
+    Bounds3 bounds = bounds3_empty();
+    for (size_t pointIndex = 0; pointIndex < polygon->pointCount; ++pointIndex) {
+        bounds3_expand(&bounds, polygon->points[pointIndex]);
+    }
+    return bounds;
+}
+
+static BOOL viewport_bake_bounds_overlap(Bounds3 a, Bounds3 b, float pad) {
+    if (!bounds3_is_valid(a) || !bounds3_is_valid(b)) {
+        return NO;
+    }
+    return !(a.max.raw[0] < b.min.raw[0] - pad || a.min.raw[0] > b.max.raw[0] + pad ||
+             a.max.raw[1] < b.min.raw[1] - pad || a.min.raw[1] > b.max.raw[1] + pad ||
+             a.max.raw[2] < b.min.raw[2] - pad || a.min.raw[2] > b.max.raw[2] + pad);
+}
+
+static BOOL viewport_bake_collect_face_polygon(const VmfSolid* solid,
+                                               size_t sideIndex,
+                                               ViewportBakePolygon* outPolygon,
+                                               Vec3* outNormal) {
+    if (solid == NULL || outPolygon == NULL || sideIndex >= solid->sideCount || solid->sideCount > 128u) {
+        return NO;
+    }
+
+    ViewportBakePlane planes[128];
+    Vec3 interiorPoint = viewport_bake_solid_reference_point(solid);
+    for (size_t planeIndex = 0; planeIndex < solid->sideCount; ++planeIndex) {
+        planes[planeIndex] = viewport_bake_orient_plane_outward(viewport_bake_plane_from_side(&solid->sides[planeIndex]), interiorPoint);
+    }
+
+    outPolygon->pointCount = 0u;
+    for (size_t j = 0; j < solid->sideCount; ++j) {
+        if (j == sideIndex) {
+            continue;
+        }
+        for (size_t k = j + 1u; k < solid->sideCount; ++k) {
+            if (k == sideIndex) {
+                continue;
+            }
+            Vec3 point;
+            if (!viewport_bake_intersect_planes(planes[sideIndex], planes[j], planes[k], &point)) {
+                continue;
+            }
+            if (!viewport_bake_point_in_brush(planes, solid->sideCount, point)) {
+                continue;
+            }
+            viewport_bake_append_unique(outPolygon->points, &outPolygon->pointCount, point);
+        }
+    }
+
+    if (outPolygon->pointCount < 3u) {
+        return NO;
+    }
+
+    viewport_bake_sort_polygon(outPolygon->points, outPolygon->pointCount, planes[sideIndex].normal);
+    if (outNormal != NULL) {
+        *outNormal = planes[sideIndex].normal;
+    }
+    return YES;
+}
+
+static void viewport_bake_append_polygon_point(ViewportBakePolygon* polygon, Vec3 point) {
+    if (polygon->pointCount == 0u || !viewport_bake_point_equals(polygon->points[polygon->pointCount - 1u], point)) {
+        if (polygon->pointCount < 256u) {
+            polygon->points[polygon->pointCount++] = point;
+        }
+    }
+}
+
+static void viewport_bake_split_polygon_by_plane(const ViewportBakePolygon* polygon,
+                                                 ViewportBakePlane plane,
+                                                 float epsilon,
+                                                 ViewportBakePolygon* outOutside,
+                                                 ViewportBakePolygon* outInside) {
+    outOutside->pointCount = 0u;
+    outInside->pointCount = 0u;
+    if (polygon == NULL || polygon->pointCount < 3u) {
+        return;
+    }
+
+    for (size_t pointIndex = 0; pointIndex < polygon->pointCount; ++pointIndex) {
+        Vec3 current = polygon->points[pointIndex];
+        Vec3 next = polygon->points[(pointIndex + 1u) % polygon->pointCount];
+        float currentDist = vec3_dot(plane.normal, current) - plane.distance;
+        float nextDist = vec3_dot(plane.normal, next) - plane.distance;
+        BOOL currentOutside = currentDist > epsilon;
+        BOOL nextOutside = nextDist > epsilon;
+
+        if (!currentOutside) {
+            viewport_bake_append_polygon_point(outInside, current);
+        } else {
+            viewport_bake_append_polygon_point(outOutside, current);
+        }
+
+        if (currentOutside != nextOutside) {
+            float denom = currentDist - nextDist;
+            if (fabsf(denom) > 1e-6f) {
+                float t = currentDist / denom;
+                t = fminf(fmaxf(t, 0.0f), 1.0f);
+                Vec3 intersection = vec3_add(current, vec3_scale(vec3_sub(next, current), t));
+                viewport_bake_append_polygon_point(outOutside, intersection);
+                viewport_bake_append_polygon_point(outInside, intersection);
+            }
+        }
+    }
+
+    if (outOutside->pointCount >= 2u && viewport_bake_point_equals(outOutside->points[0], outOutside->points[outOutside->pointCount - 1u])) {
+        outOutside->pointCount -= 1u;
+    }
+    if (outInside->pointCount >= 2u && viewport_bake_point_equals(outInside->points[0], outInside->points[outInside->pointCount - 1u])) {
+        outInside->pointCount -= 1u;
+    }
+}
+
+static BOOL viewport_bake_subtract_polygon_by_solid(const ViewportBakePolygon* source,
+                                                    const VmfSolid* solid,
+                                                    ViewportBakePolygon* outFragments,
+                                                    size_t maxFragments,
+                                                    size_t* outFragmentCount) {
+    if (outFragmentCount == NULL || source == NULL || solid == NULL || solid->sideCount == 0u || solid->sideCount > 128u) {
+        return NO;
+    }
+
+    ViewportBakePlane planes[128];
+    Vec3 interiorPoint = viewport_bake_solid_reference_point(solid);
+    for (size_t planeIndex = 0; planeIndex < solid->sideCount; ++planeIndex) {
+        planes[planeIndex] = viewport_bake_orient_plane_outward(viewport_bake_plane_from_side(&solid->sides[planeIndex]), interiorPoint);
+    }
+
+    ViewportBakePolygon* insideQueue = (ViewportBakePolygon*)malloc(kViewportBakeMaxFragments * sizeof(ViewportBakePolygon));
+    ViewportBakePolygon* nextInsideQueue = (ViewportBakePolygon*)malloc(kViewportBakeMaxFragments * sizeof(ViewportBakePolygon));
+    if (insideQueue == NULL || nextInsideQueue == NULL) {
+        free(insideQueue);
+        free(nextInsideQueue);
+        return NO;
+    }
+    size_t insideCount = 1u;
+    size_t keptCount = 0u;
+    insideQueue[0] = *source;
+
+    for (size_t planeIndex = 0; planeIndex < solid->sideCount; ++planeIndex) {
+        size_t nextInsideCount = 0u;
+        for (size_t fragmentIndex = 0; fragmentIndex < insideCount; ++fragmentIndex) {
+            ViewportBakePolygon outsideFragment;
+            ViewportBakePolygon insideFragment;
+            viewport_bake_split_polygon_by_plane(&insideQueue[fragmentIndex],
+                                                 planes[planeIndex],
+                                                 0.05f,
+                                                 &outsideFragment,
+                                                 &insideFragment);
+            if (outsideFragment.pointCount >= 3u) {
+                if (keptCount >= maxFragments) {
+                    free(insideQueue);
+                    free(nextInsideQueue);
+                    return NO;
+                }
+                outFragments[keptCount++] = outsideFragment;
+            }
+            if (insideFragment.pointCount >= 3u) {
+                if (nextInsideCount >= kViewportBakeMaxFragments) {
+                    free(insideQueue);
+                    free(nextInsideQueue);
+                    return NO;
+                }
+                nextInsideQueue[nextInsideCount++] = insideFragment;
+            }
+        }
+        insideCount = nextInsideCount;
+        for (size_t fragmentIndex = 0; fragmentIndex < insideCount; ++fragmentIndex) {
+            insideQueue[fragmentIndex] = nextInsideQueue[fragmentIndex];
+        }
+        if (insideCount == 0u) {
+            break;
+        }
+    }
+
+    *outFragmentCount = keptCount;
+    free(insideQueue);
+    free(nextInsideQueue);
+    return YES;
+}
+
+static BOOL viewport_bake_collect_exposed_fragments(const VmfScene* scene,
+                                                    size_t entityIndex,
+                                                    size_t solidIndex,
+                                                    size_t sideIndex,
+                                                    ViewportBakePolygon* outFragments,
+                                                    size_t maxFragments,
+                                                    size_t* outFragmentCount,
+                                                    Vec3* outFaceNormal) {
+    if (outFragmentCount == NULL || outFragments == NULL || maxFragments == 0u ||
+        scene == NULL || entityIndex >= scene->entityCount) {
+        return NO;
+    }
+
+    const VmfEntity* entity = &scene->entities[entityIndex];
+    if (solidIndex >= entity->solidCount) {
+        return NO;
+    }
+    const VmfSolid* solid = &entity->solids[solidIndex];
+    if (sideIndex >= solid->sideCount || solid->sides[sideIndex].dispinfo.hasData) {
+        return NO;
+    }
+
+    ViewportBakePolygon basePolygon;
+    Vec3 faceNormal;
+    if (!viewport_bake_collect_face_polygon(solid, sideIndex, &basePolygon, &faceNormal)) {
+        return NO;
+    }
+
+    ViewportBakePolygon* fragments = (ViewportBakePolygon*)malloc(kViewportBakeMaxFragments * sizeof(ViewportBakePolygon));
+    ViewportBakePolygon* nextFragments = (ViewportBakePolygon*)malloc(kViewportBakeMaxFragments * sizeof(ViewportBakePolygon));
+    ViewportBakePolygon* subtractedFragments = (ViewportBakePolygon*)malloc(kViewportBakeMaxFragments * sizeof(ViewportBakePolygon));
+    if (fragments == NULL || nextFragments == NULL || subtractedFragments == NULL) {
+        free(fragments);
+        free(nextFragments);
+        free(subtractedFragments);
+        return NO;
+    }
+
+    size_t fragmentCount = 1u;
+    BOOL subtractionFailed = NO;
+    fragments[0] = basePolygon;
+
+    for (size_t occluderEntityIndex = 0u; occluderEntityIndex < scene->entityCount && !subtractionFailed; ++occluderEntityIndex) {
+        const VmfEntity* occluderEntity = &scene->entities[occluderEntityIndex];
+        if (occluderEntity->kind == VmfEntityKindLight || (!occluderEntity->isWorld && !occluderEntity->enabled)) {
+            continue;
+        }
+
+        for (size_t occluderSolidIndex = 0u; occluderSolidIndex < occluderEntity->solidCount && !subtractionFailed; ++occluderSolidIndex) {
+            const VmfSolid* occluderSolid = &occluderEntity->solids[occluderSolidIndex];
+            if (occluderSolid == solid) {
+                continue;
+            }
+
+            Bounds3 solidBounds = viewport_bake_solid_bounds(occluderSolid);
+            size_t nextFragmentCount = 0u;
+            for (size_t fragmentIndex = 0u; fragmentIndex < fragmentCount; ++fragmentIndex) {
+                Bounds3 fragmentBounds = viewport_bake_polygon_bounds(&fragments[fragmentIndex]);
+                if (!viewport_bake_bounds_overlap(fragmentBounds, solidBounds, 0.05f)) {
+                    if (nextFragmentCount >= maxFragments) {
+                        subtractionFailed = YES;
+                        break;
+                    }
+                    nextFragments[nextFragmentCount++] = fragments[fragmentIndex];
+                    continue;
+                }
+
+                size_t subtractedCount = 0u;
+                if (!viewport_bake_subtract_polygon_by_solid(&fragments[fragmentIndex],
+                                                              occluderSolid,
+                                                              subtractedFragments,
+                                                              maxFragments,
+                                                              &subtractedCount)) {
+                    subtractionFailed = YES;
+                    break;
+                }
+                if (nextFragmentCount + subtractedCount > maxFragments) {
+                    subtractionFailed = YES;
+                    break;
+                }
+                for (size_t subtractedIndex = 0u; subtractedIndex < subtractedCount; ++subtractedIndex) {
+                    nextFragments[nextFragmentCount++] = subtractedFragments[subtractedIndex];
+                }
+            }
+
+            fragmentCount = nextFragmentCount;
+            for (size_t fragmentIndex = 0u; fragmentIndex < fragmentCount; ++fragmentIndex) {
+                fragments[fragmentIndex] = nextFragments[fragmentIndex];
+            }
+            if (fragmentCount == 0u) {
+                break;
+            }
+        }
+    }
+
+    BOOL success = !subtractionFailed;
+    if (success) {
+        *outFragmentCount = fragmentCount;
+        for (size_t fragmentIndex = 0u; fragmentIndex < fragmentCount; ++fragmentIndex) {
+            outFragments[fragmentIndex] = fragments[fragmentIndex];
+        }
+        if (outFaceNormal != NULL) {
+            *outFaceNormal = faceNormal;
+        }
+    }
+
+    free(fragments);
+    free(nextFragments);
+    free(subtractedFragments);
+    return success;
 }
 
 static BOOL viewport_reserve_hwrt_bake_geometry(HwrtPathTraceVertex** ioVertices,
@@ -357,29 +934,9 @@ static void viewport_preview_bake_face_world_extents(const ViewerVertex* vertice
     if (outExtentV != NULL) *outExtentV = extentV;
 }
 
-static float preview_bake_density_from_index(int index) {
-    // Maps slider index 0..8 to densities 1/16, 1/8, 1/4, 1/2, 1, 2, 4, 8, 16.
-    return powf(2.0f, (float)(index - 4));
-}
-
-static int preview_bake_density_to_index(float density) {
-    int index = (int)roundf(log2f(fmaxf(density, kPreviewBakeDensityMin)) + 4.0f);
-    if (index < kPreviewBakeDensityIndexMin) index = kPreviewBakeDensityIndexMin;
-    if (index > kPreviewBakeDensityIndexMax) index = kPreviewBakeDensityIndexMax;
-    return index;
-}
-
-static NSString* preview_bake_density_label(float density) {
-    if (density < 1.0f) {
-        int denom = (int)roundf(1.0f / density);
-        return [NSString stringWithFormat:@"1/%d px / unit", denom];
-    }
-    return [NSString stringWithFormat:@"%.0f px / unit", density];
-}
-
 static void viewport_preview_bake_chart_size_for_range(const ViewerVertex* vertices,
                                                        ViewerFaceRange range,
-                                                       float density,
+                                                       int density,
                                                        int* outWidth,
                                                        int* outHeight) {
     float extentU = 1.0f;
@@ -388,8 +945,8 @@ static void viewport_preview_bake_chart_size_for_range(const ViewerVertex* verti
     int height;
 
     viewport_preview_bake_face_world_extents(vertices, range, &extentU, &extentV);
-    width = (int)ceilf(extentU * density);
-    height = (int)ceilf(extentV * density);
+    width = (int)ceilf(extentU * (float)density);
+    height = (int)ceilf(extentV * (float)density);
     width = (int)fmin((double)kPreviewBakeMaxResolution, fmax((double)kPreviewBakeMinResolution, (double)width));
     height = (int)fmin((double)kPreviewBakeMaxResolution, fmax((double)kPreviewBakeMinResolution, (double)height));
 
@@ -1525,6 +2082,157 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
 
 @end
 
+@interface VmfViewport () <MTKViewDelegate>
+
+@property(nonatomic, copy) NSString* title;
+@property(nonatomic, assign) VmfViewportDimension dimension;
+@property(nonatomic, assign) VmfViewportPlane plane;
+@property(nonatomic, strong) ViewportMetalView* metalView;
+@property(nonatomic, strong) NSVisualEffectView* headerView;
+@property(nonatomic, strong) ViewportOverlayView* overlayView;
+@property(nonatomic, strong) NSTextField* titleLabel;
+@property(nonatomic, strong) NSTextField* modeLabel;
+@property(nonatomic, strong) id<MTLDevice> device;
+@property(nonatomic, strong) id<MTLCommandQueue> commandQueue;
+@property(nonatomic, strong) id<MTLRenderPipelineState> pipelineState;
+@property(nonatomic, strong) id<MTLDepthStencilState> depthState;
+@property(nonatomic, strong) id<MTLDepthStencilState> disabledDepthState;
+@property(nonatomic, strong) id<MTLDepthStencilState> readOnlyDepthState;
+@property(nonatomic, strong) id<MTLBuffer> vertexBuffer;
+@property(nonatomic, strong) id<MTLBuffer> edgeVertexBuffer;
+@property(nonatomic, strong) id<MTLBuffer> selectedFaceBuffer;
+@property(nonatomic, strong) id<MTLBuffer> highlightedFaceBuffer;
+@property(nonatomic, assign) NSUInteger vertexCount;
+@property(nonatomic, assign) NSUInteger edgeVertexCount;
+@property(nonatomic, assign) NSUInteger selectedFaceVertexCount;
+@property(nonatomic, assign) NSUInteger highlightedFaceVertexCount;
+@property(nonatomic, assign) ViewerVertex* cpuVertices;
+@property(nonatomic, assign) ViewerVertex* cpuEdgeVertices;
+@property(nonatomic, assign) Vec3* baseVertexColors;
+@property(nonatomic, assign) ViewerFaceRange* faceRanges;
+@property(nonatomic, assign) size_t faceRangeCount;
+@property(nonatomic, assign) Bounds3 sceneBounds;
+@property(nonatomic, assign) Vec3 target;
+@property(nonatomic, assign) Vec3 orbitLerpTarget;
+@property(nonatomic, assign) float yaw;
+@property(nonatomic, assign) float pitch;
+@property(nonatomic, assign) float distance;
+@property(nonatomic, assign) Vec3 freeLookPosition;
+@property(nonatomic, assign) BOOL freeLookActive;
+@property(nonatomic, assign) CameraMovement movementMask;
+@property(nonatomic, assign) CFTimeInterval lastFrameTime;
+@property(nonatomic, assign) Vec3 orthoCenter;
+@property(nonatomic, assign) float orthoSize;
+@property(nonatomic, assign) Vec3 primaryLightPosition;
+@property(nonatomic, assign) Vec3 primaryLightColor;
+@property(nonatomic, assign) float primaryLightIntensity;
+@property(nonatomic, assign) float primaryLightRange;
+@property(nonatomic, assign) BOOL primaryLightEnabled;
+@property(nonatomic, assign) Bounds3 selectionBounds;
+@property(nonatomic, assign) BOOL selectionVisible;
+@property(nonatomic, assign) Vec3* selectionVertices;
+@property(nonatomic, assign) size_t selectionVertexCount;
+@property(nonatomic, assign) VmfSolidEdge* selectionEdges;
+@property(nonatomic, assign) size_t selectionEdgeCount;
+@property(nonatomic, assign) VmfViewportSelectionEdge selectedFaceEdge;
+@property(nonatomic, assign) BOOL selectedFaceVisible;
+@property(nonatomic, assign) size_t selectedFaceEntityIndex;
+@property(nonatomic, assign) size_t selectedFaceSolidIndex;
+@property(nonatomic, assign) size_t selectedFaceSideIndex;
+@property(nonatomic, assign) BOOL highlightedFaceVisible;
+@property(nonatomic, assign) size_t highlightedFaceEntityIndex;
+@property(nonatomic, assign) size_t highlightedFaceSolidIndex;
+@property(nonatomic, assign) size_t highlightedFaceSideIndex;
+@property(nonatomic, assign) Bounds3 creationBounds;
+@property(nonatomic, assign) BOOL creationVisible;
+@property(nonatomic, assign) Bounds3 pluginDebugBounds;
+@property(nonatomic, assign) BOOL pluginDebugVisible;
+@property(nonatomic, assign) BOOL clipGuideVisible;
+@property(nonatomic, assign) Vec3 clipGuideStart;
+@property(nonatomic, assign) Vec3 clipGuideEnd;
+@property(nonatomic, assign) ViewportDragMode dragMode;
+@property(nonatomic, assign) ViewportHandle activeHandle;
+@property(nonatomic, assign) size_t activeEdgeFirstSideIndex;
+@property(nonatomic, assign) size_t activeEdgeSecondSideIndex;
+@property(nonatomic, assign) Vec3 dragAnchorWorld;
+@property(nonatomic, assign) Bounds3 dragOriginalBounds;
+@property(nonatomic, assign) NSPoint dragStartPoint;
+@property(nonatomic, assign) BOOL pendingClickSelection;
+@property(nonatomic, assign) BOOL vertexEditIsInvalid;
+@property(nonatomic, strong) id<MTLBuffer> vertexEditPreviewBuffer;
+@property(nonatomic, assign) NSUInteger vertexEditPreviewVertexCount;
+@property(nonatomic, strong) id<MTLSamplerState> samplerState;
+@property(nonatomic, strong) NSMutableDictionary<NSString*, id>* textureCache; // id<MTLTexture> or NSNull
+@property(nonatomic, strong) NSMutableDictionary<NSString*, id>* textureDataCache; // NSDictionary or NSNull
+@property(nonatomic, strong) NSMutableDictionary<NSString*, NSNumber*>* textureMissLogTimes;
+@property(nonatomic, strong) NSMutableDictionary<NSString*, NSDictionary<NSString*, id>*>* previewBakedLightmaps;
+@property(nonatomic, strong) NSMutableDictionary<NSString*, NSNumber*>* previewBakeBrushResolutions;
+@property(nonatomic, strong) NSMutableDictionary<NSString*, NSDictionary<NSString*, NSNumber*>*>* previewBakeBrushStats;
+@property(nonatomic, strong) NSMutableDictionary<NSString*, id>* previewBakedDebugTextures;
+@property(nonatomic, copy) NSString* previewBakeDebugSelectedKey;
+@property(nonatomic, assign) BOOL previewBakeDebugWindowOpen;
+@property(nonatomic, strong) NSPanel* previewBakePanel;
+@property(nonatomic, strong) NSTextField* previewBakeMapCountLabel;
+@property(nonatomic, strong) NSTextField* previewBakeStatusLabel;
+@property(nonatomic, strong) NSProgressIndicator* previewBakeProgressIndicator;
+@property(nonatomic, strong) NSSlider* previewBakeExposureSlider;
+@property(nonatomic, strong) NSTextField* previewBakeExposureValueLabel;
+@property(nonatomic, strong) NSSlider* previewBakeBatchSppSlider;
+@property(nonatomic, strong) NSTextField* previewBakeBatchSppValueLabel;
+@property(nonatomic, strong) NSSlider* previewBakeTargetSppSlider;
+@property(nonatomic, strong) NSTextField* previewBakeTargetSppValueLabel;
+@property(nonatomic, strong) NSSlider* previewBakeBounceSlider;
+@property(nonatomic, strong) NSTextField* previewBakeBounceValueLabel;
+@property(nonatomic, strong) NSSlider* previewBakeSkyBrightnessSlider;
+@property(nonatomic, strong) NSTextField* previewBakeSkyBrightnessValueLabel;
+@property(nonatomic, strong) NSSlider* previewBakeDiffuseBounceSlider;
+@property(nonatomic, strong) NSTextField* previewBakeDiffuseBounceValueLabel;
+@property(nonatomic, strong) NSSlider* previewBakeDensitySlider;
+@property(nonatomic, strong) NSTextField* previewBakeDensityValueLabel;
+@property(nonatomic, strong) NSPopUpButton* previewBakeMapPopUp;
+@property(nonatomic, strong) NSImageView* previewBakeImageView;
+@property(nonatomic, strong) NSTextField* previewBakeImageInfoLabel;
+@property(nonatomic, strong) NSButton* previewBakeRebakeButton;
+@property(nonatomic, assign) float previewBakeDebugExposure;
+@property(nonatomic, assign) uint32_t previewBakeRtSamplesPerTexel;
+@property(nonatomic, assign) uint32_t previewBakeTargetSamplesPerTexel;
+@property(nonatomic, assign) uint32_t previewBakeBounceCount;
+@property(nonatomic, assign) float previewBakeSkyBrightness;
+@property(nonatomic, assign) float previewBakeDiffuseBounceIntensity;
+@property(nonatomic, assign) int previewBakeDensity;
+@property(nonatomic, assign) uint32_t previewBakeAccumulatedSamplesPerTexel;
+@property(nonatomic, assign) uint32_t previewBakeRunningTargetSamplesPerTexel;
+@property(nonatomic, assign) uint32_t previewBakeRunningBounceCount;
+@property(nonatomic, assign) int previewBakeDisplayMode;
+@property(nonatomic, assign) BOOL previewBakePauseRequested;
+@property(nonatomic, assign) BOOL previewBakeCancelRequested;
+@property(nonatomic, assign) BOOL previewBakeRestartQueued;
+@property(nonatomic, strong) id<MTLComputePipelineState> hwrtBakePipeline;
+@property(nonatomic, copy) NSString* textureDirectory;
+@property(nonatomic, assign) NovaToolMetalEditorViewportRenderer metalRenderer;
+@property(nonatomic, assign) NovaToolMetalContext fullMetalContext;
+@property(nonatomic, assign) NovaToolMetalRenderer fullMetalRenderer;
+@property(nonatomic, assign) NovaSceneData importedSceneData;
+@property(nonatomic, assign) UiGizmoState fullRendererUiState;
+@property(nonatomic, assign) const VmfScene* vmfScene;
+@property(nonatomic, assign) NovaSceneWorld* sceneWorld;
+@property(nonatomic, assign) uint32_t* heavyObjectEntityIndices;
+@property(nonatomic, assign) Vec3* heavyObjectModelBasePositions;
+@property(nonatomic, assign) uint8_t* heavyObjectModelFlags;
+@property(nonatomic, assign) uint32_t heavyObjectMappingCount;
+@property(nonatomic, assign) BOOL fullRendererInitialized;
+@property(nonatomic, assign) uint32_t fullRendererFrameIndex;
+@property(nonatomic, assign) void* imguiContext;
+@property(nonatomic, assign) BOOL gizmoHovered;
+@property(nonatomic, assign) BOOL gizmoInteractionActive;
+@property(nonatomic, assign) BOOL orbitLerpActive;
+@property(nonatomic, assign) BOOL previewBakeInProgress;
+@property(nonatomic, assign) BOOL previewBakedLightingEnabled;
+@property(nonatomic, assign) uint64_t previewBakeGeneration;
+@property(nonatomic, assign) uint64_t meshRevision;
+
+@end
+
 @interface VmfViewport () {
     size_t _activeVertexIndices[VMF_MAX_SOLID_VERTICES];
     size_t _activeVertexIndexCount;
@@ -1532,8 +2240,6 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
 
 @end
 
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wincomplete-implementation"
 @implementation VmfViewport
 
 - (void)dealloc {
@@ -1764,6 +2470,38 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     self.fullRendererInitialized = YES;
     self.fullRendererFrameIndex = 0u;
     return YES;
+}
+
+- (nullable id<MTLComputePipelineState>)hwrtBakePipelineState {
+    if (self.hwrtBakePipeline != nil) {
+        return self.hwrtBakePipeline;
+    }
+
+    NSError* error = nil;
+    id<MTLLibrary> library = nil;
+    NSString* path = [[NSBundle mainBundle] pathForResource:@"pathtrace.comp" ofType:@"metallib" inDirectory:@"shaders/metal"];
+    if (path == nil) {
+        NSString* executableDir = [[[NSProcessInfo processInfo] arguments][0] stringByDeletingLastPathComponent];
+        path = [executableDir stringByAppendingPathComponent:@"shaders/metal/pathtrace.comp.metallib"];
+    }
+
+    library = [self.device newLibraryWithURL:[NSURL fileURLWithPath:path] error:&error];
+    if (library == nil) {
+        NSLog(@"[lighting] failed to load HWRT bake metallib %@: %@", path, error);
+        return nil;
+    }
+
+    id<MTLFunction> function = [library newFunctionWithName:@"pathtrace_lightmap_bake_main"];
+    if (function == nil) {
+        NSLog(@"[lighting] HWRT bake function pathtrace_lightmap_bake_main not found in %@", path);
+        return nil;
+    }
+
+    self.hwrtBakePipeline = [self.device newComputePipelineStateWithFunction:function error:&error];
+    if (self.hwrtBakePipeline == nil) {
+        NSLog(@"[lighting] failed to create HWRT bake pipeline: %@", error);
+    }
+    return self.hwrtBakePipeline;
 }
 
 - (void)setSceneWorld:(NovaSceneWorld*)sceneWorld {
@@ -2078,9 +2816,9 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     self.previewBakeDiffuseBounceValueLabel.stringValue = [NSString stringWithFormat:@"%.2fx", self.previewBakeDiffuseBounceIntensity];
     self.previewBakeDiffuseBounceSlider.enabled = !panelLocked;
 
-    float density = fminf(kPreviewBakeDensityMax, fmaxf(kPreviewBakeDensityMin, self.previewBakeDensity));
-    self.previewBakeDensitySlider.intValue = preview_bake_density_to_index(density);
-    self.previewBakeDensityValueLabel.stringValue = preview_bake_density_label(density);
+    int density = (int)fmin((double)kPreviewBakeDensityMax, fmax((double)kPreviewBakeDensityMin, (double)self.previewBakeDensity));
+    self.previewBakeDensitySlider.intValue = density;
+    self.previewBakeDensityValueLabel.stringValue = [NSString stringWithFormat:@"%d px / unit", density];
     self.previewBakeDensitySlider.enabled = !panelLocked;
 
     [self.previewBakeMapPopUp removeAllItems];
@@ -2160,7 +2898,9 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     } else if (sender == self.previewBakeDiffuseBounceSlider) {
         self.previewBakeDiffuseBounceIntensity = fminf(4.0f, fmaxf(0.25f, self.previewBakeDiffuseBounceSlider.floatValue));
     } else if (sender == self.previewBakeDensitySlider) {
-        self.previewBakeDensity = preview_bake_density_from_index(self.previewBakeDensitySlider.intValue);
+        self.previewBakeDensity = (int)fmin((double)kPreviewBakeDensityMax,
+                                            fmax((double)kPreviewBakeDensityMin,
+                                                 (double)self.previewBakeDensitySlider.intValue));
     } else if (sender == self.previewBakeMapPopUp) {
         self.previewBakeDebugSelectedKey = self.previewBakeMapPopUp.selectedItem.title ?: @"";
     }
@@ -2288,10 +3028,8 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     self.previewBakeDiffuseBounceSlider.minValue = 0.25;
     self.previewBakeDiffuseBounceSlider.maxValue = 4.0;
     [root addArrangedSubview:makeRow(@"Lightmap Density", &_previewBakeDensitySlider, &_previewBakeDensityValueLabel)];
-    self.previewBakeDensitySlider.minValue = (double)kPreviewBakeDensityIndexMin;
-    self.previewBakeDensitySlider.maxValue = (double)kPreviewBakeDensityIndexMax;
-    self.previewBakeDensitySlider.numberOfTickMarks = kPreviewBakeDensityIndexMax - kPreviewBakeDensityIndexMin + 1;
-    self.previewBakeDensitySlider.allowsTickMarkValuesOnly = YES;
+    self.previewBakeDensitySlider.minValue = (double)kPreviewBakeDensityMin;
+    self.previewBakeDensitySlider.maxValue = (double)kPreviewBakeDensityMax;
 
     NSTextField* mapLabel = makeLabel(@"Preview Map", [NSFont systemFontOfSize:12.0 weight:NSFontWeightMedium], nil);
     self.previewBakeMapPopUp = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
@@ -2926,11 +3664,98 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     return textureInfo;
 }
 
+- (nullable id<MTLTexture>)previewBakedDebugTextureForKey:(NSString*)key {
+    id cached = self.previewBakedDebugTextures[key];
+    if (cached != nil) {
+        return cached == (id)NSNull.null ? nil : (id<MTLTexture>)cached;
+    }
+
+    NSDictionary<NSString*, id>* info = self.previewBakedLightmaps[key];
+    if (info == nil) {
+        self.previewBakedDebugTextures[key] = NSNull.null;
+        return nil;
+    }
+
+    NSData* rgba8 = info[@"rgba8"];
+    NSData* rgba32f = info[@"rgba32f"];
+    int width = [info[@"width"] intValue];
+    int height = [info[@"height"] intValue];
+    if ((rgba8 == nil && rgba32f == nil) || width <= 0 || height <= 0) {
+        self.previewBakedDebugTextures[key] = NSNull.null;
+        return nil;
+    }
+
+    MTLTextureDescriptor* descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                           width:(NSUInteger)width
+                                                                                          height:(NSUInteger)height
+                                                                                       mipmapped:NO];
+    descriptor.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> texture = [self.device newTextureWithDescriptor:descriptor];
+    if (texture == nil) {
+        self.previewBakedDebugTextures[key] = NSNull.null;
+        return nil;
+    }
+
+    MTLRegion region = MTLRegionMake2D(0, 0, (NSUInteger)width, (NSUInteger)height);
+    if (rgba32f != nil && rgba32f.length >= (NSUInteger)width * (NSUInteger)height * sizeof(float) * 4u) {
+        NSMutableData* debugPixels = [NSMutableData dataWithLength:(NSUInteger)width * (NSUInteger)height * 4u];
+        if (debugPixels.length == (NSUInteger)width * (NSUInteger)height * 4u) {
+            const float* hdr = (const float*)rgba32f.bytes;
+            uint8_t* ldr = (uint8_t*)debugPixels.mutableBytes;
+            float exposure = fmaxf(self.previewBakeDebugExposure, 0.0f);
+            size_t texelCount = (size_t)width * (size_t)height;
+            for (size_t texelIndex = 0; texelIndex < texelCount; ++texelIndex) {
+                float litR = fmaxf(hdr[texelIndex * 4u + 0u], 0.0f) * exposure;
+                float litG = fmaxf(hdr[texelIndex * 4u + 1u], 0.0f) * exposure;
+                float litB = fmaxf(hdr[texelIndex * 4u + 2u], 0.0f) * exposure;
+                float mappedR = litR / (1.0f + litR);
+                float mappedG = litG / (1.0f + litG);
+                float mappedB = litB / (1.0f + litB);
+                ldr[texelIndex * 4u + 0u] = (uint8_t)lrintf(fminf(mappedR, 1.0f) * 255.0f);
+                ldr[texelIndex * 4u + 1u] = (uint8_t)lrintf(fminf(mappedG, 1.0f) * 255.0f);
+                ldr[texelIndex * 4u + 2u] = (uint8_t)lrintf(fminf(mappedB, 1.0f) * 255.0f);
+                ldr[texelIndex * 4u + 3u] = 255u;
+            }
+            [texture replaceRegion:region mipmapLevel:0 withBytes:debugPixels.bytes bytesPerRow:(NSUInteger)width * 4u];
+        } else {
+            self.previewBakedDebugTextures[key] = NSNull.null;
+            return nil;
+        }
+    } else {
+        [texture replaceRegion:region mipmapLevel:0 withBytes:rgba8.bytes bytesPerRow:(NSUInteger)width * 4u];
+    }
+    self.previewBakedDebugTextures[key] = texture;
+    return texture;
+}
+
+- (void)clearTextureMissCache {
+    NSArray* keys = self.textureCache.allKeys;
+    for (NSString* key in keys) {
+        if (self.textureCache[key] == (id)NSNull.null) {
+            [self.textureCache removeObjectForKey:key];
+        }
+    }
+    keys = self.textureDataCache.allKeys;
+    for (NSString* key in keys) {
+        if (self.textureDataCache[key] == (id)NSNull.null) {
+            [self.textureDataCache removeObjectForKey:key];
+        }
+    }
+    [self.textureMissLogTimes removeAllObjects];
+}
+
+- (void)clearTextureCache {
+    [self.textureCache removeAllObjects];
+    [self.textureDataCache removeAllObjects];
+    [self.textureMissLogTimes removeAllObjects];
+}
+
 - (void)setTextureDirectory:(NSString*)path {
     if ([path isEqualToString:_textureDirectory]) {
         return;
     }
     _textureDirectory = [path copy];
+    // Clear only "not found" entries so previously loaded textures survive
     NSArray* keys = self.textureCache.allKeys;
     for (NSString* key in keys) {
         if (self.textureCache[key] == (id)NSNull.null) {
@@ -3111,7 +3936,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     uint32_t targetSamplesPerTexel;
     uint32_t batchSamplesPerTexel;
     uint32_t bounceCount;
-    float bakeDensity;
+    int bakeDensity;
     float skyBrightness;
     float diffuseBounceIntensity;
     uint64_t bakeGeneration;
@@ -3404,7 +4229,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
             NSNumber* materialIndexValue = nil;
             uint32_t bakeMaterialIndex = 0u;
             NSString* brushKey = nil;
-            if (sledgehammer_geometry_face_range_is_bake_excluded(&range)) {
+            if (viewport_face_range_is_bake_excluded(&range)) {
                 continue;
             }
             if (range.vertexCount < 3u || range.vertexStart >= vertexCount) {
@@ -3435,22 +4260,22 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                 const VmfEntity* entity = &vmfSceneSnapshot->entities[range.entityIndex];
                 if (range.solidIndex < entity->solidCount) {
                     const VmfSolid* solid = &entity->solids[range.solidIndex];
-                    SledgehammerBakePolygon* exposedFragments = (SledgehammerBakePolygon*)malloc(SLEDGEHAMMER_BAKE_MAX_FRAGMENTS * sizeof(SledgehammerBakePolygon));
+                    ViewportBakePolygon* exposedFragments = (ViewportBakePolygon*)malloc(kViewportBakeMaxFragments * sizeof(ViewportBakePolygon));
                     size_t exposedFragmentCount = 0u;
                     Vec3 faceNormal;
                     if (exposedFragments != NULL &&
-                        sledgehammer_geometry_collect_exposed_fragments(vmfSceneSnapshot,
-                                                                        range.entityIndex,
-                                                                        range.solidIndex,
-                                                                        range.sideIndex,
-                                                                        exposedFragments,
-                                                                        SLEDGEHAMMER_BAKE_MAX_FRAGMENTS,
-                                                                        &exposedFragmentCount,
-                                                                        &faceNormal)) {
+                        viewport_bake_collect_exposed_fragments(vmfSceneSnapshot,
+                                                                range.entityIndex,
+                                                                range.solidIndex,
+                                                                range.sideIndex,
+                                                                exposedFragments,
+                                                                kViewportBakeMaxFragments,
+                                                                &exposedFragmentCount,
+                                                                &faceNormal)) {
                         const VmfSide* side = &solid->sides[range.sideIndex];
                         emittedExposedSceneGeometry = YES;
                         for (size_t fragmentIndex = 0u; fragmentIndex < exposedFragmentCount; ++fragmentIndex) {
-                            const SledgehammerBakePolygon* fragment = &exposedFragments[fragmentIndex];
+                            const ViewportBakePolygon* fragment = &exposedFragments[fragmentIndex];
                             if (fragment->pointCount < 3u) {
                                 continue;
                             }
@@ -3483,7 +4308,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                                 for (size_t triVertex = 0u; triVertex < 3u; ++triVertex) {
                                     float u = 0.0f;
                                     float v = 0.0f;
-                                    sledgehammer_geometry_bake_compute_uv(positions[triVertex], side, &u, &v);
+                                    viewport_bake_compute_uv(positions[triVertex], side, &u, &v);
                                     rtBakeVertices[rtBakeVertexCount].position = simd_make_float4(positions[triVertex].raw[0], positions[triVertex].raw[1], positions[triVertex].raw[2], 1.0f);
                                     rtBakeVertices[rtBakeVertexCount].normal = simd_make_float4(faceNormal.raw[0], faceNormal.raw[1], faceNormal.raw[2], 0.0f);
                                     rtBakeVertices[rtBakeVertexCount].tangent = simd_make_float4(1.0f, 0.0f, 0.0f, 1.0f);
@@ -3561,9 +4386,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                 }
 
                 uint32_t entityIndex = modelObjectEntitySnapshot[objectIndex];
-                NSString* modelKey = object->name[0] != '\0'
-                    ? [NSString stringWithUTF8String:object->name]
-                    : [NSString stringWithFormat:@"model_%u_%u", entityIndex, objectIndex];
+                NSString* modelKey = [NSString stringWithFormat:@"model_%u_%u", entityIndex, objectIndex];
                 uint32_t triangleStart = (uint32_t)(rtBakeVertexCount / 3u);
                 uint32_t emittedTriangleCount = 0u;
                 float translationX = object->worldMatrix[12];
@@ -3726,7 +4549,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         }
 
         for (size_t faceIndex = 0; faceIndex < faceRangeCount; ++faceIndex) {
-            if (sledgehammer_geometry_face_range_is_bake_excluded(&faceRangesSnapshot[faceIndex])) {
+            if (viewport_face_range_is_bake_excluded(&faceRangesSnapshot[faceIndex])) {
                 continue;
             }
             totalTriangles += (uint32_t)(faceRangesSnapshot[faceIndex].vertexCount / 3u);
@@ -3788,9 +4611,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                 }
 
                 uint32_t entityIndex = modelObjectEntitySnapshot[objectIndex];
-                NSString* modelKey = object->name[0] != '\0'
-                    ? [NSString stringWithUTF8String:object->name]
-                    : [NSString stringWithFormat:@"model_%u_%u", entityIndex, objectIndex];
+                NSString* modelKey = [NSString stringWithFormat:@"model_%u_%u", entityIndex, objectIndex];
 
                 totalTriangles += objectVertexCount / 3u;
                 for (uint32_t localVertex = 0u; localVertex < objectVertexCount; ++localVertex) {
@@ -3829,7 +4650,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
             int bakeWidth;
             int bakeHeight;
 
-            if (sledgehammer_geometry_face_range_is_bake_excluded(&range)) {
+            if (viewport_face_range_is_bake_excluded(&range)) {
                 continue;
             }
             if (range.vertexCount < 3u || range.vertexStart >= vertexCount) {
@@ -3850,7 +4671,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
 
             slotValue = brushSlotByKey[brushKey];
             if (slotValue == nil) {
-                float resolution = fminf(kPreviewBakeDensityMax, fmaxf(kPreviewBakeDensityMin, bakeDensity));
+                int resolution = (int)fmin((double)kPreviewBakeDensityMax, fmax((double)kPreviewBakeDensityMin, (double)bakeDensity));
                 int chartWidth = kPreviewBakeMinResolution;
                 int chartHeight = kPreviewBakeMinResolution;
                 viewport_preview_bake_chart_size_for_range(verticesSnapshot, range, resolution, &chartWidth, &chartHeight);
@@ -3876,18 +4697,18 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                 const VmfEntity* entity = &vmfSceneSnapshot->entities[range.entityIndex];
                 if (range.solidIndex < entity->solidCount) {
                     const VmfSolid* solid = &entity->solids[range.solidIndex];
-                    SledgehammerBakePolygon* exposedFragments = (SledgehammerBakePolygon*)malloc(SLEDGEHAMMER_BAKE_MAX_FRAGMENTS * sizeof(SledgehammerBakePolygon));
+                    ViewportBakePolygon* exposedFragments = (ViewportBakePolygon*)malloc(kViewportBakeMaxFragments * sizeof(ViewportBakePolygon));
                     size_t exposedFragmentCount = 0u;
                     Vec3 faceNormal;
                     if (exposedFragments != NULL &&
-                        sledgehammer_geometry_collect_exposed_fragments(vmfSceneSnapshot,
-                                                                        range.entityIndex,
-                                                                        range.solidIndex,
-                                                                        range.sideIndex,
-                                                                        exposedFragments,
-                                                                        SLEDGEHAMMER_BAKE_MAX_FRAGMENTS,
-                                                                        &exposedFragmentCount,
-                                                                        &faceNormal)) {
+                        viewport_bake_collect_exposed_fragments(vmfSceneSnapshot,
+                                                                range.entityIndex,
+                                                                range.solidIndex,
+                                                                range.sideIndex,
+                                                                exposedFragments,
+                                                                kViewportBakeMaxFragments,
+                                                                &exposedFragmentCount,
+                                                                &faceNormal)) {
                         const VmfSide* side = &solid->sides[range.sideIndex];
                         Vec3 faceColor = viewport_color_from_material(side->material);
                         uint32_t trianglePrimitiveId = (brushTriangleStartByKey[brushKey] != nil ? brushTriangleStartByKey[brushKey].unsignedIntValue : 0u);
@@ -3900,7 +4721,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
 
                         usedExposedReceiverFragments = YES;
                         for (size_t fragmentIndex = 0u; fragmentIndex < exposedFragmentCount; ++fragmentIndex) {
-                            const SledgehammerBakePolygon* fragment = &exposedFragments[fragmentIndex];
+                            const ViewportBakePolygon* fragment = &exposedFragments[fragmentIndex];
                             if (fragment->pointCount < 3u) {
                                 continue;
                             }
@@ -3914,7 +4735,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                                 float triU[3];
                                 float triV[3];
                                 for (size_t triVertex = 0u; triVertex < 3u; ++triVertex) {
-                                    sledgehammer_geometry_bake_compute_uv(triPositions[triVertex], side, &triU[triVertex], &triV[triVertex]);
+                                    viewport_bake_compute_uv(triPositions[triVertex], side, &triU[triVertex], &triV[triVertex]);
                                 }
 
                                 float x0 = ((triU[0] - uvMinU) / uvSpanU) * (float)bakeWidth;
@@ -4194,7 +5015,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                 float translationX;
                 float translationY;
                 float translationZ;
-                float resolution;
+                int resolution;
 
                 if (modelObjectFlagsSnapshot[objectIndex] == 0u) {
                     continue;
@@ -4214,9 +5035,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                     continue;
                 }
 
-                modelKey = object->name[0] != '\0'
-                    ? [NSString stringWithUTF8String:object->name]
-                    : [NSString stringWithFormat:@"model_%u_%u", modelObjectEntitySnapshot[objectIndex], objectIndex];
+                modelKey = [NSString stringWithFormat:@"model_%u_%u", modelObjectEntitySnapshot[objectIndex], objectIndex];
                 slotValue = brushSlotByKey[modelKey];
                 if (slotValue == nil) {
                     float minU = FLT_MAX;
@@ -4246,12 +5065,12 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                         worldArea += 0.5f * vec3_length(crossEdge);
                     }
 
-                    resolution = fminf(kPreviewBakeDensityMax, fmaxf(kPreviewBakeDensityMin, bakeDensity));
+                    resolution = (int)fmin((double)kPreviewBakeDensityMax, fmax((double)kPreviewBakeDensityMin, (double)bakeDensity));
                     {
                         float uvSpanU = fmaxf(maxU - minU, 1e-4f);
                         float uvSpanV = fmaxf(maxV - minV, 1e-4f);
                         float aspect = uvSpanU / uvSpanV;
-                        float targetTexelCount = fmaxf(worldArea, 1.0f) * resolution * resolution;
+                        float targetTexelCount = fmaxf(worldArea, 1.0f) * (float)resolution * (float)resolution;
                         chartWidth = (int)ceilf(sqrtf(targetTexelCount * aspect));
                         chartHeight = (int)ceilf(sqrtf(targetTexelCount / fmaxf(aspect, 1e-4f)));
                     }
@@ -4608,7 +5427,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                     uniforms->diffuseBounceScale = 1.05f * diffuseBounceIntensity;
                     uniforms->indirectScale = 1.95f;
                     uniforms->skyAmbientScale = skyBrightness;
-                        uniforms->padding = simd_make_float3(0.0f, 0.0f, 0.0f);
+                    uniforms->padding = simd_make_float3(0.0f, 0.0f, 0.0f);
                 }
 
                 id<MTLCommandBuffer> commandBuffer = [self.commandQueue commandBuffer];
@@ -4876,6 +5695,25 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     });
 }
 
+- (void)setLightmapDebugWindowVisible:(BOOL)visible {
+    self.previewBakeDebugWindowOpen = visible;
+    if (!visible) {
+        [self.previewBakePanel orderOut:nil];
+        return;
+    }
+
+    [self buildPreviewBakePanelIfNeeded];
+    [self syncPreviewBakePanel];
+    if (self.window != nil) {
+        [self.window addChildWindow:self.previewBakePanel ordered:NSWindowAbove];
+    }
+    [self.previewBakePanel makeKeyAndOrderFront:nil];
+}
+
+- (BOOL)isLightmapDebugWindowVisible {
+    return self.previewBakePanel != nil && self.previewBakePanel.visible;
+}
+
 - (void)syncHeavyRendererSceneFromMesh:(const ViewerMesh*)mesh {
     NovaSceneObjectRecord* objectRecords = NULL;
     char materialNames[UI_MAX_LIGHTS][128] = {{0}};
@@ -5109,7 +5947,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
             }
             if (cachedSceneValue != (id)NSNull.null) {
                 sourceModelScene = (NovaSceneData*)[(NSValue*)cachedSceneValue pointerValue];
-                sourceModelCenter = sledgehammer_renderer_bridge_scene_bounds_center(sourceModelScene);
+                sourceModelCenter = viewport_scene_bounds_center(sourceModelScene);
             }
         }
 
@@ -5155,8 +5993,8 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                     sourceMaterial->baseColorTexture >= 0 &&
                     (uint32_t)sourceMaterial->baseColorTexture < sourceModelScene->textureCount) {
                     NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->baseColorTexture];
-                    modelTextureInfo = sledgehammer_renderer_bridge_texture_dictionary_from_scene_texture(&sourceModelScene->textures[sourceMaterial->baseColorTexture]);
-                    materialBaseColorTextureIndices[materialIndex] = sledgehammer_renderer_bridge_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
+                    modelTextureInfo = viewport_texture_dictionary_from_scene_texture(&sourceModelScene->textures[sourceMaterial->baseColorTexture]);
+                    materialBaseColorTextureIndices[materialIndex] = viewport_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
                     NSString* viewportTextureKey = [NSString stringWithFormat:@"__modelvp__/%@#%d", assetPathString, range.sourceMaterialIndex];
                     id<MTLTexture> viewportTexture = [self textureFromSceneTexture:&sourceModelScene->textures[sourceMaterial->baseColorTexture]];
                     self.textureCache[viewportTextureKey] = viewportTexture != nil ? viewportTexture : (id)NSNull.null;
@@ -5165,36 +6003,36 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                     sourceMaterial->metallicRoughnessTexture >= 0 &&
                     (uint32_t)sourceMaterial->metallicRoughnessTexture < sourceModelScene->textureCount) {
                     NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->metallicRoughnessTexture];
-                    modelTextureInfo = sledgehammer_renderer_bridge_texture_dictionary_from_scene_texture(&sourceModelScene->textures[sourceMaterial->metallicRoughnessTexture]);
-                    materialMetallicRoughnessTextureIndices[materialIndex] = sledgehammer_renderer_bridge_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
+                    modelTextureInfo = viewport_texture_dictionary_from_scene_texture(&sourceModelScene->textures[sourceMaterial->metallicRoughnessTexture]);
+                    materialMetallicRoughnessTextureIndices[materialIndex] = viewport_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
                 }
                 if (materialNormalTextureIndices[materialIndex] < 0 &&
                     sourceMaterial->normalTexture >= 0 &&
                     (uint32_t)sourceMaterial->normalTexture < sourceModelScene->textureCount) {
                     NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->normalTexture];
-                    modelTextureInfo = sledgehammer_renderer_bridge_texture_dictionary_from_scene_texture(&sourceModelScene->textures[sourceMaterial->normalTexture]);
-                    materialNormalTextureIndices[materialIndex] = sledgehammer_renderer_bridge_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
+                    modelTextureInfo = viewport_texture_dictionary_from_scene_texture(&sourceModelScene->textures[sourceMaterial->normalTexture]);
+                    materialNormalTextureIndices[materialIndex] = viewport_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
                 }
                 if (materialEmissiveTextureIndices[materialIndex] < 0 &&
                     sourceMaterial->emissiveTexture >= 0 &&
                     (uint32_t)sourceMaterial->emissiveTexture < sourceModelScene->textureCount) {
                     NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->emissiveTexture];
-                    modelTextureInfo = sledgehammer_renderer_bridge_texture_dictionary_from_scene_texture(&sourceModelScene->textures[sourceMaterial->emissiveTexture]);
-                    materialEmissiveTextureIndices[materialIndex] = sledgehammer_renderer_bridge_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
+                    modelTextureInfo = viewport_texture_dictionary_from_scene_texture(&sourceModelScene->textures[sourceMaterial->emissiveTexture]);
+                    materialEmissiveTextureIndices[materialIndex] = viewport_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
                 }
                 if (materialOcclusionTextureIndices[materialIndex] < 0 &&
                     sourceMaterial->occlusionTexture >= 0 &&
                     (uint32_t)sourceMaterial->occlusionTexture < sourceModelScene->textureCount) {
                     NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->occlusionTexture];
-                    modelTextureInfo = sledgehammer_renderer_bridge_texture_dictionary_from_scene_texture(&sourceModelScene->textures[sourceMaterial->occlusionTexture]);
-                    materialOcclusionTextureIndices[materialIndex] = sledgehammer_renderer_bridge_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
+                    modelTextureInfo = viewport_texture_dictionary_from_scene_texture(&sourceModelScene->textures[sourceMaterial->occlusionTexture]);
+                    materialOcclusionTextureIndices[materialIndex] = viewport_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
                 }
                 if (materialTransmissionTextureIndices[materialIndex] < 0 &&
                     sourceMaterial->transmissionTexture >= 0 &&
                     (uint32_t)sourceMaterial->transmissionTexture < sourceModelScene->textureCount) {
                     NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->transmissionTexture];
-                    modelTextureInfo = sledgehammer_renderer_bridge_texture_dictionary_from_scene_texture(&sourceModelScene->textures[sourceMaterial->transmissionTexture]);
-                    materialTransmissionTextureIndices[materialIndex] = sledgehammer_renderer_bridge_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
+                    modelTextureInfo = viewport_texture_dictionary_from_scene_texture(&sourceModelScene->textures[sourceMaterial->transmissionTexture]);
+                    materialTransmissionTextureIndices[materialIndex] = viewport_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
                 }
             }
         }
@@ -5389,7 +6227,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                 primitiveCountValue = modelAssetPrimitiveCounts[assetPathString];
 
                 if (vertexStartValue == nil || primitiveStartValue == nil || vertexCountValue == nil || primitiveCountValue == nil) {
-                    Vec3 modelCenter = sledgehammer_renderer_bridge_scene_bounds_center(sourceModelScene);
+                    Vec3 modelCenter = viewport_scene_bounds_center(sourceModelScene);
                     uint32_t sourceMaterialCount = sourceModelScene->materialCount > 0u ? sourceModelScene->materialCount : 1u;
                     uint32_t defaultModelMaterialIndex = 0u;
                     uint32_t* materialRemap = (uint32_t*)malloc(sizeof(uint32_t) * sourceMaterialCount);
@@ -5455,38 +6293,38 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                                     if (sourceMaterial->baseColorTexture >= 0 &&
                                         (uint32_t)sourceMaterial->baseColorTexture < sourceModelScene->textureCount) {
                                         NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->baseColorTexture];
-                                        modelTextureInfo = sledgehammer_renderer_bridge_texture_dictionary_from_scene_texture(&sourceModelScene->textures[sourceMaterial->baseColorTexture]);
-                                        materialBaseColorTextureIndices[resolvedMaterialIndex] = sledgehammer_renderer_bridge_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
+                                        modelTextureInfo = viewport_texture_dictionary_from_scene_texture(&sourceModelScene->textures[sourceMaterial->baseColorTexture]);
+                                        materialBaseColorTextureIndices[resolvedMaterialIndex] = viewport_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
                                     }
                                     if (sourceMaterial->metallicRoughnessTexture >= 0 &&
                                         (uint32_t)sourceMaterial->metallicRoughnessTexture < sourceModelScene->textureCount) {
                                         NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->metallicRoughnessTexture];
-                                        modelTextureInfo = sledgehammer_renderer_bridge_texture_dictionary_from_scene_texture(&sourceModelScene->textures[sourceMaterial->metallicRoughnessTexture]);
-                                        materialMetallicRoughnessTextureIndices[resolvedMaterialIndex] = sledgehammer_renderer_bridge_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
+                                        modelTextureInfo = viewport_texture_dictionary_from_scene_texture(&sourceModelScene->textures[sourceMaterial->metallicRoughnessTexture]);
+                                        materialMetallicRoughnessTextureIndices[resolvedMaterialIndex] = viewport_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
                                     }
                                     if (sourceMaterial->normalTexture >= 0 &&
                                         (uint32_t)sourceMaterial->normalTexture < sourceModelScene->textureCount) {
                                         NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->normalTexture];
-                                        modelTextureInfo = sledgehammer_renderer_bridge_texture_dictionary_from_scene_texture(&sourceModelScene->textures[sourceMaterial->normalTexture]);
-                                        materialNormalTextureIndices[resolvedMaterialIndex] = sledgehammer_renderer_bridge_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
+                                        modelTextureInfo = viewport_texture_dictionary_from_scene_texture(&sourceModelScene->textures[sourceMaterial->normalTexture]);
+                                        materialNormalTextureIndices[resolvedMaterialIndex] = viewport_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
                                     }
                                     if (sourceMaterial->emissiveTexture >= 0 &&
                                         (uint32_t)sourceMaterial->emissiveTexture < sourceModelScene->textureCount) {
                                         NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->emissiveTexture];
-                                        modelTextureInfo = sledgehammer_renderer_bridge_texture_dictionary_from_scene_texture(&sourceModelScene->textures[sourceMaterial->emissiveTexture]);
-                                        materialEmissiveTextureIndices[resolvedMaterialIndex] = sledgehammer_renderer_bridge_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
+                                        modelTextureInfo = viewport_texture_dictionary_from_scene_texture(&sourceModelScene->textures[sourceMaterial->emissiveTexture]);
+                                        materialEmissiveTextureIndices[resolvedMaterialIndex] = viewport_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
                                     }
                                     if (sourceMaterial->occlusionTexture >= 0 &&
                                         (uint32_t)sourceMaterial->occlusionTexture < sourceModelScene->textureCount) {
                                         NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->occlusionTexture];
-                                        modelTextureInfo = sledgehammer_renderer_bridge_texture_dictionary_from_scene_texture(&sourceModelScene->textures[sourceMaterial->occlusionTexture]);
-                                        materialOcclusionTextureIndices[resolvedMaterialIndex] = sledgehammer_renderer_bridge_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
+                                        modelTextureInfo = viewport_texture_dictionary_from_scene_texture(&sourceModelScene->textures[sourceMaterial->occlusionTexture]);
+                                        materialOcclusionTextureIndices[resolvedMaterialIndex] = viewport_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
                                     }
                                     if (sourceMaterial->transmissionTexture >= 0 &&
                                         (uint32_t)sourceMaterial->transmissionTexture < sourceModelScene->textureCount) {
                                         NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->transmissionTexture];
-                                        modelTextureInfo = sledgehammer_renderer_bridge_texture_dictionary_from_scene_texture(&sourceModelScene->textures[sourceMaterial->transmissionTexture]);
-                                        materialTransmissionTextureIndices[resolvedMaterialIndex] = sledgehammer_renderer_bridge_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
+                                        modelTextureInfo = viewport_texture_dictionary_from_scene_texture(&sourceModelScene->textures[sourceMaterial->transmissionTexture]);
+                                        materialTransmissionTextureIndices[resolvedMaterialIndex] = viewport_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
                                     }
                                 }
 
@@ -5916,9 +6754,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
             }
 
             if (objectBrushSolid[objectIndex] == UINT32_MAX || objectBrushSide[objectIndex] == UINT32_MAX) {
-                faceSideKey = _importedSceneData.objects[objectIndex].name[0] != '\0'
-                    ? [NSString stringWithUTF8String:_importedSceneData.objects[objectIndex].name]
-                    : [NSString stringWithFormat:@"model_%u_%u", objectBrushEntity[objectIndex], objectIndex];
+                faceSideKey = [NSString stringWithFormat:@"model_%u_%u", objectBrushEntity[objectIndex], objectIndex];
                 usesModelLightmapUv = YES;
             } else {
                 faceSideKey = [NSString stringWithFormat:@"brush_%u_%u_%u", objectBrushEntity[objectIndex], objectBrushSolid[objectIndex], objectBrushSide[objectIndex]];
@@ -5961,10 +6797,10 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
             }
             objectBakedLightmapIndices[objectIndex] = bakedTextureIndex.intValue;
             objectRecords[objectIndex].bakedLightmap[0] = (float)bakedTextureIndex.intValue;
-            objectRecords[objectIndex].bakedLightmap[1] = usesModelLightmapUv ? chartOriginU : 0.0f;
-            objectRecords[objectIndex].bakedLightmap[2] = usesModelLightmapUv ? chartOriginV : 0.0f;
-            objectRecords[objectIndex].bakedLightmap[3] = usesModelLightmapUv ? chartScaleU : 1.0f;
-            objectRecords[objectIndex].bakedLightmap[4] = usesModelLightmapUv ? chartScaleV : 1.0f;
+            objectRecords[objectIndex].bakedLightmap[1] = chartOriginU;
+            objectRecords[objectIndex].bakedLightmap[2] = chartOriginV;
+            objectRecords[objectIndex].bakedLightmap[3] = chartScaleU;
+            objectRecords[objectIndex].bakedLightmap[4] = chartScaleV;
 
             {
                 uint32_t vertexStart = _importedSceneData.objects[objectIndex].vertexOffset;
@@ -5997,13 +6833,8 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                             float sourceV = usesModelLightmapUv ? vertex->lightmapUv[1] : vertex->uv[1];
                             float normalizedU = (sourceU - minU) * invSpanU;
                             float normalizedV = (sourceV - minV) * invSpanV;
-                            if (usesModelLightmapUv) {
-                                vertex->lightmapUv[0] = normalizedU;
-                                vertex->lightmapUv[1] = normalizedV;
-                            } else {
-                                vertex->lightmapUv[0] = chartOriginU + normalizedU * chartScaleU;
-                                vertex->lightmapUv[1] = chartOriginV + normalizedV * chartScaleV;
-                            }
+                            vertex->lightmapUv[0] = chartOriginU + normalizedU * chartScaleU;
+                            vertex->lightmapUv[1] = chartOriginV + normalizedV * chartScaleV;
                         }
                     }
                 }
@@ -6127,7 +6958,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
             materialRecord->transmission = material->transmission;
             materialRecord->ior = material->ior;
 
-            sledgehammer_renderer_bridge_init_imported_material_gpu_defaults(materialGpu);
+            viewport_init_imported_material_gpu_defaults(materialGpu);
             materialGpu->baseColor[0] = material->baseColorFactor[0];
             materialGpu->baseColor[1] = material->baseColorFactor[1];
             materialGpu->baseColor[2] = material->baseColorFactor[2];
@@ -6185,36 +7016,36 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
 
                 if (sourceMaterial->baseColorTexture >= 0 && (uint32_t)sourceMaterial->baseColorTexture < sourceScene.textureCount) {
                     NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->baseColorTexture];
-                    modelTextureInfo = sledgehammer_renderer_bridge_texture_dictionary_from_scene_texture(&sourceScene.textures[sourceMaterial->baseColorTexture]);
-                    baseColorTextureIndex = sledgehammer_renderer_bridge_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
+                    modelTextureInfo = viewport_texture_dictionary_from_scene_texture(&sourceScene.textures[sourceMaterial->baseColorTexture]);
+                    baseColorTextureIndex = viewport_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
                     NSString* viewportTextureKey = [NSString stringWithFormat:@"__modelvp__/%@#%d", assetPathString, materialSourceMaterialIndices[materialIndex]];
                     id<MTLTexture> viewportTexture = [self textureFromSceneTexture:&sourceScene.textures[sourceMaterial->baseColorTexture]];
                     self.textureCache[viewportTextureKey] = viewportTexture != nil ? viewportTexture : (id)NSNull.null;
                 }
                 if (sourceMaterial->metallicRoughnessTexture >= 0 && (uint32_t)sourceMaterial->metallicRoughnessTexture < sourceScene.textureCount) {
                     NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->metallicRoughnessTexture];
-                    modelTextureInfo = sledgehammer_renderer_bridge_texture_dictionary_from_scene_texture(&sourceScene.textures[sourceMaterial->metallicRoughnessTexture]);
-                    metallicRoughnessTextureIndex = sledgehammer_renderer_bridge_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
+                    modelTextureInfo = viewport_texture_dictionary_from_scene_texture(&sourceScene.textures[sourceMaterial->metallicRoughnessTexture]);
+                    metallicRoughnessTextureIndex = viewport_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
                 }
                 if (sourceMaterial->normalTexture >= 0 && (uint32_t)sourceMaterial->normalTexture < sourceScene.textureCount) {
                     NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->normalTexture];
-                    modelTextureInfo = sledgehammer_renderer_bridge_texture_dictionary_from_scene_texture(&sourceScene.textures[sourceMaterial->normalTexture]);
-                    normalTextureIndex = sledgehammer_renderer_bridge_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
+                    modelTextureInfo = viewport_texture_dictionary_from_scene_texture(&sourceScene.textures[sourceMaterial->normalTexture]);
+                    normalTextureIndex = viewport_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
                 }
                 if (sourceMaterial->emissiveTexture >= 0 && (uint32_t)sourceMaterial->emissiveTexture < sourceScene.textureCount) {
                     NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->emissiveTexture];
-                    modelTextureInfo = sledgehammer_renderer_bridge_texture_dictionary_from_scene_texture(&sourceScene.textures[sourceMaterial->emissiveTexture]);
-                    emissiveTextureIndex = sledgehammer_renderer_bridge_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
+                    modelTextureInfo = viewport_texture_dictionary_from_scene_texture(&sourceScene.textures[sourceMaterial->emissiveTexture]);
+                    emissiveTextureIndex = viewport_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
                 }
                 if (sourceMaterial->occlusionTexture >= 0 && (uint32_t)sourceMaterial->occlusionTexture < sourceScene.textureCount) {
                     NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->occlusionTexture];
-                    modelTextureInfo = sledgehammer_renderer_bridge_texture_dictionary_from_scene_texture(&sourceScene.textures[sourceMaterial->occlusionTexture]);
-                    occlusionTextureIndex = sledgehammer_renderer_bridge_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
+                    modelTextureInfo = viewport_texture_dictionary_from_scene_texture(&sourceScene.textures[sourceMaterial->occlusionTexture]);
+                    occlusionTextureIndex = viewport_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
                 }
                 if (sourceMaterial->transmissionTexture >= 0 && (uint32_t)sourceMaterial->transmissionTexture < sourceScene.textureCount) {
                     NSString* textureKey = [NSString stringWithFormat:@"__modeltex__/%@#%d", assetPathString, sourceMaterial->transmissionTexture];
-                    modelTextureInfo = sledgehammer_renderer_bridge_texture_dictionary_from_scene_texture(&sourceScene.textures[sourceMaterial->transmissionTexture]);
-                    transmissionTextureIndex = sledgehammer_renderer_bridge_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
+                    modelTextureInfo = viewport_texture_dictionary_from_scene_texture(&sourceScene.textures[sourceMaterial->transmissionTexture]);
+                    transmissionTextureIndex = viewport_import_texture_dictionary(importedTextureIndices, importedTextures, textureKey, modelTextureInfo);
                 }
 
                 material->baseColorTexture = baseColorTextureIndex;
@@ -6237,7 +7068,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                 materialRecord->transmission = material->transmission;
                 materialRecord->ior = material->ior;
 
-                sledgehammer_renderer_bridge_init_imported_material_gpu_defaults(materialGpu);
+                viewport_init_imported_material_gpu_defaults(materialGpu);
                 materialGpu->baseColor[0] = material->baseColorFactor[0];
                 materialGpu->baseColor[1] = material->baseColorFactor[1];
                 materialGpu->baseColor[2] = material->baseColorFactor[2];
@@ -6305,7 +7136,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         materialRecord->baseColor[3] = 1.0f;
         materialRecord->roughness = 1.0f;
         materialRecord->ior = 1.45f;
-        sledgehammer_renderer_bridge_init_imported_material_gpu_defaults(materialGpu);
+        viewport_init_imported_material_gpu_defaults(materialGpu);
         materialGpu->baseColor[0] = material->baseColorFactor[0];
         materialGpu->baseColor[1] = material->baseColorFactor[1];
         materialGpu->baseColor[2] = material->baseColorFactor[2];
@@ -7856,4 +8687,3 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
 }
 
 @end
-#pragma clang diagnostic pop
