@@ -22,6 +22,10 @@ typedef struct SledgehammerBakePolygon {
 
 bool sledgehammer_geometry_face_range_is_bake_excluded(const ViewerFaceRange* range);
 void sledgehammer_geometry_bake_compute_uv(Vec3 position, const VmfSide* side, float* outU, float* outV);
+bool sledgehammer_geometry_bake_compute_lightmap_basis(const VmfSide* side,
+                                                       Vec3 faceNormal,
+                                                       Vec3* outTangent,
+                                                       Vec3* outBitangent);
 bool sledgehammer_geometry_collect_exposed_fragments(const VmfScene* scene,
                                                      size_t entityIndex,
                                                      size_t solidIndex,

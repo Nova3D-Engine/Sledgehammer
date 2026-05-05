@@ -129,7 +129,7 @@ typedef NS_ENUM(NSUInteger, ViewerClipMode) {
 @property(nonatomic, strong) NSButton* lightEnabledButton;
 @property(nonatomic, strong) NSButton* lightCastShadowsButton;
 @property(nonatomic, strong) NSLayoutConstraint* controlBarHeightConstraint;
-@property(nonatomic, strong) NSSegmentedControl* renderControl;
+@property(nonatomic, strong) NSPopUpButton* renderControl;
 @property(nonatomic, strong) NSPopUpButton* materialPopUp;
 @property(nonatomic, strong) NSPopUpButton* gridPopUp;
 @property(nonatomic, strong) NSButton* createMapButton;
@@ -238,7 +238,7 @@ typedef NS_ENUM(NSUInteger, ViewerClipMode) {
 @property(nonatomic, assign) int pluginDirectoryWatchFd;
 
 - (void)showError:(NSString*)message;
-- (NSModalResponse)runModelImportSettingsModalForURL:(NSURL*)url outAssetName:(NSString**)outAssetName outScale:(float*)outScale error:(NSString**)outError;
+- (NSModalResponse)runModelImportSettingsModalForURL:(NSURL*)url outAssetName:(NSString**)outAssetName outScale:(float*)outScale outUpAxisMode:(uint32_t*)outUpAxisMode error:(NSString**)outError;
 - (BOOL)confirmDiscardChangesForAction:(NSString*)actionDescription;
 - (void)createMenu;
 - (void)createWindow;

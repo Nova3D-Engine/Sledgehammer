@@ -361,6 +361,9 @@ static NSString* sledgehammer_model_import_size_string(const float boundsMin[3],
 }
 
 - (void)reloadContentBrowser {
+    if (self.contentBrowserItems == nil) {
+        self.contentBrowserItems = [NSMutableArray array];
+    }
     [self.contentBrowserItems removeAllObjects];
 
     NSString* modelsDirectory = [self contentBrowserRootDirectory];
@@ -455,9 +458,14 @@ static NSString* sledgehammer_model_import_size_string(const float boundsMin[3],
     NSMutableArray<NSString*>* failures = [NSMutableArray array];
     for (NSURL* url in panel.URLs) {
         float importScale = 1.0f;
+        uint32_t importUpAxisMode = NOVA_MODEL_IMPORT_UP_AXIS_AUTO;
         NSString* assetName = nil;
         NSString* modalError = nil;
-        NSModalResponse modalResponse = [self runModelImportSettingsModalForURL:url outAssetName:&assetName outScale:&importScale error:&modalError];
+        NSModalResponse modalResponse = [self runModelImportSettingsModalForURL:url
+                                                                    outAssetName:&assetName
+                                                                        outScale:&importScale
+                                                                   outUpAxisMode:&importUpAxisMode
+                                                                           error:&modalError];
         if (modalResponse == NSAlertThirdButtonReturn) {
             break;
         }
@@ -471,8 +479,21 @@ static NSString* sledgehammer_model_import_size_string(const float boundsMin[3],
         }
 
         NSString* targetPath = [[modelsDirectory stringByAppendingPathComponent:assetName] stringByAppendingPathExtension:kSledgehammerModelAssetExtension];
+        NSDictionary<NSFileAttributeKey, id>* sourceAttributes = [fileManager attributesOfItemAtPath:url.path error:nil];
+        NSDictionary<NSFileAttributeKey, id>* targetAttributes = [fileManager attributesOfItemAtPath:targetPath error:nil];
+        NSDictionary<NSFileAttributeKey, id>* executableAttributes = [fileManager attributesOfItemAtPath:NSBundle.mainBundle.executablePath error:nil];
+        NSDate* sourceModified = sourceAttributes[NSFileModificationDate];
+        NSDate* targetModified = targetAttributes[NSFileModificationDate];
+        NSDate* executableModified = executableAttributes[NSFileModificationDate];
+        BOOL targetUpToDateForSource = (sourceModified != nil && targetModified != nil && [targetModified compare:sourceModified] != NSOrderedAscending);
+        BOOL targetUpToDateForImporter = (executableModified == nil || targetModified == nil || [targetModified compare:executableModified] != NSOrderedAscending);
+        if (targetUpToDateForSource && targetUpToDateForImporter) {
+            continue;
+        }
+
         NovaModelAssetImportOptions options = {};
         options.uniformScale = importScale > 0.0f ? importScale : 1.0f;
+        options.upAxisMode = importUpAxisMode;
         char compileMessage[512] = {0};
         if (!nova_model_asset_compile_from_source_with_options(url.path.fileSystemRepresentation,
                                                                targetPath.fileSystemRepresentation,
@@ -491,7 +512,7 @@ static NSString* sledgehammer_model_import_size_string(const float boundsMin[3],
     }
 }
 
-- (NSModalResponse)runModelImportSettingsModalForURL:(NSURL*)url outAssetName:(NSString**)outAssetName outScale:(float*)outScale error:(NSString**)outError {
+- (NSModalResponse)runModelImportSettingsModalForURL:(NSURL*)url outAssetName:(NSString**)outAssetName outScale:(float*)outScale outUpAxisMode:(uint32_t*)outUpAxisMode error:(NSString**)outError {
     NSString* defaultAssetName;
 
     if (outAssetName != NULL) {
@@ -499,6 +520,9 @@ static NSString* sledgehammer_model_import_size_string(const float boundsMin[3],
     }
     if (outScale != NULL) {
         *outScale = 1.0f;
+    }
+    if (outUpAxisMode != NULL) {
+        *outUpAxisMode = NOVA_MODEL_IMPORT_UP_AXIS_AUTO;
     }
     if (outError != NULL) {
         *outError = nil;
@@ -546,6 +570,15 @@ static NSString* sledgehammer_model_import_size_string(const float boundsMin[3],
     scaleField.stringValue = [NSString stringWithFormat:@"%.4f", suggestedScale];
     scaleField.placeholderString = @"1.0";
 
+    NSTextField* upAxisLabel = [NSTextField labelWithString:@"Source Up Axis"];
+    NSPopUpButton* upAxisPopUp = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(0.0, 0.0, 220.0, 24.0) pullsDown:NO];
+    [upAxisPopUp addItemsWithTitles:@[@"Auto Detect", @"X Up", @"Y Up", @"Z Up"]];
+    [[upAxisPopUp itemAtIndex:0] setTag:NOVA_MODEL_IMPORT_UP_AXIS_AUTO];
+    [[upAxisPopUp itemAtIndex:1] setTag:NOVA_MODEL_IMPORT_UP_AXIS_X];
+    [[upAxisPopUp itemAtIndex:2] setTag:NOVA_MODEL_IMPORT_UP_AXIS_Y];
+    [[upAxisPopUp itemAtIndex:3] setTag:NOVA_MODEL_IMPORT_UP_AXIS_Z];
+    [upAxisPopUp selectItemAtIndex:0];
+
     NSTextField* nameLabel = [NSTextField labelWithString:@"Asset Name"];
     NSTextField* nameField = [[NSTextField alloc] initWithFrame:NSMakeRect(0.0, 0.0, 220.0, 24.0)];
     nameField.stringValue = defaultAssetName ?: @"model";
@@ -561,6 +594,8 @@ static NSString* sledgehammer_model_import_size_string(const float boundsMin[3],
     [stack addArrangedSubview:nameField];
     [stack addArrangedSubview:scaleLabel];
     [stack addArrangedSubview:scaleField];
+    [stack addArrangedSubview:upAxisLabel];
+    [stack addArrangedSubview:upAxisPopUp];
     [stack addArrangedSubview:hintLabel];
     alert.accessoryView = stack;
 
@@ -583,6 +618,14 @@ static NSString* sledgehammer_model_import_size_string(const float boundsMin[3],
         }
         if (outScale != NULL) {
             *outScale = chosenScale;
+        }
+        if (outUpAxisMode != NULL) {
+            NSInteger selectedIndex = upAxisPopUp.indexOfSelectedItem;
+            if (selectedIndex < 0 || selectedIndex >= (NSInteger)upAxisPopUp.numberOfItems) {
+                *outUpAxisMode = NOVA_MODEL_IMPORT_UP_AXIS_AUTO;
+            } else {
+                *outUpAxisMode = (uint32_t)[upAxisPopUp itemAtIndex:selectedIndex].tag;
+            }
         }
     }
     return response;

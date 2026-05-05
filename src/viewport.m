@@ -290,6 +290,32 @@ static int viewport_next_power_of_two_int(int value, int minValue, int maxValue)
     return (int)powerOfTwo;
 }
 
+static BOOL viewport_preview_bake_face_basis(const ViewerVertex* vertices,
+                                             ViewerFaceRange range,
+                                             Vec3* outOrigin,
+                                             Vec3* outNormal,
+                                             Vec3* outTangent,
+                                             Vec3* outBitangent);
+
+static void viewport_preview_bake_project_to_face_basis(Vec3 position,
+                                                        Vec3 origin,
+                                                        Vec3 tangent,
+                                                        Vec3 bitangent,
+                                                        float* outU,
+                                                        float* outV);
+
+static void viewport_preview_bake_stamp_world_brush_centroids(const ViewerVertex* vertices,
+                                                              const Vec3* baseColors,
+                                                              ViewerFaceRange range,
+                                                              float uvMinU,
+                                                              float uvMinV,
+                                                              float uvSpanU,
+                                                              float uvSpanV,
+                                                              int bakeWidth,
+                                                              int bakeHeight,
+                                                              uint32_t trianglePrimitiveStart,
+                                                              HwrtBakeTexelAccum* accum);
+
 static void viewport_preview_bake_face_world_extents(const ViewerVertex* vertices,
                                                      ViewerFaceRange range,
                                                      float* outExtentU,
@@ -300,6 +326,45 @@ static void viewport_preview_bake_face_world_extents(const ViewerVertex* vertice
         if (outExtentU != NULL) *outExtentU = extentU;
         if (outExtentV != NULL) *outExtentV = extentV;
         return;
+    }
+
+    Vec3 origin;
+    Vec3 tangent;
+    Vec3 bitangent;
+    if (!viewport_preview_bake_face_basis(vertices, range, &origin, NULL, &tangent, &bitangent)) {
+        if (outExtentU != NULL) *outExtentU = extentU;
+        if (outExtentV != NULL) *outExtentV = extentV;
+        return;
+    }
+
+    float minU = FLT_MAX;
+    float maxU = -FLT_MAX;
+    float minV = FLT_MAX;
+    float maxV = -FLT_MAX;
+    for (size_t vertexOffset = 0u; vertexOffset < range.vertexCount; ++vertexOffset) {
+        Vec3 delta = vec3_sub(vertices[range.vertexStart + vertexOffset].position, origin);
+        float localU = vec3_dot(delta, tangent);
+        float localV = vec3_dot(delta, bitangent);
+        minU = fminf(minU, localU);
+        maxU = fmaxf(maxU, localU);
+        minV = fminf(minV, localV);
+        maxV = fmaxf(maxV, localV);
+    }
+
+    extentU = fmaxf(maxU - minU, 1.0f);
+    extentV = fmaxf(maxV - minV, 1.0f);
+    if (outExtentU != NULL) *outExtentU = extentU;
+    if (outExtentV != NULL) *outExtentV = extentV;
+}
+
+static BOOL viewport_preview_bake_face_basis(const ViewerVertex* vertices,
+                                             ViewerFaceRange range,
+                                             Vec3* outOrigin,
+                                             Vec3* outNormal,
+                                             Vec3* outTangent,
+                                             Vec3* outBitangent) {
+    if (vertices == NULL || range.vertexCount < 3u) {
+        return NO;
     }
 
     Vec3 origin = vertices[range.vertexStart].position;
@@ -331,30 +396,90 @@ static void viewport_preview_bake_face_world_extents(const ViewerVertex* vertice
         tangent = fabsf(faceNormal.raw[2]) < 0.999f ? vec3_make(0.0f, 0.0f, 1.0f) : vec3_make(1.0f, 0.0f, 0.0f);
         tangent = vec3_normalize(vec3_cross(tangent, faceNormal));
     }
+
     Vec3 bitangent = vec3_normalize(vec3_cross(faceNormal, tangent));
     if (vec3_length(bitangent) < 1e-4f) {
         bitangent = fabsf(faceNormal.raw[0]) < 0.999f ? vec3_make(1.0f, 0.0f, 0.0f) : vec3_make(0.0f, 1.0f, 0.0f);
         bitangent = vec3_normalize(vec3_cross(faceNormal, bitangent));
     }
 
-    float minU = FLT_MAX;
-    float maxU = -FLT_MAX;
-    float minV = FLT_MAX;
-    float maxV = -FLT_MAX;
-    for (size_t vertexOffset = 0u; vertexOffset < range.vertexCount; ++vertexOffset) {
-        Vec3 delta = vec3_sub(vertices[range.vertexStart + vertexOffset].position, origin);
-        float localU = vec3_dot(delta, tangent);
-        float localV = vec3_dot(delta, bitangent);
-        minU = fminf(minU, localU);
-        maxU = fmaxf(maxU, localU);
-        minV = fminf(minV, localV);
-        maxV = fmaxf(maxV, localV);
+    if (outOrigin != NULL) *outOrigin = origin;
+    if (outNormal != NULL) *outNormal = faceNormal;
+    if (outTangent != NULL) *outTangent = tangent;
+    if (outBitangent != NULL) *outBitangent = bitangent;
+    return YES;
+}
+
+static void viewport_preview_bake_project_to_face_basis(Vec3 position,
+                                                        Vec3 origin,
+                                                        Vec3 tangent,
+                                                        Vec3 bitangent,
+                                                        float* outU,
+                                                        float* outV) {
+    Vec3 delta = vec3_sub(position, origin);
+    if (outU != NULL) {
+        *outU = vec3_dot(delta, tangent);
+    }
+    if (outV != NULL) {
+        *outV = vec3_dot(delta, bitangent);
+    }
+}
+
+static void viewport_preview_bake_stamp_world_brush_centroids(const ViewerVertex* vertices,
+                                                              const Vec3* baseColors,
+                                                              ViewerFaceRange range,
+                                                              float uvMinU,
+                                                              float uvMinV,
+                                                              float uvSpanU,
+                                                              float uvSpanV,
+                                                              int bakeWidth,
+                                                              int bakeHeight,
+                                                              uint32_t trianglePrimitiveStart,
+                                                              HwrtBakeTexelAccum* accum) {
+    if (vertices == NULL || baseColors == NULL || accum == NULL || bakeWidth <= 0 || bakeHeight <= 0 || range.vertexCount < 3u) {
+        return;
     }
 
-    extentU = fmaxf(maxU - minU, 1.0f);
-    extentV = fmaxf(maxV - minV, 1.0f);
-    if (outExtentU != NULL) *outExtentU = extentU;
-    if (outExtentV != NULL) *outExtentV = extentV;
+    for (size_t triOffset = 0u; triOffset + 2u < range.vertexCount; triOffset += 3u) {
+        const ViewerVertex* v0 = &vertices[range.vertexStart + triOffset + 0u];
+        const ViewerVertex* v1 = &vertices[range.vertexStart + triOffset + 1u];
+        const ViewerVertex* v2 = &vertices[range.vertexStart + triOffset + 2u];
+        const Vec3 a0 = baseColors[range.vertexStart + triOffset + 0u];
+        const Vec3 a1 = baseColors[range.vertexStart + triOffset + 1u];
+        const Vec3 a2 = baseColors[range.vertexStart + triOffset + 2u];
+        float centroidU = (v0->lightmapU + v1->lightmapU + v2->lightmapU) / 3.0f;
+        float centroidV = (v0->lightmapV + v1->lightmapV + v2->lightmapV) / 3.0f;
+        int px = (int)lrintf(((centroidU - uvMinU) / uvSpanU) * (float)bakeWidth);
+        int py = (int)lrintf(((centroidV - uvMinV) / uvSpanV) * (float)bakeHeight);
+        px = (int)fmin((double)(bakeWidth - 1), fmax(0.0, (double)px));
+        py = (int)fmin((double)(bakeHeight - 1), fmax(0.0, (double)py));
+
+        size_t texelIndex = (size_t)py * (size_t)bakeWidth + (size_t)px;
+        simd_float3 worldPos = (simd_make_float3(v0->position.raw[0], v0->position.raw[1], v0->position.raw[2]) +
+                                simd_make_float3(v1->position.raw[0], v1->position.raw[1], v1->position.raw[2]) +
+                                simd_make_float3(v2->position.raw[0], v2->position.raw[1], v2->position.raw[2])) / 3.0f;
+        simd_float3 normal = (simd_make_float3(v0->normal.raw[0], v0->normal.raw[1], v0->normal.raw[2]) +
+                              simd_make_float3(v1->normal.raw[0], v1->normal.raw[1], v1->normal.raw[2]) +
+                              simd_make_float3(v2->normal.raw[0], v2->normal.raw[1], v2->normal.raw[2])) / 3.0f;
+        simd_float3 albedo = (simd_make_float3(a0.raw[0], a0.raw[1], a0.raw[2]) +
+                              simd_make_float3(a1.raw[0], a1.raw[1], a1.raw[2]) +
+                              simd_make_float3(a2.raw[0], a2.raw[1], a2.raw[2])) / 3.0f;
+
+        if (accum[texelIndex].sourceTriangleIdPlusOne == 0u) {
+            accum[texelIndex].sourceTriangleIdPlusOne = trianglePrimitiveStart + (uint32_t)(triOffset / 3u) + 1u;
+        }
+
+        accum[texelIndex].worldPosWeight.x += worldPos.x;
+        accum[texelIndex].worldPosWeight.y += worldPos.y;
+        accum[texelIndex].worldPosWeight.z += worldPos.z;
+        accum[texelIndex].worldPosWeight.w += 1.0f;
+        accum[texelIndex].normalSum.x += normal.x;
+        accum[texelIndex].normalSum.y += normal.y;
+        accum[texelIndex].normalSum.z += normal.z;
+        accum[texelIndex].albedoSum.x += albedo.x;
+        accum[texelIndex].albedoSum.y += albedo.y;
+        accum[texelIndex].albedoSum.z += albedo.z;
+    }
 }
 
 static float preview_bake_density_from_index(int index) {
@@ -1718,7 +1843,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     }
 
     [self buildUI];
-    if (self.dimension == VmfViewportDimension3D && self.renderMode == VmfViewportRenderModeShaded) {
+    if (self.dimension == VmfViewportDimension3D && self.renderMode != VmfViewportRenderModeWireframe) {
         [self initializeHeavyRenderer];
     }
     [self refreshChrome];
@@ -2337,6 +2462,8 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
 - (void)windowWillClose:(NSNotification*)notification {
     if (notification.object == self.previewBakePanel) {
         self.previewBakeDebugWindowOpen = NO;
+        self.previewBakePanel.delegate = nil;
+        self.previewBakePanel = nil;
     }
 }
 
@@ -2383,7 +2510,15 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         ImGuizmo::SetOrthographic(false);
         ImGuizmo::SetDrawlist(ImGui::GetForegroundDrawList());
         ImGuizmo::SetRect(0.0f, 0.0f, viewportWidth, viewportHeight);
-        BOOL manipulated = ImGuizmo::Manipulate(viewMatrix, projectionMatrix, ImGuizmo::TRANSLATE, ImGuizmo::WORLD, objectMatrix);
+        float gridSnap = (float)fmax(1.0, self.gridSize);
+        float snapValues[3] = { gridSnap, gridSnap, gridSnap };
+        BOOL manipulated = ImGuizmo::Manipulate(viewMatrix,
+                            projectionMatrix,
+                            ImGuizmo::TRANSLATE,
+                            ImGuizmo::WORLD,
+                            objectMatrix,
+                            NULL,
+                            snapValues);
         self.gizmoHovered = ImGuizmo::IsOver();
         if (manipulated && self.delegate) {
             Vec3 translatedCenter = vec3_make(objectMatrix[12], objectMatrix[13], objectMatrix[14]);
@@ -2423,6 +2558,9 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
 
 - (void)setRenderMode:(VmfViewportRenderMode)renderMode {
     _renderMode = renderMode;
+    if (self.dimension == VmfViewportDimension3D && renderMode != VmfViewportRenderModeWireframe) {
+        [self initializeHeavyRenderer];
+    }
     [self refreshChrome];
 }
 
@@ -2437,7 +2575,12 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     self.titleLabel.textColor = self.active ? [NSColor colorWithRed:0.97 green:0.79 blue:0.53 alpha:1.0] : [NSColor colorWithWhite:0.92 alpha:1.0];
 
     NSString* dimensionLabel = self.dimension == VmfViewportDimension3D ? @"3D" : @"2D";
-    NSString* modeLabel = self.renderMode == VmfViewportRenderModeShaded ? @"SHADED" : @"WIRE";
+    NSString* modeLabel = @"WIRE";
+    if (self.renderMode == VmfViewportRenderModeShaded) {
+        modeLabel = @"SHADED";
+    } else if (self.renderMode == VmfViewportRenderModePathTraced) {
+        modeLabel = @"PATH";
+    }
     NSString* toolLabel = @"SELECT";
     if (self.editorTool == VmfViewportEditorToolVertex) {
         toolLabel = @"VERTEX";
@@ -3198,6 +3341,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         NSMutableDictionary<NSString*, NSNumber*>* brushUvMaxVByKey = [NSMutableDictionary dictionary];
         NSMutableDictionary<NSString*, NSNumber*>* brushTriangleStartByKey = [NSMutableDictionary dictionary];
         NSMutableDictionary<NSString*, NSNumber*>* brushTriangleCountByKey = [NSMutableDictionary dictionary];
+        NSMutableDictionary<NSString*, NSValue*>* worldFaceRangeByKey = [NSMutableDictionary dictionary];
         NSMutableArray<NSMutableData*>* brushAccums = [NSMutableArray array];
         NSMutableArray<NSString*>* brushKeys = [NSMutableArray array];
         NSMutableArray<NSNumber*>* brushWidths = [NSMutableArray array];
@@ -3427,6 +3571,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
             if (brushKey.length == 0) {
                 brushKey = @"brush_0_0_0";
             }
+            worldFaceRangeByKey[brushKey] = [NSValue valueWithBytes:&range objCType:@encode(ViewerFaceRange)];
             brushTriangleStartByKey[brushKey] = @((uint32_t)(rtBakeVertexCount / 3u));
             uint32_t emittedTriangleCount = 0u;
             BOOL emittedExposedSceneGeometry = NO;
@@ -3446,7 +3591,8 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                                                                         exposedFragments,
                                                                         SLEDGEHAMMER_BAKE_MAX_FRAGMENTS,
                                                                         &exposedFragmentCount,
-                                                                        &faceNormal)) {
+                                                                        &faceNormal) &&
+                        exposedFragmentCount > 0u) {
                         const VmfSide* side = &solid->sides[range.sideIndex];
                         emittedExposedSceneGeometry = YES;
                         for (size_t fragmentIndex = 0u; fragmentIndex < exposedFragmentCount; ++fragmentIndex) {
@@ -3744,14 +3890,14 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                         NSNumber* minVExisting = brushUvMinVByKey[brushKey];
                         NSNumber* maxUExisting = brushUvMaxUByKey[brushKey];
                         NSNumber* maxVExisting = brushUvMaxVByKey[brushKey];
-                        float minU = minUExisting != nil ? minUExisting.floatValue : v->u;
-                        float minV = minVExisting != nil ? minVExisting.floatValue : v->v;
-                        float maxU = maxUExisting != nil ? maxUExisting.floatValue : v->u;
-                        float maxV = maxVExisting != nil ? maxVExisting.floatValue : v->v;
-                        minU = fminf(minU, v->u);
-                        minV = fminf(minV, v->v);
-                        maxU = fmaxf(maxU, v->u);
-                        maxV = fmaxf(maxV, v->v);
+                        float minU = minUExisting != nil ? minUExisting.floatValue : v->lightmapU;
+                        float minV = minVExisting != nil ? minVExisting.floatValue : v->lightmapV;
+                        float maxU = maxUExisting != nil ? maxUExisting.floatValue : v->lightmapU;
+                        float maxV = maxVExisting != nil ? maxVExisting.floatValue : v->lightmapV;
+                        minU = fminf(minU, v->lightmapU);
+                        minV = fminf(minV, v->lightmapV);
+                        maxU = fmaxf(maxU, v->lightmapU);
+                        maxV = fmaxf(maxV, v->lightmapV);
                         brushUvMinUByKey[brushKey] = @(minU);
                         brushUvMinVByKey[brushKey] = @(minV);
                         brushUvMaxUByKey[brushKey] = @(maxU);
@@ -3897,6 +4043,24 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                         float uvMaxV = brushUvMaxVByKey[brushKey] != nil ? brushUvMaxVByKey[brushKey].floatValue : 1.0f;
                         float uvSpanU = fmaxf(uvMaxU - uvMinU, 1e-4f);
                         float uvSpanV = fmaxf(uvMaxV - uvMinV, 1e-4f);
+                        Vec3 lightmapOrigin = verticesSnapshot[range.vertexStart].position;
+                        Vec3 lightmapTangent;
+                        Vec3 lightmapBitangent;
+                        if (!sledgehammer_geometry_bake_compute_lightmap_basis(side,
+                                                                              faceNormal,
+                                                                              &lightmapTangent,
+                                                                              &lightmapBitangent)) {
+                            if (!viewport_preview_bake_face_basis(verticesSnapshot,
+                                                                  range,
+                                                                  &lightmapOrigin,
+                                                                  NULL,
+                                                                  &lightmapTangent,
+                                                                  &lightmapBitangent)) {
+                                lightmapOrigin = verticesSnapshot[range.vertexStart].position;
+                                lightmapTangent = vec3_make(1.0f, 0.0f, 0.0f);
+                                lightmapBitangent = vec3_make(0.0f, 1.0f, 0.0f);
+                            }
+                        }
 
                         usedExposedReceiverFragments = YES;
                         for (size_t fragmentIndex = 0u; fragmentIndex < exposedFragmentCount; ++fragmentIndex) {
@@ -3914,7 +4078,12 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                                 float triU[3];
                                 float triV[3];
                                 for (size_t triVertex = 0u; triVertex < 3u; ++triVertex) {
-                                    sledgehammer_geometry_bake_compute_uv(triPositions[triVertex], side, &triU[triVertex], &triV[triVertex]);
+                                    viewport_preview_bake_project_to_face_basis(triPositions[triVertex],
+                                                                                lightmapOrigin,
+                                                                                lightmapTangent,
+                                                                                lightmapBitangent,
+                                                                                &triU[triVertex],
+                                                                                &triV[triVertex]);
                                 }
 
                                 float x0 = ((triU[0] - uvMinU) / uvSpanU) * (float)bakeWidth;
@@ -4056,12 +4225,12 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                 float uvMaxV = brushUvMaxVByKey[brushKey] != nil ? brushUvMaxVByKey[brushKey].floatValue : 1.0f;
                 float uvSpanU = fmaxf(uvMaxU - uvMinU, 1e-4f);
                 float uvSpanV = fmaxf(uvMaxV - uvMinV, 1e-4f);
-                float x0 = ((v0->u - uvMinU) / uvSpanU) * (float)bakeWidth;
-                float y0 = ((v0->v - uvMinV) / uvSpanV) * (float)bakeHeight;
-                float x1 = ((v1->u - uvMinU) / uvSpanU) * (float)bakeWidth;
-                float y1 = ((v1->v - uvMinV) / uvSpanV) * (float)bakeHeight;
-                float x2 = ((v2->u - uvMinU) / uvSpanU) * (float)bakeWidth;
-                float y2 = ((v2->v - uvMinV) / uvSpanV) * (float)bakeHeight;
+                float x0 = ((v0->lightmapU - uvMinU) / uvSpanU) * (float)bakeWidth;
+                float y0 = ((v0->lightmapV - uvMinV) / uvSpanV) * (float)bakeHeight;
+                float x1 = ((v1->lightmapU - uvMinU) / uvSpanU) * (float)bakeWidth;
+                float y1 = ((v1->lightmapV - uvMinV) / uvSpanV) * (float)bakeHeight;
+                float x2 = ((v2->lightmapU - uvMinU) / uvSpanU) * (float)bakeWidth;
+                float y2 = ((v2->lightmapV - uvMinV) / uvSpanV) * (float)bakeHeight;
                 float denom = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2);
 
                 float minU = floorf(fminf(fminf(x0, x1), x2));
@@ -4417,6 +4586,38 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
             NSMutableData* texelData = [NSMutableData dataWithLength:texelCount * sizeof(HwrtBakeTexel)];
             HwrtBakeTexel* texels = (HwrtBakeTexel*)texelData.mutableBytes;
             uint32_t validTexelCount = 0u;
+
+            BOOL hasAnyAccumulatedTexels = NO;
+            for (size_t texelIndex = 0; texelIndex < texelCount; ++texelIndex) {
+                if (accum[texelIndex].worldPosWeight.w > 0.0f) {
+                    hasAnyAccumulatedTexels = YES;
+                    break;
+                }
+            }
+            if (!hasAnyAccumulatedTexels) {
+                NSValue* rangeValue = worldFaceRangeByKey[key];
+                if (rangeValue != nil) {
+                    ViewerFaceRange range;
+                    [rangeValue getValue:&range];
+                    float uvMinU = brushUvMinUByKey[key] != nil ? brushUvMinUByKey[key].floatValue : 0.0f;
+                    float uvMinV = brushUvMinVByKey[key] != nil ? brushUvMinVByKey[key].floatValue : 0.0f;
+                    float uvMaxU = brushUvMaxUByKey[key] != nil ? brushUvMaxUByKey[key].floatValue : 1.0f;
+                    float uvMaxV = brushUvMaxVByKey[key] != nil ? brushUvMaxVByKey[key].floatValue : 1.0f;
+                    float uvSpanU = fmaxf(uvMaxU - uvMinU, 1e-4f);
+                    float uvSpanV = fmaxf(uvMaxV - uvMinV, 1e-4f);
+                    viewport_preview_bake_stamp_world_brush_centroids(verticesSnapshot,
+                                                                     baseColorSnapshot,
+                                                                     range,
+                                                                     uvMinU,
+                                                                     uvMinV,
+                                                                     uvSpanU,
+                                                                     uvSpanV,
+                                                                     bakeWidth,
+                                                                     bakeHeight,
+                                                                     sourceTriangleStart,
+                                                                     accum);
+                }
+            }
 
             for (size_t texelIndex = 0; texelIndex < texelCount; ++texelIndex) {
                 float weight = accum[texelIndex].worldPosWeight.w;
@@ -6484,7 +6685,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     uniforms.colorTint[3] = 1.0f;
     uniforms.flags[0] = self.primaryLightEnabled ? 1u : 0u;
     uniforms.flags[1] = self.previewBakedLightingEnabled ? 2u : 0u;
-    uniforms.flags[2] = (self.dimension == VmfViewportDimension3D && self.renderMode == VmfViewportRenderModeShaded) ? 1u : 0u;
+    uniforms.flags[2] = (self.dimension == VmfViewportDimension3D && self.renderMode != VmfViewportRenderModeWireframe) ? 1u : 0u;
     uniforms.flags[3] = 0u;
     return uniforms;
 }
@@ -7349,10 +7550,10 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     self.lastFrameTime = now;
 
     if (self.dimension == VmfViewportDimension3D &&
-        self.renderMode == VmfViewportRenderModeShaded &&
+        self.renderMode != VmfViewportRenderModeWireframe &&
         self.fullRendererInitialized &&
         self.sceneWorld != NULL &&
-        self.importedSceneData.objectCount > 0u) {
+        (self.importedSceneData.objectCount > 0u || nova_scene_world_light_count(self.sceneWorld) > 0u)) {
         char errorBuffer[512] = {0};
         Vec3 eye = [self cameraPosition];
         Vec3 target = [self cameraTarget];
@@ -7370,6 +7571,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         nova_scene_world_sync_to_ui(self.sceneWorld,
                                     self.importedSceneData.objectCount > 0u ? 1u : 0u,
                                     &_fullRendererUiState);
+        _fullRendererUiState.renderMode = self.renderMode == VmfViewportRenderModePathTraced ? 0 : 1;
         _fullRendererUiState.previewBakeLightingEnabled = self.previewBakedLightingEnabled ? 1 : 0;
 
         if (
@@ -7451,7 +7653,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         .vertexEditPreviewBuffer = (__bridge void*)self.vertexEditPreviewBuffer,
         .vertexEditPreviewVertexCount = self.vertexEditPreviewVertexCount,
         .dimension3D = self.dimension == VmfViewportDimension3D ? 1u : 0u,
-        .shaded = self.renderMode == VmfViewportRenderModeShaded ? 1u : 0u,
+        .shaded = self.renderMode != VmfViewportRenderModeWireframe ? 1u : 0u,
         .encodeOverlay = viewport_encode_overlay,
         .overlayUserData = (__bridge void*)self,
     };

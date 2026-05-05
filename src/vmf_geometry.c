@@ -1,5 +1,7 @@
 #include "vmf_geometry.h"
 
+#include "sledgehammer_geometry.h"
+
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -92,6 +94,16 @@ static void compute_uv(Vec3 position, const VmfSide* side, float* outU, float* o
         *outV = (vec3_dot(position, side->vaxis) + side->voffset) / (side->vscale * 0.5f);
     } else {
         *outV = vec3_dot(position, side->vaxis) + side->voffset;
+    }
+}
+
+static void compute_lightmap_uv(Vec3 origin, Vec3 tangent, Vec3 bitangent, Vec3 position, float* outU, float* outV) {
+    Vec3 delta = vec3_sub(position, origin);
+    if (outU != NULL) {
+        *outU = vec3_dot(delta, tangent);
+    }
+    if (outV != NULL) {
+        *outV = vec3_dot(delta, bitangent);
     }
 }
 
@@ -407,14 +419,29 @@ static int triangulate_solid(const VmfSolid* solid, ViewerMesh* mesh, size_t ent
             return 0;
         }
         const VmfSide* side = &solid->sides[sideIndex];
+        Vec3 lightmapOrigin = polygon[0];
+        Vec3 lightmapTangent;
+        Vec3 lightmapBitangent;
+        if (!sledgehammer_geometry_bake_compute_lightmap_basis(side,
+                                                               planes[sideIndex].normal,
+                                                               &lightmapTangent,
+                                                               &lightmapBitangent)) {
+            lightmapTangent = fabsf(planes[sideIndex].normal.raw[2]) < 0.999f ? vec3_make(0.0f, 0.0f, 1.0f) : vec3_make(1.0f, 0.0f, 0.0f);
+            lightmapTangent = vec3_normalize(vec3_cross(lightmapTangent, planes[sideIndex].normal));
+            lightmapBitangent = vec3_normalize(vec3_cross(planes[sideIndex].normal, lightmapTangent));
+        }
         for (size_t vertexIndex = 1; vertexIndex + 1 < polygonCount; ++vertexIndex) {
             float u0, v0, u1, v1, u2, v2;
+            float lu0, lv0, lu1, lv1, lu2, lv2;
             compute_uv(polygon[0],             side, &u0, &v0);
             compute_uv(polygon[vertexIndex],   side, &u1, &v1);
             compute_uv(polygon[vertexIndex+1], side, &u2, &v2);
-            ViewerVertex a = { .position = polygon[0],             .normal = planes[sideIndex].normal, .color = color, .u = u0, .v = v0 };
-            ViewerVertex b = { .position = polygon[vertexIndex],   .normal = planes[sideIndex].normal, .color = color, .u = u1, .v = v1 };
-            ViewerVertex c = { .position = polygon[vertexIndex+1], .normal = planes[sideIndex].normal, .color = color, .u = u2, .v = v2 };
+            compute_lightmap_uv(lightmapOrigin, lightmapTangent, lightmapBitangent, polygon[0], &lu0, &lv0);
+            compute_lightmap_uv(lightmapOrigin, lightmapTangent, lightmapBitangent, polygon[vertexIndex], &lu1, &lv1);
+            compute_lightmap_uv(lightmapOrigin, lightmapTangent, lightmapBitangent, polygon[vertexIndex+1], &lu2, &lv2);
+            ViewerVertex a = { .position = polygon[0],             .normal = planes[sideIndex].normal, .color = color, .u = u0, .v = v0, .lightmapU = lu0, .lightmapV = lv0 };
+            ViewerVertex b = { .position = polygon[vertexIndex],   .normal = planes[sideIndex].normal, .color = color, .u = u1, .v = v1, .lightmapU = lu1, .lightmapV = lv1 };
+            ViewerVertex c = { .position = polygon[vertexIndex+1], .normal = planes[sideIndex].normal, .color = color, .u = u2, .v = v2, .lightmapU = lu2, .lightmapV = lv2 };
             if (!append_triangle(mesh, a, b, c)) {
                 return 0;
             }

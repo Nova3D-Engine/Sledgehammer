@@ -87,6 +87,7 @@ static NSString* clip_mode_label(ViewerClipMode mode) {
     NSMenu* viewMenu = [[NSMenu alloc] initWithTitle:@"View"];
     [viewMenu addItemWithTitle:@"Shaded" action:@selector(setShadedMode:) keyEquivalent:@"1"];
     [viewMenu addItemWithTitle:@"Wireframe" action:@selector(setWireframeMode:) keyEquivalent:@"2"];
+    [viewMenu addItemWithTitle:@"Path Traced" action:@selector(setPathTracedMode:) keyEquivalent:@"3"];
     [viewMenu addItemWithTitle:@"Frame Scene" action:@selector(frameScene:) keyEquivalent:@"k"];
     [viewMenu addItemWithTitle:@"Bake Preview Lighting (1 Bounce GI)" action:@selector(bakePreviewLighting:) keyEquivalent:@"j"];
     [viewMenu addItemWithTitle:@"Show Lightmap Debug" action:@selector(showLightmapDebugWindow:) keyEquivalent:@""];
@@ -158,6 +159,8 @@ static NSString* clip_mode_label(ViewerClipMode mode) {
     [self setActiveViewport:self.perspectiveViewport];
     [self.window makeFirstResponder:self.perspectiveViewport.metalView];
     [self updateChrome];
+    [self.window center];
+    [self.window makeKeyAndOrderFront:nil];
 }
 
 - (StyledSplitView*)newSplitViewVertical:(BOOL)vertical {
@@ -483,14 +486,13 @@ static NSString* clip_mode_label(ViewerClipMode mode) {
     self.duplicateButton = [self toolbarButtonWithIcon:@"content_copy" text:@"Duplicate" action:@selector(duplicateSelection:)];
     self.deleteButton = [self toolbarButtonWithIcon:@"delete" text:@"Delete" action:@selector(deleteSelection:)];
 
-    self.renderControl = [[NSSegmentedControl alloc] initWithFrame:NSZeroRect];
-    self.renderControl.segmentCount = 2;
-    [self.renderControl setLabel:@"Wire" forSegment:0];
-    [self.renderControl setLabel:@"Solid" forSegment:1];
-    self.renderControl.trackingMode = NSSegmentSwitchTrackingSelectOne;
+    self.renderControl = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
+    [self.renderControl addItemsWithTitles:@[ @"Wireframe", @"Shaded", @"Path Traced" ]];
+    [[self.renderControl itemAtIndex:0] setTag:VmfViewportRenderModeWireframe];
+    [[self.renderControl itemAtIndex:1] setTag:VmfViewportRenderModeShaded];
+    [[self.renderControl itemAtIndex:2] setTag:VmfViewportRenderModePathTraced];
     self.renderControl.target = self;
     self.renderControl.action = @selector(renderControlChanged:);
-    self.renderControl.segmentStyle = NSSegmentStyleRounded;
 
     self.materialPopUp = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
     [self.materialPopUp addItemsWithTitles:@[ @"dev_grid", @"nodraw", @"clip" ]];
@@ -628,7 +630,7 @@ static NSString* clip_mode_label(ViewerClipMode mode) {
     self.applyMaterialButton.enabled = self.textureApplicationModeActive && self.hasSelection && !pointEntitySelection;
     [self refreshToolRailSelection];
     VmfViewport* viewport = self.activeViewport ? self.activeViewport : self.perspectiveViewport;
-    [self.renderControl setSelectedSegment:viewport.renderMode == VmfViewportRenderModeShaded ? 1 : 0];
+    [self.renderControl selectItemWithTag:viewport.renderMode];
     self.renderControl.enabled = viewport.dimension == VmfViewportDimension3D;
     NSInteger gridItemIndex = [self.gridPopUp indexOfItemWithTitle:[NSString stringWithFormat:@"%.0f", self.gridSize]];
     if (gridItemIndex >= 0) {

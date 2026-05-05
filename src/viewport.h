@@ -23,6 +23,7 @@ typedef NS_ENUM(NSUInteger, VmfViewportPlane) {
 typedef NS_ENUM(NSUInteger, VmfViewportRenderMode) {
     VmfViewportRenderModeShaded = 0,
     VmfViewportRenderModeWireframe = 1,
+    VmfViewportRenderModePathTraced = 2,
 };
 
 typedef NS_ENUM(NSUInteger, VmfViewportEditorTool) {

@@ -40,12 +40,46 @@ static NSString* light_type_label(int lightType) {
 
 @implementation ViewerAppDelegate
 
+- (instancetype)initWithStartupPath:(NSString*)startupPath {
+    self = [super init];
+    if (self == nil) {
+        return nil;
+    }
+    self.startupPath = startupPath;
+    _gridSize = 32.0;
+    self.undoStack = [NSMutableArray array];
+    self.redoStack = [NSMutableArray array];
+    self.currentPrefabs = [NSMutableArray array];
+    self.allMaterials = [NSMutableArray array];
+    self.filteredMaterials = [NSMutableArray array];
+    self.contentBrowserItems = [NSMutableArray array];
+    _sceneWorld = nova_scene_world_create();
+    if (_sceneWorld != NULL) {
+        nova_scene_world_initialize(_sceneWorld);
+        nova_scene_world_register_editor_tags(_sceneWorld);
+    }
+    return self;
+}
+
+- (void)applicationDidFinishLaunching:(NSNotification*)notification {
+    (void)notification;
+    [self createMenu];
+    [self createWindow];
+    [self configurePlugins];
+    if (self.startupPath.length > 0) {
+        [self openPath:self.startupPath];
+    }
+    [NSApp activateIgnoringOtherApps:YES];
+}
+
 - (void)setGridSize:(CGFloat)gridSize {
     _gridSize = fmax(gridSize, 1.0);
     for (VmfViewport* viewport in self.viewports) {
         viewport.gridSize = _gridSize;
     }
-    [self updateChrome];
+    if (self.window != nil) {
+        [self updateChrome];
+    }
 }
 
 - (void)stepGridSizeByOffset:(NSInteger)offset {
@@ -1389,6 +1423,16 @@ static NSString* light_type_label(int lightType) {
     [self updateChrome];
 }
 
+- (void)setPathTracedMode:(id)sender {
+    (void)sender;
+    VmfViewport* viewport = self.activeViewport ? self.activeViewport : self.perspectiveViewport;
+    if (viewport.dimension != VmfViewportDimension3D) {
+        viewport = self.perspectiveViewport;
+    }
+    viewport.renderMode = VmfViewportRenderModePathTraced;
+    [self updateChrome];
+}
+
 - (void)frameScene:(id)sender {
     (void)sender;
     [self frameAllViewports];
@@ -1475,10 +1519,17 @@ static NSString* light_type_label(int lightType) {
 
 - (void)renderControlChanged:(id)sender {
     (void)sender;
-    if (self.renderControl.selectedSegment == 1) {
+    switch (self.renderControl.selectedTag) {
+        case VmfViewportRenderModePathTraced:
+            [self setPathTracedMode:nil];
+            break;
+        case VmfViewportRenderModeShaded:
         [self setShadedMode:nil];
-    } else {
-        [self setWireframeMode:nil];
+            break;
+        case VmfViewportRenderModeWireframe:
+        default:
+            [self setWireframeMode:nil];
+            break;
     }
 }
 
@@ -2065,8 +2116,24 @@ static NSString* light_type_label(int lightType) {
     [self updateChrome];
 }
 
+- (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)sender {
+    (void)sender;
+    return YES;
+}
+
 - (void)windowWillClose:(NSNotification*)notification {
-    (void)notification;
+    if (notification.object != self.window) {
+        return;
+    }
+
+    if (self.materialBrowserPanel != nil) {
+        [self.materialBrowserPanel orderOut:nil];
+        [self.materialBrowserPanel close];
+    }
+
+    for (VmfViewport* viewport in self.viewports) {
+        [viewport setLightmapDebugWindowVisible:NO];
+    }
 }
 
 - (BOOL)windowShouldClose:(NSWindow*)sender {
@@ -2097,6 +2164,40 @@ static NSString* light_type_label(int lightType) {
 
 - (void)viewportDidRequestOpenDroppedPath:(NSString*)path {
     [self openPath:path];
+}
+
+static BOOL sledgehammer_model_asset_bounds(NSString* path, void* unused, Vec3* outHalfExtents, NSString** outError) {
+    (void)unused;
+    if (path.length == 0 || outHalfExtents == NULL) {
+        if (outError) *outError = @"Invalid arguments.";
+        return NO;
+    }
+    NovaSceneData scene;
+    nova_scene_data_init(&scene);
+    char errorText[512] = {0};
+    if (!nova_model_asset_load_scene(path.fileSystemRepresentation, &scene, errorText, (uint32_t)sizeof(errorText))) {
+        if (outError) *outError = errorText[0] ? [NSString stringWithUTF8String:errorText] : @"Failed to load model asset.";
+        nova_scene_data_release(&scene);
+        return NO;
+    }
+    float bMin[3] = { FLT_MAX,  FLT_MAX,  FLT_MAX};
+    float bMax[3] = {-FLT_MAX, -FLT_MAX, -FLT_MAX};
+    for (uint32_t i = 0; i < scene.vertexCount; ++i) {
+        const float* p = scene.vertices[i].position;
+        for (int k = 0; k < 3; ++k) {
+            if (p[k] < bMin[k]) bMin[k] = p[k];
+            if (p[k] > bMax[k]) bMax[k] = p[k];
+        }
+    }
+    nova_scene_data_release(&scene);
+    if (scene.vertexCount == 0) {
+        *outHalfExtents = vec3_make(32.0f, 32.0f, 32.0f);
+        return YES;
+    }
+    outHalfExtents->raw[0] = (bMax[0] - bMin[0]) * 0.5f;
+    outHalfExtents->raw[1] = (bMax[1] - bMin[1]) * 0.5f;
+    outHalfExtents->raw[2] = (bMax[2] - bMin[2]) * 0.5f;
+    return YES;
 }
 
 - (void)placeModelAssetAtPath:(NSString*)path worldPoint:(Vec3)worldPoint {
@@ -2361,7 +2462,7 @@ static NSString* light_type_label(int lightType) {
 
         _hasPointEntityDragPreview = NO;
         sledgehammer_viewer_mesh_translate_entity(&_mesh, self.selectedEntityIndex, delta);
-        [self refreshViewportsFromCurrentMeshSyncHeavyRenderer:NO clearingMaterialMisses:NO];
+        [self refreshViewportsFromCurrentMeshSyncHeavyRenderer:commit clearingMaterialMisses:NO];
         if (commit) {
             [self commitPendingHistoryEntry];
         }

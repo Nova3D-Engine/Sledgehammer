@@ -127,6 +127,58 @@ void sledgehammer_geometry_bake_compute_uv(Vec3 position, const VmfSide* side, f
     }
 }
 
+bool sledgehammer_geometry_bake_compute_lightmap_basis(const VmfSide* side,
+                                                       Vec3 faceNormal,
+                                                       Vec3* outTangent,
+                                                       Vec3* outBitangent) {
+    if (side == NULL || outTangent == NULL || outBitangent == NULL) {
+        return false;
+    }
+
+    Vec3 tangent = vec3_sub(side->uaxis, vec3_scale(faceNormal, vec3_dot(side->uaxis, faceNormal)));
+    Vec3 bitangent = vec3_sub(side->vaxis, vec3_scale(faceNormal, vec3_dot(side->vaxis, faceNormal)));
+    float tangentLen = vec3_length(tangent);
+    float bitangentLen = vec3_length(bitangent);
+
+    if (tangentLen > 1e-4f) {
+        tangent = vec3_scale(tangent, 1.0f / tangentLen);
+    }
+    if (bitangentLen > 1e-4f) {
+        bitangent = vec3_scale(bitangent, 1.0f / bitangentLen);
+    }
+
+    if (tangentLen <= 1e-4f && bitangentLen > 1e-4f) {
+        tangent = vec3_normalize(vec3_cross(bitangent, faceNormal));
+        tangentLen = vec3_length(tangent);
+    }
+    if (bitangentLen <= 1e-4f && tangentLen > 1e-4f) {
+        bitangent = vec3_normalize(vec3_cross(faceNormal, tangent));
+        bitangentLen = vec3_length(bitangent);
+    }
+    if (tangentLen <= 1e-4f) {
+        tangent = fabsf(faceNormal.raw[2]) < 0.999f ? vec3_make(0.0f, 0.0f, 1.0f) : vec3_make(1.0f, 0.0f, 0.0f);
+        tangent = vec3_normalize(vec3_cross(tangent, faceNormal));
+    }
+
+    bitangent = vec3_sub(bitangent, vec3_scale(tangent, vec3_dot(bitangent, tangent)));
+    if (vec3_length(bitangent) <= 1e-4f) {
+        bitangent = vec3_normalize(vec3_cross(faceNormal, tangent));
+    } else {
+        bitangent = vec3_normalize(bitangent);
+    }
+
+    if (vec3_dot(tangent, side->uaxis) < 0.0f) {
+        tangent = vec3_scale(tangent, -1.0f);
+    }
+    if (vec3_dot(bitangent, side->vaxis) < 0.0f) {
+        bitangent = vec3_scale(bitangent, -1.0f);
+    }
+
+    *outTangent = tangent;
+    *outBitangent = bitangent;
+    return true;
+}
+
 static Bounds3 sledgehammer_geometry_bake_solid_bounds(const VmfSolid* solid) {
     Bounds3 bounds = bounds3_empty();
     for (size_t sideIndex = 0; sideIndex < solid->sideCount; ++sideIndex) {
