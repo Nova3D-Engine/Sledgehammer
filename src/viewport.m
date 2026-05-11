@@ -16,7 +16,6 @@
 
 #include <imgui.h>
 #include <ImGuizmo.h>
-#include "external/ImGizmo2D.h"
 #include <backends/imgui_impl_metal.h>
 #include <backends/imgui_impl_osx.h>
 
@@ -132,6 +131,79 @@ static void copy_mat4_to_uniform(float destination[16], Mat4 matrix) {
         for (int row = 0; row < 4; ++row) {
             destination[column * 4 + row] = matrix.raw[column][row];
         }
+    }
+}
+
+static BOOL viewport_project_world_to_screen(const float viewProjection[16], CGSize viewportSize, Vec3 worldPoint, NSPoint* outPoint) {
+    if (outPoint == nil || viewportSize.width <= 1.0 || viewportSize.height <= 1.0) {
+        return NO;
+    }
+    float x = worldPoint.raw[0];
+    float y = worldPoint.raw[1];
+    float z = worldPoint.raw[2];
+    float clipX = viewProjection[0] * x + viewProjection[4] * y + viewProjection[8] * z + viewProjection[12];
+    float clipY = viewProjection[1] * x + viewProjection[5] * y + viewProjection[9] * z + viewProjection[13];
+    float clipW = viewProjection[3] * x + viewProjection[7] * y + viewProjection[11] * z + viewProjection[15];
+    if (clipW <= 1e-5f) {
+        return NO;
+    }
+    float invW = 1.0f / clipW;
+    float ndcX = clipX * invW;
+    float ndcY = clipY * invW;
+    if (ndcX < -1.1f || ndcX > 1.1f || ndcY < -1.1f || ndcY > 1.1f) {
+        return NO;
+    }
+    outPoint->x = ((CGFloat)ndcX * 0.5 + 0.5) * viewportSize.width;
+    outPoint->y = ((CGFloat)ndcY * 0.5 + 0.5) * viewportSize.height;
+    return YES;
+}
+
+static float viewport_degrees_to_radians(float degrees) {
+    return degrees * (float)M_PI / 180.0f;
+}
+
+static void viewport_fill_euler_rotation_matrix(Vec3 rotationDegrees, float outMatrix[16]) {
+    float rx = viewport_degrees_to_radians(rotationDegrees.raw[0]);
+    float ry = viewport_degrees_to_radians(rotationDegrees.raw[1]);
+    float rz = viewport_degrees_to_radians(rotationDegrees.raw[2]);
+    float cx = cosf(rx), sx = sinf(rx);
+    float cy = cosf(ry), sy = sinf(ry);
+    float cz = cosf(rz), sz = sinf(rz);
+    outMatrix[0] = cy * cz;
+    outMatrix[1] = cy * sz;
+    outMatrix[2] = -sy;
+    outMatrix[3] = 0.0f;
+    outMatrix[4] = sx * sy * cz - cx * sz;
+    outMatrix[5] = sx * sy * sz + cx * cz;
+    outMatrix[6] = sx * cy;
+    outMatrix[7] = 0.0f;
+    outMatrix[8] = cx * sy * cz + sx * sz;
+    outMatrix[9] = cx * sy * sz - sx * cz;
+    outMatrix[10] = cx * cy;
+    outMatrix[11] = 0.0f;
+    outMatrix[12] = 0.0f;
+    outMatrix[13] = 0.0f;
+    outMatrix[14] = 0.0f;
+    outMatrix[15] = 1.0f;
+}
+
+static void viewport_fill_model_world_matrix(Vec3 position, Vec3 rotationDegrees, float outMatrix[16]) {
+    viewport_fill_euler_rotation_matrix(rotationDegrees, outMatrix);
+    outMatrix[12] = position.raw[0];
+    outMatrix[13] = position.raw[1];
+    outMatrix[14] = position.raw[2];
+    outMatrix[15] = 1.0f;
+}
+
+static NSString* viewport_gizmo_operation_label(NSUInteger gizmoOperation) {
+    switch ((ImGuizmo::OPERATION)gizmoOperation) {
+        case ImGuizmo::ROTATE:
+            return @"ROTATE";
+        case ImGuizmo::SCALE:
+            return @"SCALE";
+        case ImGuizmo::TRANSLATE:
+        default:
+            return @"MOVE";
     }
 }
 
@@ -1499,6 +1571,32 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     NSEventModifierFlags _clickModifierFlags;
 }
 
+- (void)forwardEventToImGui:(NSEvent*)event {
+    if (self.owner == nil || self.owner.imguiContext == NULL || event == nil) {
+        return;
+    }
+    ImGui::SetCurrentContext((ImGuiContext*)self.owner.imguiContext);
+    ImGuiIO& io = ImGui::GetIO();
+    NSPoint localPoint = [self convertPoint:event.locationInWindow fromView:nil];
+    float mouseY = self.isFlipped ? (float)localPoint.y : (float)(self.bounds.size.height - localPoint.y);
+    io.AddMousePosEvent((float)localPoint.x, mouseY);
+    if (event.type == NSEventTypeLeftMouseDown || event.type == NSEventTypeLeftMouseUp) {
+        io.AddMouseButtonEvent(0, event.type == NSEventTypeLeftMouseDown);
+    } else if (event.type == NSEventTypeRightMouseDown || event.type == NSEventTypeRightMouseUp) {
+        io.AddMouseButtonEvent(1, event.type == NSEventTypeRightMouseDown);
+    } else if (event.type == NSEventTypeOtherMouseDown || event.type == NSEventTypeOtherMouseUp) {
+        io.AddMouseButtonEvent((int)event.buttonNumber, event.type == NSEventTypeOtherMouseDown);
+    }
+    if (event.type == NSEventTypeScrollWheel) {
+        io.AddMouseWheelEvent(0.1f * (float)event.scrollingDeltaX, 0.1f * (float)event.scrollingDeltaY);
+    }
+    NSEventModifierFlags modifiers = event.modifierFlags;
+    io.AddKeyEvent(ImGuiMod_Shift, (modifiers & NSEventModifierFlagShift) != 0);
+    io.AddKeyEvent(ImGuiMod_Ctrl, (modifiers & NSEventModifierFlagControl) != 0);
+    io.AddKeyEvent(ImGuiMod_Alt, (modifiers & NSEventModifierFlagOption) != 0);
+    io.AddKeyEvent(ImGuiMod_Super, (modifiers & NSEventModifierFlagCommand) != 0);
+}
+
 - (BOOL)acceptsFirstResponder {
     return YES;
 }
@@ -1530,24 +1628,28 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
 }
 
 - (void)keyDown:(NSEvent*)event {
+    [self forwardEventToImGui:event];
     if (![self.owner handleViewportKeyDown:event]) {
         [super keyDown:event];
     }
 }
 
 - (void)keyUp:(NSEvent*)event {
+    [self forwardEventToImGui:event];
     if (![self.owner handleViewportKeyUp:event]) {
         [super keyUp:event];
     }
 }
 
 - (void)mouseDown:(NSEvent*)event {
+    [self forwardEventToImGui:event];
     [self.window makeFirstResponder:self];
     _lastPoint = [self convertPoint:event.locationInWindow fromView:nil];
     [self.owner handleViewportMouseDownAtPoint:_lastPoint];
 }
 
 - (void)mouseDragged:(NSEvent*)event {
+    [self forwardEventToImGui:event];
     NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
     NSPoint delta = NSMakePoint(point.x - _lastPoint.x, point.y - _lastPoint.y);
     _lastPoint = point;
@@ -1555,11 +1657,13 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
 }
 
 - (void)mouseUp:(NSEvent*)event {
+    [self forwardEventToImGui:event];
     NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
     [self.owner handleViewportMouseUpAtPoint:point];
 }
 
 - (void)rightMouseDown:(NSEvent*)event {
+    [self forwardEventToImGui:event];
     [self.window makeFirstResponder:self];
     _lastPoint = [self convertPoint:event.locationInWindow fromView:nil];
     _hadFreeLookDrag = NO;
@@ -1582,6 +1686,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
 }
 
 - (void)rightMouseDragged:(NSEvent*)event {
+    [self forwardEventToImGui:event];
     NSPoint delta = NSMakePoint(event.deltaX, event.deltaY);
     if (hypot(delta.x, delta.y) > 0.5) {
         _hadFreeLookDrag = YES;
@@ -1590,6 +1695,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
 }
 
 - (void)rightMouseUp:(NSEvent*)event {
+    [self forwardEventToImGui:event];
     NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
     if (_cursorLocked) {
         CGWarpMouseCursorPosition(_lockedCursorPoint);
@@ -1604,6 +1710,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
 }
 
 - (void)scrollWheel:(NSEvent*)event {
+    [self forwardEventToImGui:event];
     [self.owner handleViewportScrollDelta:event.deltaY];
 }
 
@@ -1618,6 +1725,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
 }
 
 - (void)mouseMoved:(NSEvent*)event {
+    [self forwardEventToImGui:event];
     NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
     [self.owner handleViewportMouseHoverAtPoint:point];
 }
@@ -1720,6 +1828,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     _primaryLightRange = 2048.0f;
     _primaryLightEnabled = NO;
     _editorTool = VmfViewportEditorToolSelect;
+    _gizmoOperation = (NSUInteger)ImGuizmo::TRANSLATE;
     _gridSize = 32.0;
     _selectionBounds = bounds3_empty();
     _creationBounds = bounds3_empty();
@@ -1936,17 +2045,9 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
             continue;
         }
 
-        Vec3 delta = vec3_sub(entity->position, self.heavyObjectModelBasePositions[objectIndex]);
-        if (fabsf(delta.raw[0]) < 1e-6f && fabsf(delta.raw[1]) < 1e-6f && fabsf(delta.raw[2]) < 1e-6f) {
-            continue;
-        }
-
         if (_importedSceneData.objects != NULL && objectIndex < _importedSceneData.objectCount) {
             float worldMatrix[16];
-            viewport_identity_matrix(worldMatrix);
-            worldMatrix[12] = entity->position.raw[0];
-            worldMatrix[13] = entity->position.raw[1];
-            worldMatrix[14] = entity->position.raw[2];
+            viewport_fill_model_world_matrix(entity->position, entity->rotationDegrees, worldMatrix);
             memcpy(_importedSceneData.objects[objectIndex].worldMatrix,
                    worldMatrix,
                    sizeof(_importedSceneData.objects[objectIndex].worldMatrix));
@@ -2498,116 +2599,99 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         copy_mat4_to_uniform(projectionMatrix, projection);
 
         Bounds3 selectionBounds = self.selectionBounds;
+        Bounds3 baseBounds = selectionBounds;
         Vec3 selectionCenter = bounds3_center(selectionBounds);
-        float objectMatrix[16] = {
-            1.0f, 0.0f, 0.0f, 0.0f,
-            0.0f, 1.0f, 0.0f, 0.0f,
-            0.0f, 0.0f, 1.0f, 0.0f,
-            selectionCenter.raw[0], selectionCenter.raw[1], selectionCenter.raw[2], 1.0f,
-        };
+        Vec3 baseCenter = selectionCenter;
+        float objectMatrix[16];
+        if (self.gizmoInteractionActive && self.gizmoInteractionHasStart) {
+            memcpy(objectMatrix, self.gizmoInteractionMatrix.columns, sizeof(float) * 16u);
+            baseBounds = self.gizmoInteractionStartBounds;
+            baseCenter = bounds3_center(baseBounds);
+        } else {
+            float freshMatrix[16];
+            viewport_fill_model_world_matrix(selectionCenter, self.selectionRotatable ? self.selectionRotationDegrees : vec3_make(0.0f, 0.0f, 0.0f), freshMatrix);
+            memcpy(objectMatrix, freshMatrix, sizeof(float) * 16u);
+        }
 
         ImGuizmo::SetOrthographic(false);
         ImGuizmo::SetDrawlist(ImGui::GetForegroundDrawList());
         ImGuizmo::SetRect(0.0f, 0.0f, viewportWidth, viewportHeight);
+        ImGuiIO& io = ImGui::GetIO();
         float gridSnap = (float)fmax(1.0, self.gridSize);
         float snapValues[3] = { gridSnap, gridSnap, gridSnap };
+        float* snapPtr = io.KeyShift ? snapValues : NULL;
+        ImGuizmo::OPERATION operation = (ImGuizmo::OPERATION)self.gizmoOperation;
+        if (operation == ImGuizmo::ROTATE && !self.selectionRotatable) {
+            operation = ImGuizmo::TRANSLATE;
+        } else if (operation == ImGuizmo::SCALE && self.selectionRotatable) {
+            operation = ImGuizmo::TRANSLATE;
+        }
         BOOL manipulated = ImGuizmo::Manipulate(viewMatrix,
                             projectionMatrix,
-                            ImGuizmo::TRANSLATE,
+                            operation,
                             ImGuizmo::WORLD,
                             objectMatrix,
                             NULL,
-                            snapValues);
+                            snapPtr);
         self.gizmoHovered = ImGuizmo::IsOver();
-        if (manipulated && self.delegate) {
-            Vec3 translatedCenter = vec3_make(objectMatrix[12], objectMatrix[13], objectMatrix[14]);
-            Vec3 delta = vec3_sub(translatedCenter, selectionCenter);
-            Bounds3 translatedBounds = selectionBounds;
-            translatedBounds.min = vec3_add(translatedBounds.min, delta);
-            translatedBounds.max = vec3_add(translatedBounds.max, delta);
-            [self.delegate viewport:self updateSelectionBounds:translatedBounds commit:NO transform:VmfViewportSelectionTransformMove];
-        }
-
         BOOL isUsing = ImGuizmo::IsUsing();
-        if (!isUsing && self.gizmoInteractionActive && self.delegate) {
-            [self.delegate viewport:self updateSelectionBounds:self.selectionBounds commit:YES transform:VmfViewportSelectionTransformMove];
+        if (isUsing && !self.gizmoInteractionActive) {
+            self.gizmoInteractionHasStart = YES;
+            self.gizmoInteractionStartBounds = selectionBounds;
         }
-        self.gizmoInteractionActive = isUsing;
-    } else if (shouldDrawGizmo && self.dimension == VmfViewportDimension2D) {
-        float viewportWidth = fmaxf((float)self.metalView.bounds.size.width, 1.0f);
-        float viewportHeight = fmaxf((float)self.metalView.bounds.size.height, 1.0f);
-        float aspect = viewportWidth / viewportHeight;
-        float visibleWidth = self.orthoSize * aspect;
-        float centerU = plane_u_value(self.plane, self.orthoCenter);
-        float centerV = plane_v_value(self.plane, self.orthoCenter);
-        float zoom = viewportHeight / fmaxf(self.orthoSize, 1e-6f);
-
-        float minU = plane_u_value(self.plane, self.selectionBounds.min);
-        float minV = plane_v_value(self.plane, self.selectionBounds.min);
-        float maxU = plane_u_value(self.plane, self.selectionBounds.max);
-        float maxV = plane_v_value(self.plane, self.selectionBounds.max);
-        float x = fminf(minU, maxU);
-        float y = fminf(minV, maxV);
-        float w = fabsf(maxU - minU);
-        float h = fabsf(maxV - minV);
-        float originX = x;
-        float originY = y;
-        float originW = w;
-        float originH = h;
-
-        ImGizmo2D::SetDrawList(ImGui::GetForegroundDrawList());
-        ImGizmo2D::SetViewRect(ImVec2(0.0f, 0.0f), ImVec2(viewportWidth, viewportHeight));
-        ImGizmo2D::SetViewTransform(centerU, centerV, zoom);
-        ImGizmo2D::SetSnapGrid((float)fmax(1.0, self.gridSize));
-        ImGizmo2D::BeginFrame();
-
-        BOOL translated = ImGizmo2D::Translate("selection_translate", &x, &y) ? YES : NO;
-        BOOL resized = ImGizmo2D::Rect("selection_rect", &x, &y, &w, &h) ? YES : NO;
-        self.gizmoHovered = ImGizmo2D::IsHovered() ? YES : NO;
-
-        if ((translated || resized) && self.delegate) {
-            Bounds3 updated = self.selectionBounds;
-            float newMinU = x;
-            float newMaxU = x + w;
-            float newMinV = y;
-            float newMaxV = y + h;
-
-            switch (self.plane) {
-                case VmfViewportPlaneXY:
-                    updated.min.raw[0] = fminf(newMinU, newMaxU);
-                    updated.max.raw[0] = fmaxf(newMinU, newMaxU);
-                    updated.min.raw[1] = fminf(newMinV, newMaxV);
-                    updated.max.raw[1] = fmaxf(newMinV, newMaxV);
-                    break;
-                case VmfViewportPlaneXZ:
-                    updated.min.raw[0] = fminf(newMinU, newMaxU);
-                    updated.max.raw[0] = fmaxf(newMinU, newMaxU);
-                    updated.min.raw[2] = fminf(newMinV, newMaxV);
-                    updated.max.raw[2] = fmaxf(newMinV, newMaxV);
-                    break;
-                case VmfViewportPlaneZY:
-                    updated.min.raw[1] = fminf(newMinU, newMaxU);
-                    updated.max.raw[1] = fmaxf(newMinU, newMaxU);
-                    updated.min.raw[2] = fminf(newMinV, newMaxV);
-                    updated.max.raw[2] = fmaxf(newMinV, newMaxV);
-                    break;
+        if ((manipulated || isUsing) && self.gizmoInteractionHasStart) {
+            matrix_float4x4 persisted;
+            memcpy(persisted.columns, objectMatrix, sizeof(float) * 16u);
+            self.gizmoInteractionMatrix = persisted;
+        }
+        if ((manipulated || isUsing) && self.delegate && self.gizmoInteractionHasStart) {
+            Vec3 translatedCenter = vec3_make(objectMatrix[12], objectMatrix[13], objectMatrix[14]);
+            if (operation == ImGuizmo::TRANSLATE) {
+                Vec3 delta = vec3_sub(translatedCenter, baseCenter);
+                Bounds3 translatedBounds = baseBounds;
+                translatedBounds.min = vec3_add(translatedBounds.min, delta);
+                translatedBounds.max = vec3_add(translatedBounds.max, delta);
+                [self.delegate viewport:self updateSelectionBounds:translatedBounds commit:NO transform:VmfViewportSelectionTransformMove];
+            } else if (operation == ImGuizmo::SCALE) {
+                float translation[3];
+                float rotation[3];
+                float scale[3];
+                ImGuizmo::DecomposeMatrixToComponents(objectMatrix, translation, rotation, scale);
+                Vec3 baseExtent = bounds3_size(baseBounds);
+                Vec3 scaledExtent = vec3_make(baseExtent.raw[0] * fabsf(scale[0]),
+                                              baseExtent.raw[1] * fabsf(scale[1]),
+                                              baseExtent.raw[2] * fabsf(scale[2]));
+                Vec3 halfExtent = vec3_scale(scaledExtent, 0.5f);
+                Bounds3 scaledBounds;
+                scaledBounds.min = vec3_sub(translatedCenter, halfExtent);
+                scaledBounds.max = vec3_add(translatedCenter, halfExtent);
+                [self.delegate viewport:self updateSelectionBounds:scaledBounds commit:NO transform:VmfViewportSelectionTransformResize];
+            } else if (operation == ImGuizmo::ROTATE && self.selectionRotatable) {
+                float translation[3];
+                float rotation[3];
+                float scale[3];
+                ImGuizmo::DecomposeMatrixToComponents(objectMatrix, translation, rotation, scale);
+                [self.delegate viewport:self
+                 updateSelectionRotationDegrees:vec3_make(rotation[0], rotation[1], rotation[2])
+                                         commit:NO];
             }
-
-            VmfViewportSelectionTransform transform = resized ? VmfViewportSelectionTransformResize : VmfViewportSelectionTransformMove;
-            [self.delegate viewport:self updateSelectionBounds:updated commit:NO transform:transform];
         }
-
-        BOOL isUsing = ImGizmo2D::IsActive() ? YES : NO;
         if (!isUsing && self.gizmoInteractionActive && self.delegate) {
-            float moved = fabsf(x - originX) + fabsf(y - originY);
-            float scaled = fabsf(w - originW) + fabsf(h - originH);
-            VmfViewportSelectionTransform commitTransform = scaled > moved ? VmfViewportSelectionTransformResize : VmfViewportSelectionTransformMove;
-            [self.delegate viewport:self updateSelectionBounds:self.selectionBounds commit:YES transform:commitTransform];
+            if (operation == ImGuizmo::TRANSLATE) {
+                [self.delegate viewport:self updateSelectionBounds:self.selectionBounds commit:YES transform:VmfViewportSelectionTransformMove];
+            } else if (operation == ImGuizmo::SCALE) {
+                [self.delegate viewport:self updateSelectionBounds:self.selectionBounds commit:YES transform:VmfViewportSelectionTransformResize];
+            } else if (operation == ImGuizmo::ROTATE && self.selectionRotatable) {
+                [self.delegate viewport:self updateSelectionRotationDegrees:self.selectionRotationDegrees commit:YES];
+            }
+            self.gizmoInteractionHasStart = NO;
         }
         self.gizmoInteractionActive = isUsing;
-    } else {
+    }
+    else {
         self.gizmoHovered = NO;
         self.gizmoInteractionActive = NO;
+        self.gizmoInteractionHasStart = NO;
     }
 
     ImGui::Render();
@@ -2669,7 +2753,11 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         toolLabel = @"STAIRS";
     }
     if (self.dimension == VmfViewportDimension3D) {
-        toolLabel = self.editorTool == VmfViewportEditorToolSelect ? @"CAMERA" : toolLabel;
+        if (self.editorTool == VmfViewportEditorToolSelect) {
+            toolLabel = (self.selectionVisible && self.selectionEditable)
+                ? viewport_gizmo_operation_label(self.gizmoOperation)
+                : @"CAMERA";
+        }
     }
     if (self.dimension == VmfViewportDimension2D) {
         self.modeLabel.stringValue = [NSString stringWithFormat:@"%@ %@ %@ %.0f", dimensionLabel, modeLabel, toolLabel, self.gridSize];
@@ -2708,6 +2796,20 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     self.selectionBounds = normalized_bounds(bounds);
     self.selectionVisible = visible;
     [self.overlayView setNeedsDisplay:YES];
+}
+
+- (void)setSelectionRotationDegrees:(Vec3)rotationDegrees rotatable:(BOOL)rotatable {
+    self.selectionRotationDegrees = rotationDegrees;
+    self.selectionRotatable = rotatable;
+    if (!rotatable && self.gizmoOperation == (NSUInteger)ImGuizmo::ROTATE) {
+        self.gizmoOperation = (NSUInteger)ImGuizmo::TRANSLATE;
+    } else if (rotatable && self.gizmoOperation == (NSUInteger)ImGuizmo::SCALE) {
+        self.gizmoOperation = (NSUInteger)ImGuizmo::TRANSLATE;
+    }
+    if (!self.gizmoInteractionActive) {
+        self.gizmoInteractionHasStart = NO;
+    }
+    [self refreshChrome];
 }
 
 - (void)setSelectionVertices:(const Vec3*)vertices count:(size_t)count visible:(BOOL)visible {
@@ -5906,16 +6008,10 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                         _importedSceneData.objects[objectCount].primitiveCount = objectPrimitiveCount;
                         _importedSceneData.objects[objectCount].vertexOffset = objectVertexOffset;
                         _importedSceneData.objects[objectCount].vertexCount = objectVertexCount;
-                        viewport_identity_matrix(_importedSceneData.objects[objectCount].worldMatrix);
-                        _importedSceneData.objects[objectCount].worldMatrix[12] = entity->position.raw[0];
-                        _importedSceneData.objects[objectCount].worldMatrix[13] = entity->position.raw[1];
-                        _importedSceneData.objects[objectCount].worldMatrix[14] = entity->position.raw[2];
+                        viewport_fill_model_world_matrix(entity->position, entity->rotationDegrees, _importedSceneData.objects[objectCount].worldMatrix);
 
                         snprintf(objectRecords[objectCount].name, sizeof(objectRecords[objectCount].name), "%s", _importedSceneData.objects[objectCount].name);
-                        viewport_identity_matrix(objectRecords[objectCount].worldMatrix);
-                        objectRecords[objectCount].worldMatrix[12] = entity->position.raw[0];
-                        objectRecords[objectCount].worldMatrix[13] = entity->position.raw[1];
-                        objectRecords[objectCount].worldMatrix[14] = entity->position.raw[2];
+                        viewport_fill_model_world_matrix(entity->position, entity->rotationDegrees, objectRecords[objectCount].worldMatrix);
                         objectRecords[objectCount].aabbMin[0] = objectBounds.min.raw[0];
                         objectRecords[objectCount].aabbMin[1] = objectBounds.min.raw[1];
                         objectRecords[objectCount].aabbMin[2] = objectBounds.min.raw[2];
@@ -5995,16 +6091,10 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
                         _importedSceneData.objects[objectCount].primitiveCount = objectPrimitiveCount;
                         _importedSceneData.objects[objectCount].vertexOffset = objectVertexOffset;
                         _importedSceneData.objects[objectCount].vertexCount = objectVertexCount;
-                        viewport_identity_matrix(_importedSceneData.objects[objectCount].worldMatrix);
-                        _importedSceneData.objects[objectCount].worldMatrix[12] = entity->position.raw[0];
-                        _importedSceneData.objects[objectCount].worldMatrix[13] = entity->position.raw[1];
-                        _importedSceneData.objects[objectCount].worldMatrix[14] = entity->position.raw[2];
+                        viewport_fill_model_world_matrix(entity->position, entity->rotationDegrees, _importedSceneData.objects[objectCount].worldMatrix);
 
                         snprintf(objectRecords[objectCount].name, sizeof(objectRecords[objectCount].name), "%s", _importedSceneData.objects[objectCount].name);
-                        viewport_identity_matrix(objectRecords[objectCount].worldMatrix);
-                        objectRecords[objectCount].worldMatrix[12] = entity->position.raw[0];
-                        objectRecords[objectCount].worldMatrix[13] = entity->position.raw[1];
-                        objectRecords[objectCount].worldMatrix[14] = entity->position.raw[2];
+                        viewport_fill_model_world_matrix(entity->position, entity->rotationDegrees, objectRecords[objectCount].worldMatrix);
                         objectRecords[objectCount].aabbMin[0] = objectBounds.min.raw[0];
                         objectRecords[objectCount].aabbMin[1] = objectBounds.min.raw[1];
                         objectRecords[objectCount].aabbMin[2] = objectBounds.min.raw[2];
@@ -7194,6 +7284,44 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
 }
 
 - (void)drawEditorOverlay {
+    if (self.vmfScene != NULL) {
+        NSFont* iconFont = [NSFont fontWithName:@"Material Symbols Outlined" size:self.dimension == VmfViewportDimension3D ? 16.0 : 14.0];
+        if (iconFont != nil) {
+            NSDictionary* attrs = @{
+                NSFontAttributeName: iconFont,
+                NSForegroundColorAttributeName: [NSColor colorWithCalibratedRed:0.99 green:0.88 blue:0.48 alpha:0.96]
+            };
+            if (self.dimension == VmfViewportDimension2D) {
+                for (size_t entityIndex = 0; entityIndex < self.vmfScene->entityCount; ++entityIndex) {
+                    const VmfEntity* entity = &self.vmfScene->entities[entityIndex];
+                    if (entity->kind != VmfEntityKindLight) {
+                        continue;
+                    }
+                    NSPoint p = [self viewPointForWorldPoint:entity->position];
+                    [@"lightbulb" drawAtPoint:NSMakePoint(p.x - 7.0, p.y - 8.0) withAttributes:attrs];
+                }
+            } else {
+                float aspect = fmaxf((float)self.metalView.bounds.size.width, 1.0f) / fmaxf((float)self.metalView.bounds.size.height, 1.0f);
+                Mat4 projection = [self projectionMatrixForAspect:aspect];
+                Vec3 eye;
+                Mat4 view = [self viewMatrixWithCameraPosition:&eye];
+                Mat4 viewProjection = cglm_mat4_mul(projection, view);
+                float viewProjectionArray[16];
+                copy_mat4_to_uniform(viewProjectionArray, viewProjection);
+                for (size_t entityIndex = 0; entityIndex < self.vmfScene->entityCount; ++entityIndex) {
+                    const VmfEntity* entity = &self.vmfScene->entities[entityIndex];
+                    if (entity->kind != VmfEntityKindLight) {
+                        continue;
+                    }
+                    NSPoint p;
+                    if (viewport_project_world_to_screen(viewProjectionArray, self.metalView.bounds.size, entity->position, &p)) {
+                        [@"lightbulb" drawAtPoint:NSMakePoint(p.x - 7.0, p.y - 8.0) withAttributes:attrs];
+                    }
+                }
+            }
+        }
+    }
+
     if (self.dimension != VmfViewportDimension2D) {
         return;
     }
@@ -7660,6 +7788,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
             !nova_tool_metal_renderer_draw_frame(&_fullMetalRenderer, errorBuffer, sizeof(errorBuffer))) {
             NSLog(@"Heavy Metal viewport draw failed: %s", errorBuffer);
         } else {
+            [self.overlayView setNeedsDisplay:YES];
             self.fullRendererFrameIndex += 1u;
             return;
         }
@@ -7732,10 +7861,39 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     if (!nova_tool_metal_editor_viewport_renderer_draw(&_metalRenderer, &drawInfo, errorBuffer, sizeof(errorBuffer))) {
         NSLog(@"Viewport renderer draw failed: %s", errorBuffer);
     }
+    [self.overlayView setNeedsDisplay:YES];
 }
 
 - (BOOL)handleViewportKeyDown:(NSEvent*)event {
     NSString* key = event.charactersIgnoringModifiers.lowercaseString;
+    if (self.dimension == VmfViewportDimension3D &&
+        self.editorTool == VmfViewportEditorToolSelect &&
+        !self.freeLookActive) {
+        if ([key isEqualToString:@"w"]) {
+            self.gizmoOperation = (NSUInteger)ImGuizmo::TRANSLATE;
+            [self refreshChrome];
+            [self.overlayView setNeedsDisplay:YES];
+            return YES;
+        }
+        if ([key isEqualToString:@"e"]) {
+            if (self.selectionRotatable) {
+                self.gizmoOperation = (NSUInteger)ImGuizmo::ROTATE;
+                [self refreshChrome];
+                [self.overlayView setNeedsDisplay:YES];
+            }
+            return YES;
+        }
+        if ([key isEqualToString:@"r"]) {
+            if (self.selectionRotatable) {
+                return YES;
+            }
+            self.gizmoOperation = (NSUInteger)ImGuizmo::SCALE;
+            [self refreshChrome];
+            [self.overlayView setNeedsDisplay:YES];
+            return YES;
+        }
+    }
+
     if (self.dimension == VmfViewportDimension3D &&
         [key isEqualToString:@"f"] &&
         self.selectionVisible &&

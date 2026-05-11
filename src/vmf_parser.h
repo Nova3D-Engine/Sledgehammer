@@ -63,6 +63,7 @@ typedef struct VmfEntity {
     char modelAssetPath[512];
     VmfEntityKind kind;
     Vec3 position;
+    Vec3 rotationDegrees;
     Vec3 modelHalfExtents;
     Vec3 color;
     float intensity;

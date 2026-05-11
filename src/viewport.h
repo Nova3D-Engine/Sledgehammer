@@ -69,6 +69,7 @@ typedef NS_ENUM(NSUInteger, VmfViewportSelectionEdge) {
 - (void)viewport:(VmfViewport*)viewport requestPaintAlignRayOrigin:(Vec3)origin direction:(Vec3)direction;
 - (void)viewport:(VmfViewport*)viewport requestFaceSelectionOnEdge:(VmfViewportSelectionEdge)edge;
 - (void)viewport:(VmfViewport*)viewport updateSelectionBounds:(Bounds3)bounds commit:(BOOL)commit transform:(VmfViewportSelectionTransform)transform;
+- (void)viewport:(VmfViewport*)viewport updateSelectionRotationDegrees:(Vec3)rotationDegrees commit:(BOOL)commit;
 - (void)viewport:(VmfViewport*)viewport updateSelectionVertexAtIndex:(size_t)vertexIndex position:(Vec3)position commit:(BOOL)commit;
 - (void)viewport:(VmfViewport*)viewport updateSelectionVerticesAtIndices:(const size_t*)indices positions:(const Vec3*)positions count:(size_t)count commit:(BOOL)commit;
 - (void)viewport:(VmfViewport*)viewport updateSelectionEdgeFirstSideIndex:(size_t)firstSideIndex secondSideIndex:(size_t)secondSideIndex offset:(Vec3)offset commit:(BOOL)commit;
@@ -116,6 +117,7 @@ typedef NS_ENUM(NSUInteger, VmfViewportSelectionEdge) {
 - (void)frameScene;
 - (void)setMovementForward:(BOOL)forward backward:(BOOL)backward left:(BOOL)left right:(BOOL)right;
 - (void)setSelectionBounds:(Bounds3)bounds visible:(BOOL)visible;
+- (void)setSelectionRotationDegrees:(Vec3)rotationDegrees rotatable:(BOOL)rotatable;
 - (void)setSelectionVertices:(const Vec3*)vertices count:(size_t)count visible:(BOOL)visible;
 - (void)setSelectionEdges:(const VmfSolidEdge*)edges count:(size_t)count visible:(BOOL)visible;
 - (void)setSelectedFaceEdge:(VmfViewportSelectionEdge)edge;

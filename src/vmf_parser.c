@@ -637,6 +637,8 @@ static int parse_entity_block(Parser* parser, VmfEntity* outEntity, int isWorld)
             outEntity->name[sizeof(outEntity->name) - 1] = '\0';
         } else if (strcmp(keyBuffer, "position") == 0 || strcmp(keyBuffer, "origin") == 0) {
             parse_bracket_vec3(valueBuffer, &outEntity->position);
+        } else if (strcmp(keyBuffer, "rotation") == 0) {
+            parse_bracket_vec3(valueBuffer, &outEntity->rotationDegrees);
         } else if (strcmp(keyBuffer, "color") == 0) {
             parse_color_vec3(valueBuffer, &outEntity->color);
         } else if (strcmp(keyBuffer, "intensity") == 0) {

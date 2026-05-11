@@ -134,6 +134,9 @@ typedef NS_ENUM(NSUInteger, ViewportHandle) {
 @property(nonatomic, assign) BOOL primaryLightEnabled;
 @property(nonatomic, assign) Bounds3 selectionBounds;
 @property(nonatomic, assign) BOOL selectionVisible;
+@property(nonatomic, assign) Vec3 selectionRotationDegrees;
+@property(nonatomic, assign) BOOL selectionRotatable;
+@property(nonatomic, assign) NSUInteger gizmoOperation;
 @property(nonatomic, assign) Vec3* selectionVertices;
 @property(nonatomic, assign) size_t selectionVertexCount;
 @property(nonatomic, assign) VmfSolidEdge* selectionEdges;
@@ -229,6 +232,9 @@ typedef NS_ENUM(NSUInteger, ViewportHandle) {
 @property(nonatomic, assign) void* imguiContext;
 @property(nonatomic, assign) BOOL gizmoHovered;
 @property(nonatomic, assign) BOOL gizmoInteractionActive;
+@property(nonatomic, assign) matrix_float4x4 gizmoInteractionMatrix;
+@property(nonatomic, assign) Bounds3 gizmoInteractionStartBounds;
+@property(nonatomic, assign) BOOL gizmoInteractionHasStart;
 @property(nonatomic, assign) BOOL orbitLerpActive;
 @property(nonatomic, assign) BOOL previewBakeInProgress;
 @property(nonatomic, assign) BOOL previewBakedLightingEnabled;

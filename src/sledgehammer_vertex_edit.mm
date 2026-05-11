@@ -188,6 +188,7 @@
         vmf_scene_solid_bounds(&_scene, self.selectedEntityIndex, self.selectedSolidIndex, &selectionBounds, boundsErr, sizeof(boundsErr));
         for (VmfViewport* viewport in self.viewports) {
             viewport.selectionEditable = YES;
+            [viewport setSelectionRotationDegrees:vec3_make(0.0f, 0.0f, 0.0f) rotatable:NO];
             [viewport setSelectionBounds:selectionBounds visible:YES];
             [viewport setSelectedFaceEdge:VmfViewportSelectionEdgeNone];
         }
@@ -203,6 +204,9 @@
     BOOL showSelection = self.hasSelection;
     BOOL prefabSelection = [self selectionIsPrefab];
     BOOL pointEntitySelection = [self selectionIsPointEntity];
+    BOOL modelPointSelection = pointEntitySelection &&
+        self.selectedEntityIndex < self.scene.entityCount &&
+        self.scene.entities[self.selectedEntityIndex].kind == VmfEntityKindModel;
     BOOL groupedBrushSelection = [self selectionIsGroupedBrushEntity];
     BOOL boxSelection = !prefabSelection && !groupedBrushSelection && [self isSelectedSolidBoxBrush];
     if (showSelection) {
@@ -249,6 +253,8 @@
     }
     for (VmfViewport* viewport in self.viewports) {
         viewport.selectionEditable = showSelection;
+        [viewport setSelectionRotationDegrees:(modelPointSelection ? self.scene.entities[self.selectedEntityIndex].rotationDegrees : vec3_make(0.0f, 0.0f, 0.0f))
+                                    rotatable:(showSelection && modelPointSelection)];
         [viewport setSelectionVertices:selectionVertices count:selectionVertexCount visible:(showSelection && !prefabSelection && !pointEntitySelection && !groupedBrushSelection)];
         [viewport setSelectionEdges:selectionEdges count:selectionEdgeCount visible:(showSelection && !prefabSelection && !pointEntitySelection && !groupedBrushSelection)];
         [viewport setSelectedFaceEdge:(showSelection && !prefabSelection && !pointEntitySelection && !groupedBrushSelection && self.hasFaceSelection && boxSelection) ? [self selectionEdgeForPlane:viewport.plane sideIndex:self.selectedSideIndex] : VmfViewportSelectionEdgeNone];

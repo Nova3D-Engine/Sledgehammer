@@ -448,6 +448,102 @@ bool sledgehammer_editor_logic_pick_point_entity_at_point(const VmfScene* scene,
     return found;
 }
 
+size_t sledgehammer_editor_logic_collect_pick_candidates_2d(const VmfScene* scene,
+                                                            Vec3 point,
+                                                            int plane,
+                                                            size_t* outEntityIndices,
+                                                            size_t* outSolidIndices,
+                                                            size_t maxCandidates) {
+    typedef struct PickCandidate2D {
+        size_t entityIndex;
+        size_t solidIndex;
+        float area;
+    } PickCandidate2D;
+    PickCandidate2D candidates[512];
+    size_t candidateCount = 0;
+    if (scene == NULL || outEntityIndices == NULL || outSolidIndices == NULL || maxCandidates == 0) {
+        return 0;
+    }
+
+    for (size_t entityIndex = 0; entityIndex < scene->entityCount; ++entityIndex) {
+        for (size_t solidIndex = 0; solidIndex < scene->entities[entityIndex].solidCount; ++solidIndex) {
+            Bounds3 bounds;
+            char errorBuffer[128] = { 0 };
+            if (!vmf_scene_solid_bounds(scene, entityIndex, solidIndex, &bounds, errorBuffer, sizeof(errorBuffer))) {
+                continue;
+            }
+            bounds = sledgehammer_editor_logic_normalize_bounds(bounds);
+
+            float minU = plane == SledgehammerViewportPlaneZY ? bounds.min.raw[1] : bounds.min.raw[0];
+            float maxU = plane == SledgehammerViewportPlaneZY ? bounds.max.raw[1] : bounds.max.raw[0];
+            float minV = plane == SledgehammerViewportPlaneXY ? bounds.min.raw[1] : bounds.min.raw[2];
+            float maxV = plane == SledgehammerViewportPlaneXY ? bounds.max.raw[1] : bounds.max.raw[2];
+            float u = plane == SledgehammerViewportPlaneZY ? point.raw[1] : point.raw[0];
+            float v = plane == SledgehammerViewportPlaneXY ? point.raw[1] : point.raw[2];
+            if (u < minU || u > maxU || v < minV || v > maxV) {
+                continue;
+            }
+
+            if (candidateCount < sizeof(candidates) / sizeof(candidates[0])) {
+                candidates[candidateCount++] = (PickCandidate2D) {
+                    .entityIndex = entityIndex,
+                    .solidIndex = solidIndex,
+                    .area = fabsf((maxU - minU) * (maxV - minV)),
+                };
+            }
+        }
+    }
+
+    for (size_t entityIndex = 0; entityIndex < scene->entityCount; ++entityIndex) {
+        const VmfEntity* entity = &scene->entities[entityIndex];
+        if (!sledgehammer_editor_logic_entity_is_point_entity(scene, entityIndex)) {
+            continue;
+        }
+        Bounds3 bounds = bounds3_empty();
+        char errorBuffer[128] = { 0 };
+        if (!vmf_scene_entity_bounds(scene, entityIndex, &bounds, errorBuffer, sizeof(errorBuffer))) {
+            continue;
+        }
+        float minU = plane == SledgehammerViewportPlaneZY ? bounds.min.raw[1] : bounds.min.raw[0];
+        float maxU = plane == SledgehammerViewportPlaneZY ? bounds.max.raw[1] : bounds.max.raw[0];
+        float minV = plane == SledgehammerViewportPlaneXY ? bounds.min.raw[1] : bounds.min.raw[2];
+        float maxV = plane == SledgehammerViewportPlaneXY ? bounds.max.raw[1] : bounds.max.raw[2];
+        float u = plane == SledgehammerViewportPlaneZY ? point.raw[1] : point.raw[0];
+        float v = plane == SledgehammerViewportPlaneXY ? point.raw[1] : point.raw[2];
+        if (u < minU || u > maxU || v < minV || v > maxV) {
+            continue;
+        }
+        if (candidateCount < sizeof(candidates) / sizeof(candidates[0])) {
+            candidates[candidateCount++] = (PickCandidate2D) {
+                .entityIndex = entityIndex,
+                .solidIndex = 0,
+                .area = fabsf((maxU - minU) * (maxV - minV)),
+            };
+        }
+    }
+
+    for (size_t i = 0; i < candidateCount; ++i) {
+        size_t bestIndex = i;
+        for (size_t j = i + 1; j < candidateCount; ++j) {
+            if (candidates[j].area < candidates[bestIndex].area) {
+                bestIndex = j;
+            }
+        }
+        if (bestIndex != i) {
+            PickCandidate2D tmp = candidates[i];
+            candidates[i] = candidates[bestIndex];
+            candidates[bestIndex] = tmp;
+        }
+    }
+
+    size_t writeCount = candidateCount < maxCandidates ? candidateCount : maxCandidates;
+    for (size_t index = 0; index < writeCount; ++index) {
+        outEntityIndices[index] = candidates[index].entityIndex;
+        outSolidIndices[index] = candidates[index].solidIndex;
+    }
+    return writeCount;
+}
+
 bool sledgehammer_editor_logic_pick_point_entity_ray(const VmfScene* scene,
                                                      Vec3 origin,
                                                      Vec3 direction,
@@ -491,64 +587,103 @@ bool sledgehammer_editor_logic_pick_point_entity_ray(const VmfScene* scene,
     return found;
 }
 
+size_t sledgehammer_editor_logic_collect_point_entity_ray_candidates(const VmfScene* scene,
+                                                                     Vec3 origin,
+                                                                     Vec3 direction,
+                                                                     size_t* outEntityIndices,
+                                                                     float* outDistances,
+                                                                     float* outPickRadii,
+                                                                     size_t maxCandidates) {
+    typedef struct PointRayCandidate {
+        size_t entityIndex;
+        float distance;
+        float radius;
+    } PointRayCandidate;
+    PointRayCandidate candidates[256];
+    size_t candidateCount = 0;
+    Vec3 normalizedDirection = vec3_normalize(direction);
+    if (scene == NULL || outEntityIndices == NULL || maxCandidates == 0) {
+        return 0;
+    }
+
+    for (size_t entityIndex = 0; entityIndex < scene->entityCount; ++entityIndex) {
+        const VmfEntity* entity = &scene->entities[entityIndex];
+        if (!sledgehammer_editor_logic_entity_is_point_entity(scene, entityIndex)) {
+            continue;
+        }
+        float radius = sledgehammer_editor_logic_entity_pick_radius(entity);
+        Vec3 toCenter = vec3_sub(entity->position, origin);
+        float projection = vec3_dot(toCenter, normalizedDirection);
+        if (projection < 0.0f) {
+            continue;
+        }
+        Vec3 closestPoint = vec3_add(origin, vec3_scale(normalizedDirection, projection));
+        float centerDistance = vec3_length(vec3_sub(entity->position, closestPoint));
+        if (centerDistance > radius) {
+            continue;
+        }
+        float surfaceDistance = projection - sqrtf(fmaxf((radius * radius) - (centerDistance * centerDistance), 0.0f));
+        if (candidateCount < sizeof(candidates) / sizeof(candidates[0])) {
+            candidates[candidateCount++] = (PointRayCandidate) {
+                .entityIndex = entityIndex,
+                .distance = surfaceDistance,
+                .radius = radius,
+            };
+        }
+    }
+
+    for (size_t i = 0; i < candidateCount; ++i) {
+        size_t bestIndex = i;
+        for (size_t j = i + 1; j < candidateCount; ++j) {
+            if (candidates[j].distance < candidates[bestIndex].distance - 1e-3f ||
+                (fabsf(candidates[j].distance - candidates[bestIndex].distance) <= 1e-3f &&
+                 candidates[j].radius < candidates[bestIndex].radius)) {
+                bestIndex = j;
+            }
+        }
+        if (bestIndex != i) {
+            PointRayCandidate tmp = candidates[i];
+            candidates[i] = candidates[bestIndex];
+            candidates[bestIndex] = tmp;
+        }
+    }
+
+    size_t writeCount = candidateCount < maxCandidates ? candidateCount : maxCandidates;
+    for (size_t index = 0; index < writeCount; ++index) {
+        outEntityIndices[index] = candidates[index].entityIndex;
+        if (outDistances != NULL) {
+            outDistances[index] = candidates[index].distance;
+        }
+        if (outPickRadii != NULL) {
+            outPickRadii[index] = candidates[index].radius;
+        }
+    }
+    return writeCount;
+}
+
 bool sledgehammer_editor_logic_pick_scene_at_point_2d(const VmfScene* scene,
                                                       Vec3 point,
                                                       int plane,
                                                       size_t* outEntityIndex,
                                                       size_t* outSolidIndex) {
-    size_t bestEntityIndex = 0;
-    size_t bestSolidIndex = 0;
-    float bestArea = FLT_MAX;
-    bool found = false;
-    if (scene == NULL) {
+    size_t entityIndices[1];
+    size_t solidIndices[1];
+    size_t count = sledgehammer_editor_logic_collect_pick_candidates_2d(scene,
+                                                                        point,
+                                                                        plane,
+                                                                        entityIndices,
+                                                                        solidIndices,
+                                                                        1);
+    if (count == 0) {
         return false;
     }
-
-    for (size_t entityIndex = 0; entityIndex < scene->entityCount; ++entityIndex) {
-        for (size_t solidIndex = 0; solidIndex < scene->entities[entityIndex].solidCount; ++solidIndex) {
-            Bounds3 bounds;
-            char errorBuffer[128] = { 0 };
-            if (!vmf_scene_solid_bounds(scene, entityIndex, solidIndex, &bounds, errorBuffer, sizeof(errorBuffer))) {
-                continue;
-            }
-            bounds = sledgehammer_editor_logic_normalize_bounds(bounds);
-
-            float minU = plane == SledgehammerViewportPlaneZY ? bounds.min.raw[1] : bounds.min.raw[0];
-            float maxU = plane == SledgehammerViewportPlaneZY ? bounds.max.raw[1] : bounds.max.raw[0];
-            float minV = plane == SledgehammerViewportPlaneXY ? bounds.min.raw[1] : bounds.min.raw[2];
-            float maxV = plane == SledgehammerViewportPlaneXY ? bounds.max.raw[1] : bounds.max.raw[2];
-            float u = plane == SledgehammerViewportPlaneZY ? point.raw[1] : point.raw[0];
-            float v = plane == SledgehammerViewportPlaneXY ? point.raw[1] : point.raw[2];
-            if (u < minU || u > maxU || v < minV || v > maxV) {
-                continue;
-            }
-
-            float area = (maxU - minU) * (maxV - minV);
-            if (!found || area < bestArea) {
-                found = true;
-                bestArea = area;
-                bestEntityIndex = entityIndex;
-                bestSolidIndex = solidIndex;
-            }
-        }
+    if (outEntityIndex != NULL) {
+        *outEntityIndex = entityIndices[0];
     }
-
-    if (!found) {
-        found = sledgehammer_editor_logic_pick_point_entity_at_point(scene, point, plane, &bestEntityIndex);
-        if (found) {
-            bestSolidIndex = 0;
-        }
+    if (outSolidIndex != NULL) {
+        *outSolidIndex = solidIndices[0];
     }
-
-    if (found) {
-        if (outEntityIndex != NULL) {
-            *outEntityIndex = bestEntityIndex;
-        }
-        if (outSolidIndex != NULL) {
-            *outSolidIndex = bestSolidIndex;
-        }
-    }
-    return found;
+    return true;
 }
 
 bool sledgehammer_editor_logic_is_draft_convex(const Vec3* draftVertices,

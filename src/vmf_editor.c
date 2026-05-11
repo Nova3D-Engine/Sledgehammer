@@ -367,6 +367,7 @@ static int clone_entity(const VmfEntity* source, VmfEntity* outEntity) {
     outEntity->spotOuterDegrees = source->spotOuterDegrees;
     outEntity->kind = source->kind;
     outEntity->position = source->position;
+    outEntity->rotationDegrees = source->rotationDegrees;
     outEntity->modelHalfExtents = source->modelHalfExtents;
     outEntity->color = source->color;
     outEntity->intensity = source->intensity;
@@ -1537,6 +1538,7 @@ int vmf_scene_save(const char* path, const VmfScene* scene, char* errorBuffer, s
             fprintf(file, "    \"spot_outer_degrees\" \"%.6f\"\n", entity->spotOuterDegrees);
         } else if (entity->kind == VmfEntityKindModel) {
             fprintf(file, "    \"position\" \"[%.6f %.6f %.6f]\"\n", entity->position.raw[0], entity->position.raw[1], entity->position.raw[2]);
+            fprintf(file, "    \"rotation\" \"[%.6f %.6f %.6f]\"\n", entity->rotationDegrees.raw[0], entity->rotationDegrees.raw[1], entity->rotationDegrees.raw[2]);
             fprintf(file, "    \"model\" \"%s\"\n", entity->modelAssetPath);
             fprintf(file, "    \"model_half_extents\" \"[%.6f %.6f %.6f]\"\n", entity->modelHalfExtents.raw[0], entity->modelHalfExtents.raw[1], entity->modelHalfExtents.raw[2]);
         }
@@ -1930,6 +1932,7 @@ int vmf_scene_add_model_entity(VmfScene* scene,
     entity.id = (int)scene_next_id(scene);
     entity.kind = VmfEntityKindModel;
     entity.position = position;
+    entity.rotationDegrees = vec3_make(0.0f, 0.0f, 0.0f);
     entity.modelHalfExtents = modelHalfExtents;
     entity.enabled = 1;
     entity.castShadows = 1;

@@ -40,6 +40,18 @@ static NSString* clip_mode_label(ViewerClipMode mode) {
     }
 }
 
+static NSAttributedString* material_icon_menu_title(NSString* iconName, NSString* label) {
+    NSMutableAttributedString* title = [[NSMutableAttributedString alloc] init];
+    NSFont* iconFont = [NSFont fontWithName:@"Material Symbols Outlined" size:15.0];
+    if (iconFont != nil) {
+        [title appendAttributedString:[[NSAttributedString alloc] initWithString:iconName
+                                                                       attributes:@{ NSFontAttributeName: iconFont }]];
+        [title appendAttributedString:[[NSAttributedString alloc] initWithString:@"  "]];
+    }
+    [title appendAttributedString:[[NSAttributedString alloc] initWithString:label]];
+    return title;
+}
+
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wobjc-protocol-method-implementation"
 @implementation ViewerAppDelegate (SledgehammerChrome)
@@ -130,6 +142,13 @@ static NSString* clip_mode_label(ViewerClipMode mode) {
     addToGroupItem.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift;
     [groupsMenu addItemWithTitle:@"Ungroup" action:@selector(ungroupSelection:) keyEquivalent:@"u"];
     [groupsItem setSubmenu:groupsMenu];
+
+    NSMenuItem* lightBakingItem = [[NSMenuItem alloc] initWithTitle:@"Light Baking" action:nil keyEquivalent:@""];
+    [mainMenu addItem:lightBakingItem];
+    NSMenu* lightBakingMenu = [[NSMenu alloc] initWithTitle:@"Light Baking"];
+    NSMenuItem* openDebugLightmapItem = [lightBakingMenu addItemWithTitle:@"Show Lightmap Debug" action:@selector(showLightmapDebugWindow:) keyEquivalent:@""];
+    openDebugLightmapItem.attributedTitle = material_icon_menu_title(@"deployed_code_update", @"Show Lightmap Debug");
+    [lightBakingItem setSubmenu:lightBakingMenu];
 
     [NSApp setMainMenu:mainMenu];
 }

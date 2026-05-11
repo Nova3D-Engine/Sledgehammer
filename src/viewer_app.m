@@ -2619,6 +2619,36 @@ static BOOL sledgehammer_model_asset_bounds(NSString* path, void* unused, Vec3* 
     }
 }
 
+- (void)viewport:(VmfViewport*)viewport updateSelectionRotationDegrees:(Vec3)rotationDegrees commit:(BOOL)commit {
+    (void)viewport;
+    if (!self.hasSelection || ![self selectionIsPointEntity] || self.selectedEntityIndex >= self.scene.entityCount) {
+        return;
+    }
+
+    VmfEntity* entity = &_scene.entities[self.selectedEntityIndex];
+    if (entity->kind != VmfEntityKindModel) {
+        return;
+    }
+
+    Vec3 delta = vec3_sub(rotationDegrees, entity->rotationDegrees);
+    if (vec3_length(delta) < 0.01f) {
+        if (commit && self.pendingHistoryEntry) {
+            [self commitPendingHistoryEntry];
+        }
+        return;
+    }
+
+    if (![self beginPendingHistoryEntryWithLabel:@"Rotate Model"]) {
+        return;
+    }
+
+    entity->rotationDegrees = rotationDegrees;
+    [self rebuildMeshFromSceneSyncHeavyRenderer:commit];
+    if (commit) {
+        [self commitPendingHistoryEntry];
+    }
+}
+
 - (void)viewport:(VmfViewport*)viewport createBlockWithBounds:(Bounds3)bounds {
     (void)viewport;
     if (!self.hasDocument) {

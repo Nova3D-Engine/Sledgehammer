@@ -1,6 +1,7 @@
 #import "sledgehammer_viewer_app_internal.h"
 
 #include "sledgehammer_editor_logic.h"
+#include <math.h>
 
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wobjc-protocol-method-implementation"
@@ -157,13 +158,32 @@
 }
 
 - (BOOL)selectSolidAtPoint:(Vec3)point plane:(VmfViewportPlane)plane {
+    size_t entityCandidates[256];
+    size_t solidCandidates[256];
+    size_t candidateCount = sledgehammer_editor_logic_collect_pick_candidates_2d(&_scene,
+                                                                                 point,
+                                                                                 (int)plane,
+                                                                                 entityCandidates,
+                                                                                 solidCandidates,
+                                                                                 sizeof(entityCandidates) / sizeof(entityCandidates[0]));
+    BOOL found = candidateCount > 0 ? YES : NO;
     size_t bestEntityIndex = 0;
     size_t bestSolidIndex = 0;
-    BOOL found = sledgehammer_editor_logic_pick_scene_at_point_2d(&_scene,
-                                                                  point,
-                                                                  (int)plane,
-                                                                  &bestEntityIndex,
-                                                                  &bestSolidIndex) ? YES : NO;
+    if (found) {
+        size_t selectedCandidate = 0;
+        for (size_t candidateIndex = 0; candidateIndex < candidateCount; ++candidateIndex) {
+            if (!self.hasSelection) {
+                break;
+            }
+            if (entityCandidates[candidateIndex] == self.selectedEntityIndex &&
+                solidCandidates[candidateIndex] == self.selectedSolidIndex) {
+                selectedCandidate = (candidateIndex + 1u) % candidateCount;
+                break;
+            }
+        }
+        bestEntityIndex = entityCandidates[selectedCandidate];
+        bestSolidIndex = solidCandidates[selectedCandidate];
+    }
 
     self.hasSelection = found;
     self.selectedEntityIndex = bestEntityIndex;
@@ -204,8 +224,98 @@
     size_t sideIndex = 0;
     Vec3 hitPoint = vec3_make(0.0f, 0.0f, 0.0f);
     char errorBuffer[256] = { 0 };
-    if (!vmf_scene_pick_ray(&_scene, origin, direction, &entityIndex, &solidIndex, &sideIndex, &hitPoint, errorBuffer, sizeof(errorBuffer))) {
-        if ([self pickPointEntityRayOrigin:origin direction:direction outEntityIndex:&entityIndex]) {
+    BOOL brushHit = vmf_scene_pick_ray(&_scene, origin, direction, &entityIndex, &solidIndex, &sideIndex, &hitPoint, errorBuffer, sizeof(errorBuffer)) ? YES : NO;
+    size_t pointEntityCandidates[64];
+    float pointEntityDistances[64];
+    float pointEntityRadii[64];
+    size_t pointEntityCandidateCount = sledgehammer_editor_logic_collect_point_entity_ray_candidates(&_scene,
+                                                                                                     origin,
+                                                                                                     direction,
+                                                                                                     pointEntityCandidates,
+                                                                                                     pointEntityDistances,
+                                                                                                     pointEntityRadii,
+                                                                                                     sizeof(pointEntityCandidates) / sizeof(pointEntityCandidates[0]));
+    if (!brushHit && pointEntityCandidateCount == 0) {
+        self.hasSelection = NO;
+        self.hasFaceSelection = NO;
+        self.editingPrefab = nil;
+        [self syncSelectionOverlay];
+        return;
+    }
+
+    size_t candidateEntity[66];
+    size_t candidateSolid[66];
+    BOOL candidateIsPointEntity[66];
+    float candidateDistance[66];
+    float candidateSize[66];
+    size_t candidateCount = 0;
+    if (brushHit) {
+        candidateEntity[candidateCount] = entityIndex;
+        candidateSolid[candidateCount] = solidIndex;
+        candidateIsPointEntity[candidateCount] = NO;
+        candidateDistance[candidateCount] = vec3_length(vec3_sub(hitPoint, origin));
+        Bounds3 brushBounds;
+        char boundsErrorBuffer[128] = { 0 };
+        float brushSize = 1024.0f;
+        if (vmf_scene_solid_bounds(&_scene, entityIndex, solidIndex, &brushBounds, boundsErrorBuffer, sizeof(boundsErrorBuffer))) {
+            Vec3 diag = vec3_sub(brushBounds.max, brushBounds.min);
+            brushSize = fmaxf(1.0f, vec3_length(diag));
+        }
+        candidateSize[candidateCount] = brushSize;
+        candidateCount += 1u;
+    }
+    for (size_t candidateIndex = 0; candidateIndex < pointEntityCandidateCount && candidateCount < sizeof(candidateEntity) / sizeof(candidateEntity[0]); ++candidateIndex) {
+        candidateEntity[candidateCount] = pointEntityCandidates[candidateIndex];
+        candidateSolid[candidateCount] = 0;
+        candidateIsPointEntity[candidateCount] = YES;
+        candidateDistance[candidateCount] = pointEntityDistances[candidateIndex];
+        candidateSize[candidateCount] = fmaxf(pointEntityRadii[candidateIndex], 1.0f);
+        candidateCount += 1u;
+    }
+    for (size_t i = 0; i < candidateCount; ++i) {
+        size_t bestIndex = i;
+        for (size_t j = i + 1; j < candidateCount; ++j) {
+            if (candidateDistance[j] < candidateDistance[bestIndex] - 1e-3f ||
+                (fabsf(candidateDistance[j] - candidateDistance[bestIndex]) <= 1e-3f &&
+                 candidateSize[j] < candidateSize[bestIndex])) {
+                bestIndex = j;
+            }
+        }
+        if (bestIndex != i) {
+            size_t tmpEntity = candidateEntity[i];
+            size_t tmpSolid = candidateSolid[i];
+            BOOL tmpPoint = candidateIsPointEntity[i];
+            float tmpDist = candidateDistance[i];
+            float tmpSize = candidateSize[i];
+            candidateEntity[i] = candidateEntity[bestIndex];
+            candidateSolid[i] = candidateSolid[bestIndex];
+            candidateIsPointEntity[i] = candidateIsPointEntity[bestIndex];
+            candidateDistance[i] = candidateDistance[bestIndex];
+            candidateSize[i] = candidateSize[bestIndex];
+            candidateEntity[bestIndex] = tmpEntity;
+            candidateSolid[bestIndex] = tmpSolid;
+            candidateIsPointEntity[bestIndex] = tmpPoint;
+            candidateDistance[bestIndex] = tmpDist;
+            candidateSize[bestIndex] = tmpSize;
+        }
+    }
+
+    size_t selectedCandidate = 0;
+    for (size_t candidateIndex = 0; candidateIndex < candidateCount; ++candidateIndex) {
+        if (!self.hasSelection) {
+            break;
+        }
+        if (candidateEntity[candidateIndex] == self.selectedEntityIndex &&
+            candidateSolid[candidateIndex] == self.selectedSolidIndex &&
+            candidateIsPointEntity[candidateIndex] == [self selectionIsPointEntity]) {
+            selectedCandidate = (candidateIndex + 1u) % candidateCount;
+            break;
+        }
+    }
+
+    entityIndex = candidateEntity[selectedCandidate];
+    solidIndex = candidateSolid[selectedCandidate];
+    if (candidateIsPointEntity[selectedCandidate]) {
             self.hasSelection = YES;
             self.selectedEntityIndex = entityIndex;
             self.selectedSolidIndex = 0;
@@ -214,12 +324,6 @@
             self.selectedSideIndex = 0;
             [self syncSelectionOverlay];
             return;
-        }
-        self.hasSelection = NO;
-        self.hasFaceSelection = NO;
-        self.editingPrefab = nil;
-        [self syncSelectionOverlay];
-        return;
     }
 
     self.hasSelection = YES;

@@ -30,6 +30,44 @@ static Vec3 transform_direction_matrix(const float matrix[16], Vec3 direction) {
     return result;
 }
 
+static float vmf_geometry_degrees_to_radians(float degrees) {
+    return degrees * (float)M_PI / 180.0f;
+}
+
+static void vmf_geometry_fill_euler_rotation_matrix(Vec3 rotationDegrees, float outMatrix[16]) {
+    float rx = vmf_geometry_degrees_to_radians(rotationDegrees.raw[0]);
+    float ry = vmf_geometry_degrees_to_radians(rotationDegrees.raw[1]);
+    float rz = vmf_geometry_degrees_to_radians(rotationDegrees.raw[2]);
+    float cx = cosf(rx), sx = sinf(rx);
+    float cy = cosf(ry), sy = sinf(ry);
+    float cz = cosf(rz), sz = sinf(rz);
+    outMatrix[0] = cy * cz;
+    outMatrix[1] = cy * sz;
+    outMatrix[2] = -sy;
+    outMatrix[3] = 0.0f;
+    outMatrix[4] = sx * sy * cz - cx * sz;
+    outMatrix[5] = sx * sy * sz + cx * cz;
+    outMatrix[6] = sx * cy;
+    outMatrix[7] = 0.0f;
+    outMatrix[8] = cx * sy * cz + sx * sz;
+    outMatrix[9] = cx * sy * sz - sx * cz;
+    outMatrix[10] = cx * cy;
+    outMatrix[11] = 0.0f;
+    outMatrix[12] = 0.0f;
+    outMatrix[13] = 0.0f;
+    outMatrix[14] = 0.0f;
+    outMatrix[15] = 1.0f;
+}
+
+static void vmf_geometry_fill_model_world_matrix(const VmfEntity* entity, float outMatrix[16]) {
+    vmf_geometry_fill_euler_rotation_matrix(entity != NULL ? entity->rotationDegrees : vec3_make(0.0f, 0.0f, 0.0f), outMatrix);
+    if (entity != NULL) {
+        outMatrix[12] = entity->position.raw[0];
+        outMatrix[13] = entity->position.raw[1];
+        outMatrix[14] = entity->position.raw[2];
+    }
+}
+
 static Bounds3 scene_vertex_bounds(const NovaSceneData* scene) {
     Bounds3 bounds = bounds3_empty();
     if (scene == NULL || scene->vertices == NULL) {
@@ -281,10 +319,6 @@ static int append_polygon_edges(ViewerMesh* mesh, const Vec3* polygon, size_t po
     return 1;
 }
 
-static int append_triangle_edges(ViewerMesh* mesh, ViewerVertex a, ViewerVertex b, ViewerVertex c) {
-    return append_line(mesh, a, b) && append_line(mesh, b, c) && append_line(mesh, c, a);
-}
-
 static int displacement_start_corner(const Vec3* quad, Vec3 startPosition) {
     int bestIndex = 0;
     float bestDistance = FLT_MAX;
@@ -320,9 +354,6 @@ static int triangulate_displacement(const VmfSide* side,
     Vec3 color = color_from_material(side->material);
 
     size_t edgeVertexStart = mesh->edgeVertexCount;
-    if (!append_polygon_edges(mesh, polygon, polygonCount, faceNormal, color)) {
-        return 0;
-    }
 
     size_t vertexStart = mesh->vertexCount;
     for (int y = 0; y < resolution - 1; ++y) {
@@ -363,9 +394,7 @@ static int triangulate_displacement(const VmfSide* side,
             }
 
             if (!append_triangle(mesh, cell[0], cell[1], cell[2]) ||
-                !append_triangle(mesh, cell[0], cell[2], cell[3]) ||
-                !append_triangle_edges(mesh, cell[0], cell[1], cell[2]) ||
-                !append_triangle_edges(mesh, cell[0], cell[2], cell[3])) {
+                !append_triangle(mesh, cell[0], cell[2], cell[3])) {
                 return 0;
             }
         }
@@ -498,61 +527,6 @@ static int triangulate_solid(const VmfSolid* solid, ViewerMesh* mesh, size_t ent
     return 1;
 }
 
-static int append_light_marker(ViewerMesh* mesh, const VmfEntity* entity, size_t entityIndex) {
-    float radius = fmaxf(entity->range * 0.0625f, 16.0f);
-    Vec3 center = entity->position;
-    Vec3 color = entity->enabled ? entity->color : vec3_make(0.45f, 0.45f, 0.45f);
-    Vec3 top = vec3_add(center, vec3_make(0.0f, 0.0f, radius));
-    Vec3 bottom = vec3_add(center, vec3_make(0.0f, 0.0f, -radius));
-    Vec3 east = vec3_add(center, vec3_make(radius, 0.0f, 0.0f));
-    Vec3 west = vec3_add(center, vec3_make(-radius, 0.0f, 0.0f));
-    Vec3 north = vec3_add(center, vec3_make(0.0f, radius, 0.0f));
-    Vec3 south = vec3_add(center, vec3_make(0.0f, -radius, 0.0f));
-    size_t vertexStart = mesh->vertexCount;
-    size_t edgeVertexStart = mesh->edgeVertexCount;
-
-    ViewerVertex vTop = { .position = top, .normal = vec3_make(0.0f, 0.0f, 1.0f), .color = color };
-    ViewerVertex vBottom = { .position = bottom, .normal = vec3_make(0.0f, 0.0f, -1.0f), .color = color };
-    ViewerVertex vEast = { .position = east, .normal = vec3_make(1.0f, 0.0f, 0.0f), .color = color };
-    ViewerVertex vWest = { .position = west, .normal = vec3_make(-1.0f, 0.0f, 0.0f), .color = color };
-    ViewerVertex vNorth = { .position = north, .normal = vec3_make(0.0f, 1.0f, 0.0f), .color = color };
-    ViewerVertex vSouth = { .position = south, .normal = vec3_make(0.0f, -1.0f, 0.0f), .color = color };
-
-    if (!append_triangle(mesh, vTop, vEast, vNorth) ||
-        !append_triangle(mesh, vTop, vNorth, vWest) ||
-        !append_triangle(mesh, vTop, vWest, vSouth) ||
-        !append_triangle(mesh, vTop, vSouth, vEast) ||
-        !append_triangle(mesh, vBottom, vNorth, vEast) ||
-        !append_triangle(mesh, vBottom, vWest, vNorth) ||
-        !append_triangle(mesh, vBottom, vSouth, vWest) ||
-        !append_triangle(mesh, vBottom, vEast, vSouth)) {
-        return 0;
-    }
-
-    if (!append_line(mesh, vTop, vBottom) ||
-        !append_line(mesh, vEast, vWest) ||
-        !append_line(mesh, vNorth, vSouth)) {
-        return 0;
-    }
-
-    if (!reserve_face_ranges(mesh, mesh->faceRangeCount + 1)) {
-        return 0;
-    }
-
-    ViewerFaceRange lightRange = {
-        .entityIndex = entityIndex,
-        .solidIndex = 0,
-        .sideIndex = 0,
-        .vertexStart = vertexStart,
-        .vertexCount = mesh->vertexCount - vertexStart,
-        .edgeVertexStart = edgeVertexStart,
-        .edgeVertexCount = mesh->edgeVertexCount - edgeVertexStart,
-    };
-    snprintf(lightRange.material, sizeof(lightRange.material), "%s", "light_marker");
-    mesh->faceRanges[mesh->faceRangeCount++] = lightRange;
-    return 1;
-}
-
 static int append_model_marker(ViewerMesh* mesh, const VmfEntity* entity, size_t entityIndex) {
     NovaSceneData scene;
     char errorText[512] = {0};
@@ -565,6 +539,8 @@ static int append_model_marker(ViewerMesh* mesh, const VmfEntity* entity, size_t
             Bounds3 modelBounds = scene_vertex_bounds(&scene);
             Vec3 sceneCenter = bounds3_is_valid(modelBounds) ? bounds3_center(modelBounds) : vec3_make(0.0f, 0.0f, 0.0f);
             Vec3 color = vec3_make(0.30f, 0.78f, 0.98f);
+            float worldMatrix[16];
+            vmf_geometry_fill_model_world_matrix(entity, worldMatrix);
 
             if (scene.objectCount > 0u && scene.objects != NULL) {
                 for (uint32_t objectIndex = 0u; objectIndex < scene.objectCount; ++objectIndex) {
@@ -587,10 +563,9 @@ static int append_model_marker(ViewerMesh* mesh, const VmfEntity* entity, size_t
                         for (uint32_t triVertex = 0u; triVertex < 3u; ++triVertex) {
                             const NovaSceneVertex* src = &scene.vertices[vertexOffset + tri + triVertex];
                             Vec3 localPosition = vec3_sub(vec3_make(src->position[0], src->position[1], src->position[2]), sceneCenter);
-                            Vec3 worldPosition = transform_point_matrix(object->worldMatrix, localPosition);
-                            worldPosition = vec3_add(worldPosition, entity->position);
+                            Vec3 worldPosition = transform_point_matrix(worldMatrix, localPosition);
                             Vec3 normal = vec3_make(src->normal[0], src->normal[1], src->normal[2]);
-                            normal = transform_direction_matrix(object->worldMatrix, normal);
+                            normal = transform_direction_matrix(worldMatrix, normal);
                             if (vec3_length(normal) < 1e-5f) {
                                 normal = vec3_make(0.0f, 0.0f, 1.0f);
                             } else {
@@ -606,8 +581,7 @@ static int append_model_marker(ViewerMesh* mesh, const VmfEntity* entity, size_t
                             triangle[triVertex].lightmapV = src->lightmapUv[1];
                         }
 
-                        if (!append_triangle(mesh, triangle[0], triangle[1], triangle[2]) ||
-                            !append_triangle_edges(mesh, triangle[0], triangle[1], triangle[2])) {
+                        if (!append_triangle(mesh, triangle[0], triangle[1], triangle[2])) {
                             nova_scene_data_release(&scene);
                             return 0;
                         }
@@ -643,6 +617,8 @@ static int append_model_marker(ViewerMesh* mesh, const VmfEntity* entity, size_t
     Vec3 center = entity->position;
     Vec3 extents = entity->modelHalfExtents;
     Vec3 color = vec3_make(0.30f, 0.78f, 0.98f);
+    float worldMatrix[16];
+    vmf_geometry_fill_model_world_matrix(entity, worldMatrix);
 
     if (extents.raw[0] <= 1e-3f) {
         extents.raw[0] = 16.0f;
@@ -667,7 +643,7 @@ static int append_model_marker(ViewerMesh* mesh, const VmfEntity* entity, size_t
 
     ViewerVertex v[8];
     for (int i = 0; i < 8; ++i) {
-        v[i].position = corners[i];
+        v[i].position = transform_point_matrix(worldMatrix, vec3_sub(corners[i], center));
         v[i].normal = vec3_make(0.0f, 0.0f, 1.0f);
         v[i].color = color;
     }
@@ -721,11 +697,6 @@ int vmf_build_mesh(const VmfScene* scene, ViewerMesh* outMesh, char* errorBuffer
     for (size_t entityIndex = 0; entityIndex < scene->entityCount; ++entityIndex) {
         const VmfEntity* entity = &scene->entities[entityIndex];
         if (entity->kind == VmfEntityKindLight) {
-            if (!append_light_marker(outMesh, entity, entityIndex)) {
-                viewer_mesh_free(outMesh);
-                snprintf(errorBuffer, errorBufferSize, "failed to build light entity geometry");
-                return 0;
-            }
             continue;
         }
         if (entity->kind == VmfEntityKindModel) {
