@@ -121,6 +121,9 @@ typedef NS_ENUM(NSUInteger, ViewerClipMode) {
 @property(nonatomic, strong) NSSlider* lightIntensitySlider;
 @property(nonatomic, strong) NSTextField* lightRangeValueLabel;
 @property(nonatomic, strong) NSSlider* lightRangeSlider;
+@property(nonatomic, strong) NSTextField* lightSourceSizeLabel;
+@property(nonatomic, strong) NSTextField* lightSourceSizeValueLabel;
+@property(nonatomic, strong) NSSlider* lightSourceSizeSlider;
 @property(nonatomic, strong) NSStackView* lightSpotSettingsView;
 @property(nonatomic, strong) NSTextField* lightSpotInnerValueLabel;
 @property(nonatomic, strong) NSSlider* lightSpotInnerSlider;
@@ -246,6 +249,7 @@ typedef NS_ENUM(NSUInteger, ViewerClipMode) {
 - (void)buildInspectorUI;
 - (NSTextField*)inspectorSectionLabel:(NSString*)title;
 - (NSTextField*)inspectorBodyLabel:(NSString*)value;
+- (NSTextField*)inspectorNumericFieldWithAction:(SEL)action;
 - (void)buildFaceTextureInspectorView;
 - (void)buildLightInspectorView;
 - (void)buildViewportLayoutWithDevice:(id<MTLDevice>)device;
@@ -299,6 +303,7 @@ typedef NS_ENUM(NSUInteger, ViewerClipMode) {
 - (void)lightColorChanged:(id)sender;
 - (void)lightIntensityChanged:(id)sender;
 - (void)lightRangeChanged:(id)sender;
+- (void)lightSourceSizeChanged:(id)sender;
 - (void)lightTypeChanged:(id)sender;
 - (void)lightSpotInnerChanged:(id)sender;
 - (void)lightSpotOuterChanged:(id)sender;

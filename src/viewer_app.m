@@ -30,12 +30,43 @@ static NSString* const kAppDisplayName = @"Sledgehammer";
 
 static NSString* light_type_label(int lightType) {
     switch (lightType) {
+        case UI_LIGHT_SUN:
+            return @"Sun";
         case UI_LIGHT_SPOT:
             return @"Spot";
         case UI_LIGHT_POINT:
         default:
             return @"Point";
     }
+}
+
+static float viewer_light_degrees_to_radians(float degrees) {
+    return degrees * (float)M_PI / 180.0f;
+}
+
+static void viewer_fill_light_world_matrix(Vec3 position, Vec3 rotationDegrees, float outMatrix[16]) {
+    float rx = viewer_light_degrees_to_radians(rotationDegrees.raw[0]);
+    float ry = viewer_light_degrees_to_radians(rotationDegrees.raw[1]);
+    float rz = viewer_light_degrees_to_radians(rotationDegrees.raw[2]);
+    float cx = cosf(rx), sx = sinf(rx);
+    float cy = cosf(ry), sy = sinf(ry);
+    float cz = cosf(rz), sz = sinf(rz);
+    outMatrix[0] = cy * cz;
+    outMatrix[1] = cy * sz;
+    outMatrix[2] = -sy;
+    outMatrix[3] = 0.0f;
+    outMatrix[4] = sx * sy * cz - cx * sz;
+    outMatrix[5] = sx * sy * sz + cx * cz;
+    outMatrix[6] = sx * cy;
+    outMatrix[7] = 0.0f;
+    outMatrix[8] = cx * sy * cz + sx * sz;
+    outMatrix[9] = cx * sy * sz - sx * cz;
+    outMatrix[10] = cx * cy;
+    outMatrix[11] = 0.0f;
+    outMatrix[12] = position.raw[0];
+    outMatrix[13] = position.raw[1];
+    outMatrix[14] = position.raw[2];
+    outMatrix[15] = 1.0f;
 }
 
 @implementation ViewerAppDelegate
@@ -769,7 +800,7 @@ static NSString* light_type_label(int lightType) {
             subtitle = @"Model placement is editable through the viewport and saved in the scene.";
         } else {
             title = @"Light";
-            subtitle = @"Point and spot light properties update the scene and renderer live.";
+            subtitle = @"Point, spot, and sun light properties update the scene and renderer live.";
         }
     } else if (self.hasSelection) {
         title = self.hasFaceSelection ? @"Face" : @"Brush";
@@ -1222,7 +1253,7 @@ static NSString* light_type_label(int lightType) {
         [self setStairsTool:nil];
     } else if ([key isEqualToString:@"a"]) {
         [self setArchTool:nil];
-    } else if ([key isEqualToString:@"e"]) {
+    } else if ([key isEqualToString:@"m"]) {
         [self setVertexTool:nil];
     } else if ([key isEqualToString:@"x"]) {
         [self setClipTool:nil];
@@ -1234,8 +1265,6 @@ static NSString* light_type_label(int lightType) {
         [self previousDocument:nil];
     } else if ([key isEqualToString:@"k"]) {
         [self frameScene:nil];
-    } else if ([key isEqualToString:@"r"]) {
-        [self reloadDocument:nil];
     } else if ([event.charactersIgnoringModifiers isEqualToString:@"\177"]) {
         [self deleteSelection:nil];
     }
@@ -1282,13 +1311,7 @@ static NSString* light_type_label(int lightType) {
         record->enabled = entity->enabled;
         record->castShadows = entity->castShadows;
         record->shadowPcss = 0;
-        record->worldMatrix[0] = 1.0f;
-        record->worldMatrix[5] = 1.0f;
-        record->worldMatrix[10] = 1.0f;
-        record->worldMatrix[15] = 1.0f;
-        record->worldMatrix[12] = entity->position.raw[0];
-        record->worldMatrix[13] = entity->position.raw[1];
-        record->worldMatrix[14] = entity->position.raw[2];
+        viewer_fill_light_world_matrix(entity->position, entity->rotationDegrees, record->worldMatrix);
         record->color[0] = entity->color.raw[0];
         record->color[1] = entity->color.raw[1];
         record->color[2] = entity->color.raw[2];
@@ -1298,7 +1321,9 @@ static NSString* light_type_label(int lightType) {
         record->spotOuterDegrees = entity->spotOuterDegrees;
         record->quadHalfSize[0] = 32.0f;
         record->quadHalfSize[1] = 32.0f;
-        record->sourceSize = 0.25f;
+        record->sourceSize = entity->lightType == UI_LIGHT_SUN
+            ? fmaxf(entity->sourceSize, 0.53f)
+            : fmaxf(entity->sourceSize, 0.01f);
         record->shadowConstantBias = 0.001f;
         lightCount += 1u;
     }
@@ -2626,7 +2651,7 @@ static BOOL sledgehammer_model_asset_bounds(NSString* path, void* unused, Vec3* 
     }
 
     VmfEntity* entity = &_scene.entities[self.selectedEntityIndex];
-    if (entity->kind != VmfEntityKindModel) {
+    if (entity->kind != VmfEntityKindModel && entity->kind != VmfEntityKindLight) {
         return;
     }
 
@@ -2638,7 +2663,8 @@ static BOOL sledgehammer_model_asset_bounds(NSString* path, void* unused, Vec3* 
         return;
     }
 
-    if (![self beginPendingHistoryEntryWithLabel:@"Rotate Model"]) {
+    NSString* historyLabel = entity->kind == VmfEntityKindLight ? @"Rotate Light" : @"Rotate Model";
+    if (![self beginPendingHistoryEntryWithLabel:historyLabel]) {
         return;
     }
 

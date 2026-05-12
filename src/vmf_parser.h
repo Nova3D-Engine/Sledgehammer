@@ -57,6 +57,7 @@ typedef struct VmfEntity {
     int lightType;
     float spotInnerDegrees;
     float spotOuterDegrees;
+    float sourceSize;
     char classname[128];
     char targetname[128];
     char name[128];

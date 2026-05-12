@@ -568,6 +568,7 @@ static int parse_entity_block(Parser* parser, VmfEntity* outEntity, int isWorld)
     outEntity->lightType = 3;
     outEntity->spotInnerDegrees = 18.0f;
     outEntity->spotOuterDegrees = 28.0f;
+    outEntity->sourceSize = 8.0f;
     outEntity->color = vec3_make(1.0f, 0.95f, 0.8f);
     outEntity->intensity = 10.0f;
     outEntity->range = 512.0f;
@@ -655,6 +656,8 @@ static int parse_entity_block(Parser* parser, VmfEntity* outEntity, int isWorld)
             outEntity->spotInnerDegrees = strtof(valueBuffer, NULL);
         } else if (strcmp(keyBuffer, "spot_outer_degrees") == 0) {
             outEntity->spotOuterDegrees = strtof(valueBuffer, NULL);
+        } else if (strcmp(keyBuffer, "source_size") == 0) {
+            outEntity->sourceSize = strtof(valueBuffer, NULL);
         } else if (strcmp(keyBuffer, "model") == 0) {
             strncpy(outEntity->modelAssetPath, valueBuffer, sizeof(outEntity->modelAssetPath) - 1);
             outEntity->modelAssetPath[sizeof(outEntity->modelAssetPath) - 1] = '\0';
@@ -672,6 +675,13 @@ static int parse_entity_block(Parser* parser, VmfEntity* outEntity, int isWorld)
             } else if (strcmp(valueBuffer, "light") == 0 || strcmp(valueBuffer, "light_point") == 0) {
                 outEntity->kind = VmfEntityKindLight;
                 outEntity->isWorld = 0;
+            } else if (strcmp(valueBuffer, "light_sun") == 0) {
+                outEntity->kind = VmfEntityKindLight;
+                outEntity->isWorld = 0;
+                outEntity->lightType = 0;
+                if (outEntity->sourceSize < 0.53f) {
+                    outEntity->sourceSize = 0.53f;
+                }
             } else if (strcmp(valueBuffer, "prop_static") == 0 || strcmp(valueBuffer, "prop_dynamic") == 0) {
                 outEntity->kind = VmfEntityKindModel;
                 outEntity->isWorld = 0;

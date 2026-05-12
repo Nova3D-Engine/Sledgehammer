@@ -10,6 +10,16 @@
     if (!self.hasSelection) {
         return;
     }
+    if (self.selectedEntityIndex >= self.scene.entityCount ||
+        [self selectionIsPointEntity] ||
+        [self selectionIsPrefab] ||
+        [self selectionActsAsGroupedBrushEntity]) {
+        return;
+    }
+    VmfEntity* entity = &self.scene.entities[self.selectedEntityIndex];
+    if (self.selectedSolidIndex >= entity->solidCount || entity->solids == NULL) {
+        return;
+    }
     if (_hasVertexEditSession &&
         _vertexEditEntityIndex == self.selectedEntityIndex &&
         _vertexEditSolidIndex == self.selectedSolidIndex) {
@@ -24,22 +34,30 @@
 
     _draftVertexCount = 0;
     char vertErr[256] = { 0 };
-    vmf_scene_solid_vertices(&_scene,
-                             self.selectedEntityIndex,
-                             self.selectedSolidIndex,
-                             _draftVertices,
-                             VMF_MAX_SOLID_VERTICES,
-                             &_draftVertexCount,
-                             vertErr, sizeof(vertErr));
+    if (!vmf_scene_solid_vertices(&_scene,
+                                  self.selectedEntityIndex,
+                                  self.selectedSolidIndex,
+                                  _draftVertices,
+                                  VMF_MAX_SOLID_VERTICES,
+                                  &_draftVertexCount,
+                                  vertErr, sizeof(vertErr)) ||
+        _draftVertexCount == 0) {
+        _hasVertexEditSession = NO;
+        return;
+    }
 
     VmfSolidEdge edges[VMF_MAX_SOLID_EDGES];
     size_t edgeCount = 0;
     char edgeErr[256] = { 0 };
-    vmf_scene_solid_edges(&_scene,
-                          self.selectedEntityIndex,
-                          self.selectedSolidIndex,
-                          edges, VMF_MAX_SOLID_EDGES, &edgeCount,
-                          edgeErr, sizeof(edgeErr));
+    if (!vmf_scene_solid_edges(&_scene,
+                               self.selectedEntityIndex,
+                               self.selectedSolidIndex,
+                               edges, VMF_MAX_SOLID_EDGES, &edgeCount,
+                               edgeErr, sizeof(edgeErr))) {
+        _hasVertexEditSession = NO;
+        _draftVertexCount = 0;
+        return;
+    }
     _draftEdgeConnCount = 0;
     for (size_t i = 0; i < edgeCount; ++i) {
         size_t vA = SIZE_MAX, vB = SIZE_MAX;
@@ -56,7 +74,7 @@
     }
 
     _draftFaceCount = 0;
-    VmfSolid* baseSolid = &_scene.entities[_vertexEditEntityIndex].solids[_vertexEditSolidIndex];
+    VmfSolid* baseSolid = &entity->solids[_vertexEditSolidIndex];
     Vec3 interior = vec3_make(0.0f, 0.0f, 0.0f);
     float sampleCount = 0.0f;
     for (size_t s = 0; s < baseSolid->sideCount; ++s) {
@@ -204,9 +222,17 @@
     BOOL showSelection = self.hasSelection;
     BOOL prefabSelection = [self selectionIsPrefab];
     BOOL pointEntitySelection = [self selectionIsPointEntity];
-    BOOL modelPointSelection = pointEntitySelection &&
-        self.selectedEntityIndex < self.scene.entityCount &&
-        self.scene.entities[self.selectedEntityIndex].kind == VmfEntityKindModel;
+    BOOL rotatablePointSelection = NO;
+    Vec3 pointEntityRotation = vec3_make(0.0f, 0.0f, 0.0f);
+    if (pointEntitySelection && self.selectedEntityIndex < self.scene.entityCount) {
+        const VmfEntity* entity = &self.scene.entities[self.selectedEntityIndex];
+        if (entity->kind == VmfEntityKindModel ||
+            (entity->kind == VmfEntityKindLight &&
+             (entity->lightType == UI_LIGHT_SPOT || entity->lightType == UI_LIGHT_SUN))) {
+            rotatablePointSelection = YES;
+            pointEntityRotation = entity->rotationDegrees;
+        }
+    }
     BOOL groupedBrushSelection = [self selectionIsGroupedBrushEntity];
     BOOL boxSelection = !prefabSelection && !groupedBrushSelection && [self isSelectedSolidBoxBrush];
     if (showSelection) {
@@ -253,8 +279,8 @@
     }
     for (VmfViewport* viewport in self.viewports) {
         viewport.selectionEditable = showSelection;
-        [viewport setSelectionRotationDegrees:(modelPointSelection ? self.scene.entities[self.selectedEntityIndex].rotationDegrees : vec3_make(0.0f, 0.0f, 0.0f))
-                                    rotatable:(showSelection && modelPointSelection)];
+        [viewport setSelectionRotationDegrees:(rotatablePointSelection ? pointEntityRotation : vec3_make(0.0f, 0.0f, 0.0f))
+                                    rotatable:(showSelection && rotatablePointSelection)];
         [viewport setSelectionVertices:selectionVertices count:selectionVertexCount visible:(showSelection && !prefabSelection && !pointEntitySelection && !groupedBrushSelection)];
         [viewport setSelectionEdges:selectionEdges count:selectionEdgeCount visible:(showSelection && !prefabSelection && !pointEntitySelection && !groupedBrushSelection)];
         [viewport setSelectedFaceEdge:(showSelection && !prefabSelection && !pointEntitySelection && !groupedBrushSelection && self.hasFaceSelection && boxSelection) ? [self selectionEdgeForPlane:viewport.plane sideIndex:self.selectedSideIndex] : VmfViewportSelectionEdgeNone];

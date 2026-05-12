@@ -115,7 +115,7 @@ static NSAttributedString* material_icon_menu_title(NSString* iconName, NSString
     [mainMenu addItem:toolsItem];
     NSMenu* toolsMenu = [[NSMenu alloc] initWithTitle:@"Tools"];
     [toolsMenu addItemWithTitle:@"Selection Tool" action:@selector(setSelectTool:) keyEquivalent:@"v"];
-    [toolsMenu addItemWithTitle:@"Vertex Tool" action:@selector(setVertexTool:) keyEquivalent:@"e"];
+    [toolsMenu addItemWithTitle:@"Vertex Tool" action:@selector(setVertexTool:) keyEquivalent:@"m"];
     [toolsMenu addItemWithTitle:@"Block Tool" action:@selector(setBlockTool:) keyEquivalent:@"b"];
     [toolsMenu addItemWithTitle:@"Cylinder Tool" action:@selector(setCylinderTool:) keyEquivalent:@"c"];
     [toolsMenu addItemWithTitle:@"Ramp Tool" action:@selector(setRampTool:) keyEquivalent:@"g"];

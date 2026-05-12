@@ -365,6 +365,7 @@ static int clone_entity(const VmfEntity* source, VmfEntity* outEntity) {
     outEntity->lightType = source->lightType;
     outEntity->spotInnerDegrees = source->spotInnerDegrees;
     outEntity->spotOuterDegrees = source->spotOuterDegrees;
+    outEntity->sourceSize = source->sourceSize;
     outEntity->kind = source->kind;
     outEntity->position = source->position;
     outEntity->rotationDegrees = source->rotationDegrees;
@@ -1536,6 +1537,8 @@ int vmf_scene_save(const char* path, const VmfScene* scene, char* errorBuffer, s
             fprintf(file, "    \"light_type\" \"%d\"\n", entity->lightType);
             fprintf(file, "    \"spot_inner_degrees\" \"%.6f\"\n", entity->spotInnerDegrees);
             fprintf(file, "    \"spot_outer_degrees\" \"%.6f\"\n", entity->spotOuterDegrees);
+            fprintf(file, "    \"rotation\" \"[%.6f %.6f %.6f]\"\n", entity->rotationDegrees.raw[0], entity->rotationDegrees.raw[1], entity->rotationDegrees.raw[2]);
+            fprintf(file, "    \"source_size\" \"%.6f\"\n", entity->sourceSize);
         } else if (entity->kind == VmfEntityKindModel) {
             fprintf(file, "    \"position\" \"[%.6f %.6f %.6f]\"\n", entity->position.raw[0], entity->position.raw[1], entity->position.raw[2]);
             fprintf(file, "    \"rotation\" \"[%.6f %.6f %.6f]\"\n", entity->rotationDegrees.raw[0], entity->rotationDegrees.raw[1], entity->rotationDegrees.raw[2]);
@@ -1585,6 +1588,7 @@ int vmf_scene_add_light_entity(VmfScene* scene,
     entity.lightType = 3;
     entity.spotInnerDegrees = 18.0f;
     entity.spotOuterDegrees = 28.0f;
+    entity.sourceSize = 8.0f;
     entity.kind = VmfEntityKindLight;
     entity.position = position;
     entity.color = color;
