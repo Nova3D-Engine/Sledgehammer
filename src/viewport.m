@@ -1791,6 +1791,8 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     free(self.baseVertexColors);
     free(self.faceRanges);
     free(self.heavyObjectEntityIndices);
+    free(self.heavyObjectSolidIndices);
+    free(self.heavyObjectSideIndices);
     free(self.heavyObjectModelBasePositions);
     free(self.heavyObjectModelFlags);
     free(self.selectionVertices);
@@ -2016,9 +2018,13 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
 
 - (void)clearHeavyObjectModelMappings {
     free(self.heavyObjectEntityIndices);
+    free(self.heavyObjectSolidIndices);
+    free(self.heavyObjectSideIndices);
     free(self.heavyObjectModelBasePositions);
     free(self.heavyObjectModelFlags);
     self.heavyObjectEntityIndices = NULL;
+    self.heavyObjectSolidIndices = NULL;
+    self.heavyObjectSideIndices = NULL;
     self.heavyObjectModelBasePositions = NULL;
     self.heavyObjectModelFlags = NULL;
     self.heavyObjectMappingCount = 0u;
@@ -6691,13 +6697,21 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
 
     if (objectCount > 0u) {
         self.heavyObjectEntityIndices = (uint32_t*)calloc(objectCount, sizeof(uint32_t));
+        self.heavyObjectSolidIndices = (uint32_t*)calloc(objectCount, sizeof(uint32_t));
+        self.heavyObjectSideIndices = (uint32_t*)calloc(objectCount, sizeof(uint32_t));
         self.heavyObjectModelBasePositions = (Vec3*)calloc(objectCount, sizeof(Vec3));
         self.heavyObjectModelFlags = (uint8_t*)calloc(objectCount, sizeof(uint8_t));
-        if (self.heavyObjectEntityIndices != NULL && self.heavyObjectModelBasePositions != NULL && self.heavyObjectModelFlags != NULL) {
+        if (self.heavyObjectEntityIndices != NULL &&
+            self.heavyObjectSolidIndices != NULL &&
+            self.heavyObjectSideIndices != NULL &&
+            self.heavyObjectModelBasePositions != NULL &&
+            self.heavyObjectModelFlags != NULL) {
             self.heavyObjectMappingCount = objectCount;
             for (uint32_t objectIndex = 0u; objectIndex < objectCount; ++objectIndex) {
                 uint32_t entityIndex = objectBrushEntity[objectIndex];
                 self.heavyObjectEntityIndices[objectIndex] = entityIndex;
+                self.heavyObjectSolidIndices[objectIndex] = objectBrushSolid[objectIndex];
+                self.heavyObjectSideIndices[objectIndex] = objectBrushSide[objectIndex];
                 if (self.vmfScene != NULL && entityIndex != UINT32_MAX && entityIndex < self.vmfScene->entityCount) {
                     const VmfEntity* entity = &self.vmfScene->entities[entityIndex];
                     if (entity->kind == VmfEntityKindModel) {

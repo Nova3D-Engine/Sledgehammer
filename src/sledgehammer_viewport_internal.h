@@ -224,6 +224,8 @@ typedef NS_ENUM(NSUInteger, ViewportHandle) {
 @property(nonatomic, assign) const VmfScene* vmfScene;
 @property(nonatomic, assign) NovaSceneWorld* sceneWorld;
 @property(nonatomic, assign) uint32_t* heavyObjectEntityIndices;
+@property(nonatomic, assign) uint32_t* heavyObjectSolidIndices;
+@property(nonatomic, assign) uint32_t* heavyObjectSideIndices;
 @property(nonatomic, assign) Vec3* heavyObjectModelBasePositions;
 @property(nonatomic, assign) uint8_t* heavyObjectModelFlags;
 @property(nonatomic, assign) uint32_t heavyObjectMappingCount;

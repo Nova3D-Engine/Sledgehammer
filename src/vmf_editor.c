@@ -1,5 +1,7 @@
 #include "vmf_editor.h"
 
+#include "novamodel_asset.h"
+
 #include <errno.h>
 #include <math.h>
 #include <stdio.h>
@@ -18,6 +20,65 @@ typedef struct EditorFacePolygon {
 } EditorFacePolygon;
 static void replace_solid_contents(VmfSolid* destination, VmfSolid* replacement);
 static void free_solid_contents(VmfSolid* solid);
+
+static float vmf_editor_degrees_to_radians(float degrees) {
+    return degrees * (float)M_PI / 180.0f;
+}
+
+static Vec3 vmf_editor_rotate_point(Vec3 point, Vec3 rotationDegrees) {
+    float rx = vmf_editor_degrees_to_radians(rotationDegrees.raw[0]);
+    float ry = vmf_editor_degrees_to_radians(rotationDegrees.raw[1]);
+    float rz = vmf_editor_degrees_to_radians(rotationDegrees.raw[2]);
+    float cx = cosf(rx), sx = sinf(rx);
+    float cy = cosf(ry), sy = sinf(ry);
+    float cz = cosf(rz), sz = sinf(rz);
+    float x = point.raw[0];
+    float y = point.raw[1];
+    float z = point.raw[2];
+
+    float xy = (cy * cz) * x + (sx * sy * cz - cx * sz) * y + (cx * sy * cz + sx * sz) * z;
+    float yy = (cy * sz) * x + (sx * sy * sz + cx * cz) * y + (cx * sy * sz - sx * cz) * z;
+    float zy = (-sy) * x + (sx * cy) * y + (cx * cy) * z;
+    return vec3_make(xy, yy, zy);
+}
+
+static int vmf_editor_model_asset_bounds(const VmfEntity* entity, Bounds3* outBounds) {
+    float assetBoundsMin[3];
+    float assetBoundsMax[3];
+    char errorBuffer[256] = { 0 };
+    if (entity == NULL || outBounds == NULL || entity->modelAssetPath[0] == '\0') {
+        return 0;
+    }
+    if (!nova_model_asset_read_bounds(entity->modelAssetPath, assetBoundsMin, assetBoundsMax, errorBuffer, (uint32_t)sizeof(errorBuffer))) {
+        return 0;
+    }
+
+    Vec3 assetMin = vec3_make(assetBoundsMin[0], assetBoundsMin[1], assetBoundsMin[2]);
+    Vec3 assetMax = vec3_make(assetBoundsMax[0], assetBoundsMax[1], assetBoundsMax[2]);
+    Vec3 assetCenter = vec3_scale(vec3_add(assetMin, assetMax), 0.5f);
+    Vec3 corners[8] = {
+        vec3_make(assetMin.raw[0], assetMin.raw[1], assetMin.raw[2]),
+        vec3_make(assetMax.raw[0], assetMin.raw[1], assetMin.raw[2]),
+        vec3_make(assetMin.raw[0], assetMax.raw[1], assetMin.raw[2]),
+        vec3_make(assetMax.raw[0], assetMax.raw[1], assetMin.raw[2]),
+        vec3_make(assetMin.raw[0], assetMin.raw[1], assetMax.raw[2]),
+        vec3_make(assetMax.raw[0], assetMin.raw[1], assetMax.raw[2]),
+        vec3_make(assetMin.raw[0], assetMax.raw[1], assetMax.raw[2]),
+        vec3_make(assetMax.raw[0], assetMax.raw[1], assetMax.raw[2]),
+    };
+
+    Bounds3 bounds = bounds3_empty();
+    for (size_t index = 0; index < sizeof(corners) / sizeof(corners[0]); ++index) {
+        Vec3 centered = vec3_sub(corners[index], assetCenter);
+        Vec3 rotated = vmf_editor_rotate_point(centered, entity->rotationDegrees);
+        bounds3_expand(&bounds, vec3_add(entity->position, rotated));
+    }
+    if (!bounds3_is_valid(bounds)) {
+        return 0;
+    }
+    *outBounds = bounds;
+    return 1;
+}
 
 int reserve_sides(VmfSolid* solid, size_t minimum) {
     if (solid->sideCapacity >= minimum) {
@@ -446,6 +507,10 @@ static Bounds3 entity_selection_bounds(const VmfEntity* entity) {
         float markerHalfExtent = fmaxf(24.0f, fminf(entity->range * 0.1f, 64.0f));
         extent = vec3_make(markerHalfExtent, markerHalfExtent, markerHalfExtent);
     } else if (entity->kind == VmfEntityKindModel) {
+        Bounds3 modelBounds = bounds3_empty();
+        if (vmf_editor_model_asset_bounds(entity, &modelBounds)) {
+            return modelBounds;
+        }
         extent = entity->modelHalfExtents;
         if (extent.raw[0] < 1.0f && extent.raw[1] < 1.0f && extent.raw[2] < 1.0f) {
             extent = vec3_make(32.0f, 32.0f, 32.0f);
