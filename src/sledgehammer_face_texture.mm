@@ -7,15 +7,7 @@
 @implementation ViewerAppDelegate (FaceTexture)
 
 - (nullable NSString*)texturePathForInspectorMaterial:(NSString*)materialName {
-    NSString* normalized;
-    if (!self.materialsDirectory || materialName.length == 0) {
-        return nil;
-    }
-    normalized = materialName.lowercaseString;
-    if ([normalized isEqualToString:@"grid"]) {
-        normalized = @"dev_grid";
-    }
-    return [[self.materialsDirectory stringByAppendingPathComponent:normalized] stringByAppendingPathExtension:@"png"];
+    return [self resolvedTexturePathForMaterialName:materialName];
 }
 
 - (BOOL)textureDimensionsForMaterial:(NSString*)materialName width:(float*)outWidth height:(float*)outHeight {

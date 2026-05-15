@@ -1617,9 +1617,18 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         return NO;
     }
     NSPoint point = [self convertPoint:sender.draggingLocation fromView:nil];
+    NSString* lowerPath = firstURL.path.lowercaseString;
     if ([firstURL.pathExtension.lowercaseString isEqualToString:@"novamodel"]) {
         if (self.owner.delegate) {
             [self.owner.delegate viewport:self.owner didRequestPlaceDroppedPath:firstURL.path atPoint:[self.owner dropPlacementPointForViewPoint:point]];
+        }
+        return YES;
+    }
+    if ([lowerPath hasSuffix:@".material.json"]) {
+        if (self.owner.delegate) {
+            Vec3 origin = self.owner.dimension == VmfViewportDimension3D ? [self.owner cameraPosition] : [self.owner snappedWorldPointForViewPoint:point];
+            Vec3 direction = self.owner.dimension == VmfViewportDimension3D ? [self.owner rayDirectionForViewPoint:point] : vec3_make(0.0f, 0.0f, -1.0f);
+            [self.owner.delegate viewport:self.owner didRequestApplyDroppedMaterialPath:firstURL.path rayOrigin:origin direction:direction];
         }
         return YES;
     }
@@ -3011,12 +3020,49 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         return nil;
     }
 
+    NSFileManager* fileManager = [NSFileManager defaultManager];
     NSString* normalized = material.lowercaseString;
     if ([normalized isEqualToString:@"grid"]) {
         normalized = @"dev_grid";
     }
-    return [[self.textureDirectory stringByAppendingPathComponent:normalized]
-            stringByAppendingPathExtension:@"png"];
+
+    NSArray<NSString*>* directCandidates = @[
+        [[self.textureDirectory stringByAppendingPathComponent:normalized] stringByAppendingPathExtension:@"png"],
+        [[self.textureDirectory stringByAppendingPathComponent:@"materials"] stringByAppendingPathComponent:[normalized stringByAppendingPathExtension:@"png"]],
+        [[self.textureDirectory stringByAppendingPathComponent:@"textures"] stringByAppendingPathComponent:[normalized stringByAppendingPathExtension:@"png"]],
+    ];
+    for (NSString* candidate in directCandidates) {
+        if ([fileManager fileExistsAtPath:candidate]) {
+            return candidate;
+        }
+    }
+
+    NSString* assetPath = [[self.textureDirectory stringByAppendingPathComponent:@"materials"]
+                           stringByAppendingPathComponent:[normalized stringByAppendingString:@".material.json"]];
+    NSData* data = [NSData dataWithContentsOfFile:assetPath];
+    if (data != nil) {
+        id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        if ([json isKindOfClass:[NSDictionary class]]) {
+            NSString* relativeTexturePath = [json[@"baseColorTexture"] isKindOfClass:[NSString class]] ? json[@"baseColorTexture"] : nil;
+            if (relativeTexturePath.length == 0) {
+                relativeTexturePath = [json[@"albedoTexture"] isKindOfClass:[NSString class]] ? json[@"albedoTexture"] : nil;
+            }
+            if (relativeTexturePath.length > 0) {
+                NSString* resolvedPath = [relativeTexturePath isAbsolutePath]
+                    ? relativeTexturePath
+                    : [self.textureDirectory stringByAppendingPathComponent:relativeTexturePath];
+                if ([fileManager fileExistsAtPath:resolvedPath]) {
+                    return resolvedPath;
+                }
+                NSString* materialRelativePath = [[assetPath stringByDeletingLastPathComponent] stringByAppendingPathComponent:relativeTexturePath];
+                if ([fileManager fileExistsAtPath:materialRelativePath]) {
+                    return materialRelativePath;
+                }
+            }
+        }
+    }
+
+    return nil;
 }
 
 - (nullable NSDictionary<NSString*, id>*)loadTextureDataAtPath:(NSString*)path {
@@ -7880,6 +7926,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
 
 - (BOOL)handleViewportKeyDown:(NSEvent*)event {
     NSString* key = event.charactersIgnoringModifiers.lowercaseString;
+    BOOL rightMouseHeld = (NSEvent.pressedMouseButtons & (1u << 1)) != 0u;
     if (self.dimension == VmfViewportDimension3D &&
         self.editorTool == VmfViewportEditorToolSelect &&
         !self.freeLookActive) {
@@ -7939,7 +7986,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
             self.movementMask |= CameraMovementUp;
             return YES;
         }
-        if ([key isEqualToString:@"e"]) {
+        if ([key isEqualToString:@"e"] && rightMouseHeld) {
             self.movementMask |= CameraMovementDown;
             return YES;
         }
@@ -7974,7 +8021,7 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         self.movementMask &= ~CameraMovementUp;
         return YES;
     }
-    if ([key isEqualToString:@"e"]) {
+    if ([key isEqualToString:@"e"] && self.freeLookActive) {
         self.movementMask &= ~CameraMovementDown;
         return YES;
     }

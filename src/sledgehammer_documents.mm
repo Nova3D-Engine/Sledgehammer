@@ -166,7 +166,7 @@
 
 - (void)setMaterialsDirectory:(NSString*)materialsDirectory {
     _materialsDirectory = [materialsDirectory copy];
-    NSLog(@"[materials] directory set to: %@", materialsDirectory);
+    NSLog(@"[materials] content root set to: %@", materialsDirectory);
     for (VmfViewport* viewport in self.viewports) {
         [viewport setTextureDirectory:materialsDirectory];
     }
@@ -226,8 +226,8 @@
     panel.canChooseFiles = NO;
     panel.canChooseDirectories = YES;
     panel.allowsMultipleSelection = NO;
-    panel.title = @"Select Materials Folder";
-    panel.message = @"Choose the folder containing texture images (mirrors the VMF material path hierarchy).";
+    panel.title = @"Select Content Folder";
+    panel.message = @"Choose the content root containing materials, textures, models, and icons.";
     if (self.materialsDirectory != nil) {
         panel.directoryURL = [NSURL fileURLWithPath:self.materialsDirectory];
     }

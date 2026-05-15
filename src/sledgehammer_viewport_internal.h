@@ -65,9 +65,11 @@ typedef NS_ENUM(NSUInteger, ViewportHandle) {
 - (void)handleViewportScrollDelta:(CGFloat)deltaY;
 - (void)handleViewportDroppedPath:(NSString*)path;
 - (Vec3)dropPlacementPointForViewPoint:(NSPoint)point;
+- (Vec3)snappedWorldPointForViewPoint:(NSPoint)point;
 - (void)handleViewportMouseHoverAtPoint:(NSPoint)point;
 - (void)handleViewportSecondaryClickAtPoint:(NSPoint)point modifierFlags:(NSEventModifierFlags)flags;
 - (void)drawEditorOverlay;
+- (Vec3)cameraPosition;
 - (Vec3)rayDirectionForViewPoint:(NSPoint)point;
 - (nullable id<MTLTexture>)cachedTextureForMaterial:(NSString*)material;
 - (nullable NSDictionary<NSString*, id>*)cachedTextureDataForMaterial:(NSString*)material;

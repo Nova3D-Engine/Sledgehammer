@@ -161,6 +161,12 @@ static NSAttributedString* material_icon_menu_title(NSString* iconName, NSString
                                                   defer:NO];
     self.window.title = kAppDisplayName;
     self.window.delegate = self;
+    self.window.minSize = NSMakeSize(1.0, 1.0);
+    self.window.contentMinSize = NSMakeSize(0.0, 0.0);
+    self.window.maxSize = NSMakeSize(CGFLOAT_MAX, CGFLOAT_MAX);
+    self.window.contentMaxSize = NSMakeSize(CGFLOAT_MAX, CGFLOAT_MAX);
+    self.window.resizeIncrements = NSMakeSize(1.0, 1.0);
+    self.window.contentResizeIncrements = NSMakeSize(1.0, 1.0);
 
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
     self.rootView = [[NSView alloc] initWithFrame:frame];
@@ -263,9 +269,12 @@ static NSAttributedString* material_icon_menu_title(NSString* iconName, NSString
 
     self.verticalSplitBottomConstraint = [self.verticalSplitView.bottomAnchor constraintEqualToAnchor:self.rootView.bottomAnchor constant:-54.0];
 
+    self.verticalSplitTrailingConstraint = [self.verticalSplitView.trailingAnchor constraintEqualToAnchor:self.rootView.trailingAnchor constant:-324.0];
+    NSLayoutConstraint* verticalSplitLeadingConstraint = [self.verticalSplitView.leadingAnchor constraintEqualToAnchor:self.rootView.leadingAnchor constant:80.0];
+
     [NSLayoutConstraint activateConstraints:@[
-        [self.verticalSplitView.leadingAnchor constraintEqualToAnchor:self.rootView.leadingAnchor constant:80.0],
-        [self.verticalSplitView.trailingAnchor constraintEqualToAnchor:self.rootView.trailingAnchor constant:-324.0],
+        verticalSplitLeadingConstraint,
+        self.verticalSplitTrailingConstraint,
         [self.verticalSplitView.topAnchor constraintEqualToAnchor:self.rootView.topAnchor constant:68.0],
         self.verticalSplitBottomConstraint,
     ]];
@@ -286,32 +295,80 @@ static NSAttributedString* material_icon_menu_title(NSString* iconName, NSString
 
 - (NSAttributedString*)toolbarAttributedTitleWithIcon:(NSString*)icon text:(NSString*)text {
     NSMutableAttributedString* attributedTitle = [[NSMutableAttributedString alloc] init];
-    NSFont* iconFont = [NSFont fontWithName:@"Material Symbols Outlined" size:18.0];
+    NSFont* iconFont = [NSFont fontWithName:@"Material Symbols Outlined" size:16.0];
+    NSFont* textFont = [NSFont systemFontOfSize:12.0 weight:NSFontWeightMedium];
+    NSMutableParagraphStyle* paragraphStyle = [[NSMutableParagraphStyle alloc] init];
+    paragraphStyle.lineBreakMode = NSLineBreakByClipping;
+    paragraphStyle.alignment = NSTextAlignmentCenter;
     if (!iconFont) {
-        iconFont = [NSFont systemFontOfSize:18.0 weight:NSFontWeightRegular];
+        iconFont = [NSFont systemFontOfSize:16.0 weight:NSFontWeightRegular];
     }
+    paragraphStyle.minimumLineHeight = 20.0;
+    paragraphStyle.maximumLineHeight = paragraphStyle.minimumLineHeight;
     [attributedTitle appendAttributedString:[[NSAttributedString alloc] initWithString:icon
                                                                              attributes:@{
                                                                                  NSFontAttributeName: iconFont,
                                                                                  NSForegroundColorAttributeName: [NSColor colorWithWhite:0.94 alpha:1.0],
+                                                                                 NSBaselineOffsetAttributeName: @(-1.0),
+                                                                                 NSParagraphStyleAttributeName: paragraphStyle,
                                                                              }]];
     [attributedTitle appendAttributedString:[[NSAttributedString alloc] initWithString:[NSString stringWithFormat:@"  %@", text]
                                                                              attributes:@{
-                                                                                 NSFontAttributeName: [NSFont systemFontOfSize:12.0 weight:NSFontWeightMedium],
+                                                                                 NSFontAttributeName: textFont,
                                                                                  NSForegroundColorAttributeName: [NSColor colorWithWhite:0.94 alpha:1.0],
+                                                                                 NSBaselineOffsetAttributeName: @(1.0),
+                                                                                 NSParagraphStyleAttributeName: paragraphStyle,
                                                                              }]];
     return attributedTitle;
 }
 
-- (NSAttributedString*)toolbarAttributedTitleWithIconOnly:(NSString*)icon {
-    NSFont* iconFont = [NSFont fontWithName:@"Material Symbols Outlined" size:18.0];
+- (NSAttributedString*)toolbarSectionAttributedTitleWithIcon:(NSString*)icon text:(NSString*)text compact:(BOOL)compact {
+    NSMutableAttributedString* attributedTitle = [[NSMutableAttributedString alloc] init];
+    NSFont* iconFont = [NSFont fontWithName:@"Material Symbols Outlined" size:16.0];
+    NSFont* textFont = [NSFont systemFontOfSize:12.0 weight:NSFontWeightMedium];
+    NSMutableParagraphStyle* paragraphStyle = [[NSMutableParagraphStyle alloc] init];
+    paragraphStyle.lineBreakMode = NSLineBreakByClipping;
+    paragraphStyle.alignment = NSTextAlignmentCenter;
     if (!iconFont) {
-        iconFont = [NSFont systemFontOfSize:18.0 weight:NSFontWeightRegular];
+        iconFont = [NSFont systemFontOfSize:16.0 weight:NSFontWeightRegular];
     }
+    paragraphStyle.minimumLineHeight = 20.0;
+    paragraphStyle.maximumLineHeight = paragraphStyle.minimumLineHeight;
+    [attributedTitle appendAttributedString:[[NSAttributedString alloc] initWithString:icon
+                                                                             attributes:@{
+                                                                                 NSFontAttributeName: iconFont,
+                                                                                 NSForegroundColorAttributeName: [NSColor colorWithWhite:0.94 alpha:1.0],
+                                                                                 NSBaselineOffsetAttributeName: @(-1.0),
+                                                                                 NSParagraphStyleAttributeName: paragraphStyle,
+                                                                             }]];
+    if (!compact) {
+        [attributedTitle appendAttributedString:[[NSAttributedString alloc] initWithString:[NSString stringWithFormat:@"  %@", text]
+                                                                                 attributes:@{
+                                                                                     NSFontAttributeName: textFont,
+                                                                                     NSForegroundColorAttributeName: [NSColor colorWithWhite:0.94 alpha:1.0],
+                                                                                     NSBaselineOffsetAttributeName: @(1.0),
+                                                                                     NSParagraphStyleAttributeName: paragraphStyle,
+                                                                                 }]];
+    }
+    return attributedTitle;
+}
+
+- (NSAttributedString*)toolbarAttributedTitleWithIconOnly:(NSString*)icon {
+    NSFont* iconFont = [NSFont fontWithName:@"Material Symbols Outlined" size:16.0];
+    NSMutableParagraphStyle* paragraphStyle = [[NSMutableParagraphStyle alloc] init];
+    paragraphStyle.lineBreakMode = NSLineBreakByClipping;
+    paragraphStyle.alignment = NSTextAlignmentCenter;
+    if (!iconFont) {
+        iconFont = [NSFont systemFontOfSize:16.0 weight:NSFontWeightRegular];
+    }
+    paragraphStyle.minimumLineHeight = 20.0;
+    paragraphStyle.maximumLineHeight = paragraphStyle.minimumLineHeight;
     return [[NSAttributedString alloc] initWithString:icon
                                            attributes:@{
                                                NSFontAttributeName: iconFont,
                                                NSForegroundColorAttributeName: [NSColor colorWithWhite:0.94 alpha:1.0],
+                                               NSBaselineOffsetAttributeName: @(-1.0),
+                                               NSParagraphStyleAttributeName: paragraphStyle,
                                            }];
 }
 
@@ -333,19 +390,21 @@ static NSAttributedString* material_icon_menu_title(NSString* iconName, NSString
     button.bezelStyle = NSBezelStyleTexturedRounded;
     button.attributedTitle = [self toolbarAttributedTitleWithIcon:icon text:text];
     button.attributedAlternateTitle = [self toolbarAttributedTitleWithIconOnly:icon];
-    button.imagePosition = NSImageLeft;
+    button.imagePosition = NSNoImage;
     button.lineBreakMode = NSLineBreakByClipping;
+    button.controlSize = NSControlSizeSmall;
     [button setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
-    [button setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [button setContentHuggingPriority:NSLayoutPriorityDefaultHigh forOrientation:NSLayoutConstraintOrientationHorizontal];
     return button;
 }
 
-- (NSTextField*)toolbarBadgeLabelWithIcon:(NSString*)icon text:(NSString*)text {
-    NSTextField* label = [NSTextField labelWithAttributedString:[self toolbarAttributedTitleWithIcon:icon text:text]];
-    label.lineBreakMode = NSLineBreakByClipping;
-    label.maximumNumberOfLines = 1;
-    [label setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
-    [label setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+- (NSButton*)toolbarBadgeLabelWithIcon:(NSString*)icon text:(NSString*)text {
+    NSButton* label = [self toolbarButtonWithIcon:icon text:text action:NULL];
+    label.translatesAutoresizingMaskIntoConstraints = NO;
+    label.bordered = NO;
+    label.enabled = YES;
+    label.imagePosition = NSNoImage;
+    label.attributedTitle = [self toolbarSectionAttributedTitleWithIcon:icon text:text compact:NO];
     return label;
 }
 
@@ -354,9 +413,16 @@ static NSAttributedString* material_icon_menu_title(NSString* iconName, NSString
     button.toolTip = text;
 }
 
-- (void)applyToolbarModeToLabel:(NSTextField*)label icon:(NSString*)icon text:(NSString*)text compact:(BOOL)compact {
-    label.attributedStringValue = compact ? [self toolbarAttributedTitleWithIconOnly:icon] : [self toolbarAttributedTitleWithIcon:icon text:text];
+- (void)applyToolbarModeToLabel:(NSButton*)label icon:(NSString*)icon text:(NSString*)text compact:(BOOL)compact {
+    label.attributedTitle = compact ? [self toolbarAttributedTitleWithIconOnly:icon] : [self toolbarAttributedTitleWithIcon:icon text:text];
     label.toolTip = text;
+}
+
+- (BOOL)toolbarFitsAvailableControlWidth:(CGFloat)availableControlWidth {
+    [self.rootView layoutSubtreeIfNeeded];
+    [self.controlBar layoutSubtreeIfNeeded];
+    [self.controlStack layoutSubtreeIfNeeded];
+    return self.controlStack.fittingSize.width <= availableControlWidth;
 }
 
 - (NSButton*)toolRailButtonWithIcon:(NSString*)icon tooltip:(NSString*)tooltip action:(SEL)action {
@@ -410,37 +476,163 @@ static NSAttributedString* material_icon_menu_title(NSString* iconName, NSString
 }
 
 - (void)updateToolbarLayout {
-    CGFloat availableWidth = NSWidth(self.window.contentView.bounds);
-    BOOL compact = availableWidth < 1220.0;
-    BOOL ultraCompact = availableWidth < 980.0;
-    if (compact == self.toolbarCompact && ultraCompact == self.toolbarUltraCompact) {
-        return;
+    [self.rootView layoutSubtreeIfNeeded];
+    [self.controlBar layoutSubtreeIfNeeded];
+
+    BOOL ultraCompact = NO;
+
+    [self applyToolbarModeToButton:self.createMapButton icon:@"add" text:@"New" compact:NO];
+    [self applyToolbarModeToButton:self.openButton icon:@"folder_open" text:@"Open" compact:NO];
+    [self applyToolbarModeToButton:self.saveButton icon:@"save" text:@"Save" compact:NO];
+    [self applyToolbarModeToButton:self.undoButton icon:@"undo" text:@"Undo" compact:NO];
+    [self applyToolbarModeToButton:self.redoButton icon:@"redo" text:@"Redo" compact:NO];
+    [self applyToolbarModeToButton:self.duplicateButton icon:@"content_copy" text:@"Duplicate" compact:NO];
+    [self applyToolbarModeToButton:self.deleteButton icon:@"delete" text:@"Delete" compact:NO];
+    [self applyToolbarModeToButton:self.textureModeButton icon:@"format_paint" text:@"Texture" compact:NO];
+    [self applyToolbarModeToButton:self.textureLockButton icon:@"link" text:@"Tex Lock" compact:NO];
+    [self applyToolbarModeToButton:self.ignoreGroupsButton icon:@"filter_none" text:@"Ignore Groups" compact:NO];
+    [self applyToolbarModeToButton:self.applyMaterialButton icon:@"format_paint" text:@"Apply" compact:NO];
+    [self applyToolbarModeToButton:self.browseMaterialButton icon:@"search" text:@"Browse" compact:NO];
+
+    [self applyToolbarModeToLabel:self.gridLabel icon:@"grid_view" text:@"Snap" compact:NO];
+    [self applyToolbarModeToLabel:self.renderLabel icon:@"dehaze" text:@"Render" compact:NO];
+    [self applyToolbarModeToLabel:self.materialLabel icon:@"wallpaper" text:@"Material" compact:NO];
+
+    self.controlStack.spacing = 8.0;
+    self.controlBarHeightConstraint.constant = 50.0;
+    self.gridPopUpWidthConstraint.constant = 64.0;
+    self.renderControlWidthConstraint.constant = 126.0;
+    self.materialPopUpWidthConstraint.constant = 184.0;
+    self.toolbarOverflowWidthConstraint.constant = 38.0;
+
+    self.toolbarOverflowControl.hidden = YES;
+    self.toolbarOverflowSpacer.hidden = YES;
+    self.ignoreGroupsButton.hidden = NO;
+    self.applyMaterialButton.hidden = NO;
+    self.browseMaterialButton.hidden = NO;
+    self.textureModeButton.hidden = NO;
+    self.materialTargetModeControl.hidden = NO;
+    self.textureLockButton.hidden = NO;
+
+    [self.rootView layoutSubtreeIfNeeded];
+    [self.controlBar layoutSubtreeIfNeeded];
+    [self.controlStack layoutSubtreeIfNeeded];
+    CGFloat availableControlWidth = NSWidth(self.controlBar.bounds);
+    if (availableControlWidth <= 0.0) {
+        availableControlWidth = MAX(0.0, NSWidth(self.rootView.bounds) - 32.0);
+    }
+    availableControlWidth = MAX(0.0, availableControlWidth - 20.0);
+
+#define SLEDGEHAMMER_COMPACT_BUTTON_IF_NEEDED(button_, icon_, text_) \
+    do { \
+        if (![self toolbarFitsAvailableControlWidth:availableControlWidth]) { \
+            [self applyToolbarModeToButton:(button_) icon:(icon_) text:(text_) compact:YES]; \
+        } \
+    } while (0)
+#define SLEDGEHAMMER_COMPACT_LABEL_IF_NEEDED(label_, icon_, text_) \
+    do { \
+        if (![self toolbarFitsAvailableControlWidth:availableControlWidth]) { \
+            [self applyToolbarModeToLabel:(label_) icon:(icon_) text:(text_) compact:YES]; \
+        } \
+    } while (0)
+    SLEDGEHAMMER_COMPACT_BUTTON_IF_NEEDED(self.browseMaterialButton, @"search", @"Browse");
+    SLEDGEHAMMER_COMPACT_BUTTON_IF_NEEDED(self.applyMaterialButton, @"format_paint", @"Apply");
+    SLEDGEHAMMER_COMPACT_BUTTON_IF_NEEDED(self.ignoreGroupsButton, @"filter_none", @"Ignore Groups");
+    SLEDGEHAMMER_COMPACT_BUTTON_IF_NEEDED(self.textureLockButton, @"link", @"Tex Lock");
+    SLEDGEHAMMER_COMPACT_BUTTON_IF_NEEDED(self.textureModeButton, @"format_paint", @"Texture");
+    SLEDGEHAMMER_COMPACT_LABEL_IF_NEEDED(self.materialLabel, @"wallpaper", @"Material");
+    SLEDGEHAMMER_COMPACT_LABEL_IF_NEEDED(self.renderLabel, @"dehaze", @"Render");
+    SLEDGEHAMMER_COMPACT_LABEL_IF_NEEDED(self.gridLabel, @"grid_view", @"Snap");
+    SLEDGEHAMMER_COMPACT_BUTTON_IF_NEEDED(self.deleteButton, @"delete", @"Delete");
+    SLEDGEHAMMER_COMPACT_BUTTON_IF_NEEDED(self.duplicateButton, @"content_copy", @"Duplicate");
+    SLEDGEHAMMER_COMPACT_BUTTON_IF_NEEDED(self.redoButton, @"redo", @"Redo");
+    SLEDGEHAMMER_COMPACT_BUTTON_IF_NEEDED(self.undoButton, @"undo", @"Undo");
+    SLEDGEHAMMER_COMPACT_BUTTON_IF_NEEDED(self.saveButton, @"save", @"Save");
+    SLEDGEHAMMER_COMPACT_BUTTON_IF_NEEDED(self.openButton, @"folder_open", @"Open");
+    SLEDGEHAMMER_COMPACT_BUTTON_IF_NEEDED(self.createMapButton, @"add", @"New");
+#undef SLEDGEHAMMER_COMPACT_BUTTON_IF_NEEDED
+#undef SLEDGEHAMMER_COMPACT_LABEL_IF_NEEDED
+
+    if (![self toolbarFitsAvailableControlWidth:availableControlWidth]) {
+        self.controlStack.spacing = 6.0;
+        [self.rootView layoutSubtreeIfNeeded];
+        [self.controlBar layoutSubtreeIfNeeded];
+        [self.controlStack layoutSubtreeIfNeeded];
     }
 
-    self.toolbarCompact = compact;
-    self.toolbarUltraCompact = ultraCompact;
+    BOOL needsCompactOverflow = ![self toolbarFitsAvailableControlWidth:availableControlWidth];
+    BOOL needsUltraOverflow = NO;
+    if (needsCompactOverflow) {
+        ultraCompact = YES;
+        self.controlBarHeightConstraint.constant = 46.0;
+        self.gridPopUpWidthConstraint.constant = 58.0;
+        self.renderControlWidthConstraint.constant = 102.0;
+        self.materialPopUpWidthConstraint.constant = 132.0;
+        self.toolbarOverflowWidthConstraint.constant = 34.0;
+        self.controlStack.spacing = 4.0;
+        self.toolbarOverflowControl.hidden = NO;
+        self.toolbarOverflowSpacer.hidden = NO;
+        self.ignoreGroupsButton.hidden = YES;
+        self.applyMaterialButton.hidden = YES;
+        self.browseMaterialButton.hidden = YES;
+        [self.rootView layoutSubtreeIfNeeded];
+        [self.controlBar layoutSubtreeIfNeeded];
+        [self.controlStack layoutSubtreeIfNeeded];
+        needsUltraOverflow = self.controlStack.fittingSize.width > availableControlWidth;
+        if (needsUltraOverflow) {
+            self.textureModeButton.hidden = YES;
+            self.materialTargetModeControl.hidden = YES;
+            self.textureLockButton.hidden = YES;
+            [self.rootView layoutSubtreeIfNeeded];
+            [self.controlBar layoutSubtreeIfNeeded];
+            [self.controlStack layoutSubtreeIfNeeded];
+        }
+    }
 
-    [self applyToolbarModeToButton:self.createMapButton icon:@"add" text:@"New" compact:compact];
-    [self applyToolbarModeToButton:self.openButton icon:@"folder_open" text:@"Open" compact:compact];
-    [self applyToolbarModeToButton:self.saveButton icon:@"save" text:@"Save" compact:compact];
-    [self applyToolbarModeToButton:self.undoButton icon:@"undo" text:@"Undo" compact:compact];
-    [self applyToolbarModeToButton:self.redoButton icon:@"redo" text:@"Redo" compact:compact];
-    [self applyToolbarModeToButton:self.duplicateButton icon:@"content_copy" text:@"Duplicate" compact:compact];
-    [self applyToolbarModeToButton:self.deleteButton icon:@"delete" text:@"Delete" compact:compact];
-    [self applyToolbarModeToButton:self.textureModeButton icon:@"format_paint" text:@"Texture" compact:compact];
-    [self applyToolbarModeToButton:self.textureLockButton icon:@"link" text:@"Tex Lock" compact:compact];
-    [self applyToolbarModeToButton:self.ignoreGroupsButton icon:@"filter_none" text:@"Ignore Groups" compact:compact];
-    [self applyToolbarModeToButton:self.applyMaterialButton icon:@"format_paint" text:@"Apply" compact:compact];
-    [self applyToolbarModeToButton:self.browseMaterialButton icon:@"search" text:@"Browse" compact:compact];
-
-    [self applyToolbarModeToLabel:self.gridLabel icon:@"grid_view" text:@"Snap" compact:compact];
-    [self applyToolbarModeToLabel:self.renderLabel icon:@"dehaze" text:@"Render" compact:compact];
-    [self applyToolbarModeToLabel:self.materialLabel icon:@"wallpaper" text:@"Brush" compact:compact];
-
-    self.controlStack.spacing = ultraCompact ? 4.0 : (compact ? 6.0 : 8.0);
-    self.controlBarHeightConstraint.constant = ultraCompact ? 42.0 : 46.0;
+    [self.toolbarOverflowMenu removeAllItems];
+    if (needsUltraOverflow) {
+        NSMenuItem* textureModeItem = [self.toolbarOverflowMenu addItemWithTitle:@"Texture Mode" action:@selector(toggleTextureApplicationMode:) keyEquivalent:@""];
+        textureModeItem.target = self;
+        textureModeItem.state = self.textureApplicationModeActive ? NSControlStateValueOn : NSControlStateValueOff;
+        [[self.toolbarOverflowMenu addItemWithTitle:@"Face / Brush Target" action:nil keyEquivalent:@""] setEnabled:NO];
+        NSMenuItem* faceItem = [self.toolbarOverflowMenu addItemWithTitle:@"Apply To Face" action:@selector(selectMaterialTargetFaceFromOverflow:) keyEquivalent:@""];
+        faceItem.target = self;
+        faceItem.state = self.materialApplicationAppliesToFace ? NSControlStateValueOn : NSControlStateValueOff;
+        NSMenuItem* brushItem = [self.toolbarOverflowMenu addItemWithTitle:@"Apply To Brush" action:@selector(selectMaterialTargetBrushFromOverflow:) keyEquivalent:@""];
+        brushItem.target = self;
+        brushItem.state = self.materialApplicationAppliesToFace ? NSControlStateValueOff : NSControlStateValueOn;
+        NSMenuItem* textureLockItem = [self.toolbarOverflowMenu addItemWithTitle:@"Texture Lock" action:@selector(toggleTextureLock:) keyEquivalent:@""];
+        textureLockItem.target = self;
+        textureLockItem.state = self.textureLockEnabled ? NSControlStateValueOn : NSControlStateValueOff;
+        [self.toolbarOverflowMenu addItem:[NSMenuItem separatorItem]];
+    }
+    if (needsCompactOverflow) {
+        NSMenuItem* ignoreItem = [self.toolbarOverflowMenu addItemWithTitle:@"Ignore Groups" action:@selector(toggleIgnoreGroupSelection:) keyEquivalent:@""];
+        ignoreItem.target = self;
+        ignoreItem.state = self.ignoreGroupSelection ? NSControlStateValueOn : NSControlStateValueOff;
+        [[self.toolbarOverflowMenu addItemWithTitle:@"Apply Material" action:@selector(applyMaterialToSelection:) keyEquivalent:@""] setTarget:self];
+        [[self.toolbarOverflowMenu addItemWithTitle:@"Browse Materials" action:@selector(browseMaterials:) keyEquivalent:@""] setTarget:self];
+    }
     [self.controlBar invalidateIntrinsicContentSize];
     [self.controlStack invalidateIntrinsicContentSize];
+}
+
+- (void)selectMaterialTargetFaceFromOverflow:(id)sender {
+    self.materialTargetModeControl.selectedSegment = 0;
+    [self materialTargetModeChanged:self.materialTargetModeControl];
+}
+
+- (void)selectMaterialTargetBrushFromOverflow:(id)sender {
+    self.materialTargetModeControl.selectedSegment = 1;
+    [self materialTargetModeChanged:self.materialTargetModeControl];
+}
+
+- (void)showToolbarOverflowMenu:(id)sender {
+    if (self.toolbarOverflowMenu.numberOfItems == 0) {
+        return;
+    }
+    NSPoint menuOrigin = NSMakePoint(0.0, NSHeight(self.toolbarOverflowControl.bounds) - 2.0);
+    [self.toolbarOverflowMenu popUpMenuPositioningItem:nil atLocation:menuOrigin inView:self.toolbarOverflowControl];
 }
 
 - (void)buildMacUI {
@@ -495,7 +687,8 @@ static NSAttributedString* material_icon_menu_title(NSString* iconName, NSString
     self.controlStack.alignment = NSLayoutAttributeCenterY;
     self.controlStack.spacing = 8.0;
     self.controlStack.detachesHiddenViews = YES;
-    self.controlStack.distribution = NSStackViewDistributionFillProportionally;
+    self.controlStack.distribution = NSStackViewDistributionFill;
+    self.controlStack.edgeInsets = NSEdgeInsetsMake(0.0, 0.0, 0.0, 0.0);
 
     self.createMapButton = [self toolbarButtonWithIcon:@"add" text:@"New" action:@selector(newDocument:)];
     self.openButton = [self toolbarButtonWithIcon:@"folder_open" text:@"Open" action:@selector(openDocument:)];
@@ -512,16 +705,25 @@ static NSAttributedString* material_icon_menu_title(NSString* iconName, NSString
     [[self.renderControl itemAtIndex:2] setTag:VmfViewportRenderModePathTraced];
     self.renderControl.target = self;
     self.renderControl.action = @selector(renderControlChanged:);
+    self.renderControl.controlSize = NSControlSizeSmall;
+    self.renderControl.font = [NSFont systemFontOfSize:12.0 weight:NSFontWeightMedium];
+    self.renderControl.translatesAutoresizingMaskIntoConstraints = NO;
 
     self.materialPopUp = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
     [self.materialPopUp addItemsWithTitles:@[ @"dev_grid", @"nodraw", @"clip" ]];
     self.materialPopUp.target = self;
     self.materialPopUp.action = @selector(materialPresetChanged:);
+    self.materialPopUp.controlSize = NSControlSizeSmall;
+    self.materialPopUp.font = [NSFont systemFontOfSize:12.0 weight:NSFontWeightMedium];
+    self.materialPopUp.translatesAutoresizingMaskIntoConstraints = NO;
 
     self.gridPopUp = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
     [self.gridPopUp addItemsWithTitles:@[ @"1", @"2", @"4", @"8", @"16", @"32", @"64", @"128", @"256" ]];
     self.gridPopUp.target = self;
     self.gridPopUp.action = @selector(gridSizeChanged:);
+    self.gridPopUp.controlSize = NSControlSizeSmall;
+    self.gridPopUp.font = [NSFont systemFontOfSize:12.0 weight:NSFontWeightMedium];
+    self.gridPopUp.translatesAutoresizingMaskIntoConstraints = NO;
     [self.gridPopUp setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
 
     self.applyMaterialButton = [self toolbarButtonWithIcon:@"format_paint" text:@"Apply" action:@selector(applyMaterialToSelection:)];
@@ -529,11 +731,45 @@ static NSAttributedString* material_icon_menu_title(NSString* iconName, NSString
     self.textureLockButton = [self toolbarButtonWithIcon:@"link" text:@"Tex Lock" action:@selector(toggleTextureLock:)];
     self.ignoreGroupsButton = [self toolbarButtonWithIcon:@"filter_none" text:@"Ignore Groups" action:@selector(toggleIgnoreGroupSelection:)];
     self.browseMaterialButton = [self toolbarButtonWithIcon:@"search" text:@"Browse" action:@selector(browseMaterials:)];
+    self.materialTargetModeControl = [[NSSegmentedControl alloc] initWithFrame:NSZeroRect];
+    self.materialTargetModeControl.segmentCount = 2;
+    [self.materialTargetModeControl setLabel:@"Face" forSegment:0];
+    [self.materialTargetModeControl setLabel:@"Brush" forSegment:1];
+    self.materialTargetModeControl.trackingMode = NSSegmentSwitchTrackingSelectOne;
+    self.materialTargetModeControl.target = self;
+    self.materialTargetModeControl.action = @selector(materialTargetModeChanged:);
+    self.materialTargetModeControl.controlSize = NSControlSizeSmall;
+    self.materialTargetModeControl.selectedSegment = 0;
+    self.materialTargetModeControl.translatesAutoresizingMaskIntoConstraints = NO;
+    NSLayoutConstraint* materialTargetWidthConstraint = [self.materialTargetModeControl.widthAnchor constraintEqualToConstant:108.0];
+    materialTargetWidthConstraint.priority = NSLayoutPriorityDefaultLow;
+    materialTargetWidthConstraint.active = YES;
+
+    self.toolbarOverflowControl = [NSButton buttonWithTitle:@"" target:self action:@selector(showToolbarOverflowMenu:)];
+    self.toolbarOverflowControl.translatesAutoresizingMaskIntoConstraints = NO;
+    self.toolbarOverflowControl.bordered = YES;
+    self.toolbarOverflowControl.controlSize = NSControlSizeSmall;
+    self.toolbarOverflowControl.hidden = YES;
+    self.toolbarOverflowControl.bezelStyle = NSBezelStyleTexturedRounded;
+    self.toolbarOverflowControl.font = [NSFont systemFontOfSize:12.0 weight:NSFontWeightMedium];
+    self.toolbarOverflowControl.attributedTitle = [self toolbarAttributedTitleWithIconOnly:@"more_horiz"];
+    self.toolbarOverflowMenu = [[NSMenu alloc] initWithTitle:@"Toolbar Overflow"];
+    self.toolbarOverflowSpacer = [[NSView alloc] initWithFrame:NSZeroRect];
+    self.toolbarOverflowSpacer.translatesAutoresizingMaskIntoConstraints = NO;
+    self.toolbarOverflowSpacer.hidden = YES;
+    [self.toolbarOverflowSpacer setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [self.toolbarOverflowSpacer setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
 
     [self.materialPopUp setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [self.renderControl setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [self.renderControl setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [self.materialPopUp setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [self.gridPopUp setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [self.toolbarOverflowControl setContentCompressionResistancePriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [self.toolbarOverflowControl setContentHuggingPriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
     self.renderLabel = [self toolbarBadgeLabelWithIcon:@"dehaze" text:@"Render"];
     self.gridLabel = [self toolbarBadgeLabelWithIcon:@"grid_view" text:@"Snap"];
-    self.materialLabel = [self toolbarBadgeLabelWithIcon:@"wallpaper" text:@"Brush"];
+    self.materialLabel = [self toolbarBadgeLabelWithIcon:@"wallpaper" text:@"Material"];
 
     [self.controlStack addArrangedSubview:self.createMapButton];
     [self.controlStack addArrangedSubview:self.openButton];
@@ -549,12 +785,43 @@ static NSAttributedString* material_icon_menu_title(NSString* iconName, NSString
     [self.controlStack addArrangedSubview:self.materialLabel];
     [self.controlStack addArrangedSubview:self.materialPopUp];
     [self.controlStack addArrangedSubview:self.textureModeButton];
+    [self.controlStack addArrangedSubview:self.materialTargetModeControl];
     [self.controlStack addArrangedSubview:self.textureLockButton];
     [self.controlStack addArrangedSubview:self.ignoreGroupsButton];
     [self.controlStack addArrangedSubview:self.applyMaterialButton];
     [self.controlStack addArrangedSubview:self.browseMaterialButton];
+    [self.controlStack addArrangedSubview:self.toolbarOverflowSpacer];
+    [self.controlStack addArrangedSubview:self.toolbarOverflowControl];
     [self.controlBar addSubview:self.controlStack];
     [self.rootView addSubview:self.controlBar];
+
+    NSArray<NSView*>* toolbarControlViews = @[
+        self.createMapButton,
+        self.openButton,
+        self.saveButton,
+        self.undoButton,
+        self.redoButton,
+        self.duplicateButton,
+        self.deleteButton,
+        self.gridLabel,
+        self.gridPopUp,
+        self.renderLabel,
+        self.renderControl,
+        self.materialLabel,
+        self.materialPopUp,
+        self.textureModeButton,
+        self.materialTargetModeControl,
+        self.textureLockButton,
+        self.ignoreGroupsButton,
+        self.applyMaterialButton,
+        self.browseMaterialButton,
+        self.toolbarOverflowControl,
+    ];
+    for (NSView* view in toolbarControlViews) {
+        NSLayoutConstraint* heightConstraint = [view.heightAnchor constraintEqualToConstant:32.0];
+        heightConstraint.priority = NSLayoutPriorityDefaultHigh;
+        heightConstraint.active = YES;
+    }
 
     self.emptyStateView = [[NSVisualEffectView alloc] initWithFrame:self.rootView.bounds];
     self.emptyStateView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
@@ -600,28 +867,53 @@ static NSAttributedString* material_icon_menu_title(NSString* iconName, NSString
     [self.emptyStateView addSubview:stack];
     [self.rootView addSubview:self.emptyStateView];
 
+    NSLayoutConstraint* toolRailLeadingConstraint = [self.toolRail.leadingAnchor constraintEqualToAnchor:self.rootView.leadingAnchor constant:12.0];
+    NSLayoutConstraint* controlBarLeadingConstraint = [self.controlBar.leadingAnchor constraintEqualToAnchor:self.rootView.leadingAnchor constant:16.0];
+    NSLayoutConstraint* controlBarTrailingConstraint = [self.controlBar.trailingAnchor constraintEqualToAnchor:self.rootView.trailingAnchor constant:-16.0];
+    NSLayoutConstraint* controlStackLeadingConstraint = [self.controlStack.leadingAnchor constraintEqualToAnchor:self.controlBar.leadingAnchor constant:10.0];
+    NSLayoutConstraint* controlStackTrailingConstraint = [self.controlStack.trailingAnchor constraintLessThanOrEqualToAnchor:self.controlBar.trailingAnchor constant:-10.0];
+    NSLayoutConstraint* toolRailWidthConstraint = [self.toolRail.widthAnchor constraintEqualToConstant:56.0];
+    NSLayoutConstraint* toolRailStackLeadingConstraint = [self.toolRailStack.leadingAnchor constraintEqualToAnchor:self.toolRail.leadingAnchor constant:6.0];
+    NSLayoutConstraint* toolRailStackTrailingConstraint = [self.toolRailStack.trailingAnchor constraintEqualToAnchor:self.toolRail.trailingAnchor constant:-6.0];
+    NSLayoutConstraint* emptyStackLeadingConstraint = [stack.leadingAnchor constraintGreaterThanOrEqualToAnchor:self.emptyStateView.leadingAnchor constant:32.0];
+    emptyStackLeadingConstraint.priority = NSLayoutPriorityDefaultLow;
+    NSLayoutConstraint* emptyStackTrailingConstraint = [stack.trailingAnchor constraintLessThanOrEqualToAnchor:self.emptyStateView.trailingAnchor constant:-32.0];
+    emptyStackTrailingConstraint.priority = NSLayoutPriorityDefaultLow;
+
     [NSLayoutConstraint activateConstraints:@[
-        [self.toolRail.leadingAnchor constraintEqualToAnchor:self.rootView.leadingAnchor constant:12.0],
+        toolRailLeadingConstraint,
         [self.toolRail.topAnchor constraintEqualToAnchor:self.verticalSplitView.topAnchor],
-        [self.toolRail.bottomAnchor constraintEqualToAnchor:self.verticalSplitView.bottomAnchor],
-        [self.toolRail.widthAnchor constraintEqualToConstant:56.0],
-        [self.toolRailStack.leadingAnchor constraintEqualToAnchor:self.toolRail.leadingAnchor constant:6.0],
-        [self.toolRailStack.trailingAnchor constraintEqualToAnchor:self.toolRail.trailingAnchor constant:-6.0],
+        [self.toolRail.bottomAnchor constraintEqualToAnchor:self.rootView.bottomAnchor constant:-12.0],
+        toolRailWidthConstraint,
+        toolRailStackLeadingConstraint,
+        toolRailStackTrailingConstraint,
         [self.toolRailStack.topAnchor constraintEqualToAnchor:self.toolRail.topAnchor constant:8.0],
-        [self.controlBar.leadingAnchor constraintEqualToAnchor:self.rootView.leadingAnchor constant:16.0],
-        [self.controlBar.trailingAnchor constraintLessThanOrEqualToAnchor:self.rootView.trailingAnchor constant:-16.0],
+        controlBarLeadingConstraint,
+        controlBarTrailingConstraint,
         [self.controlBar.topAnchor constraintEqualToAnchor:self.rootView.topAnchor constant:16.0],
-        [self.controlStack.leadingAnchor constraintEqualToAnchor:self.controlBar.leadingAnchor constant:10.0],
-        [self.controlStack.trailingAnchor constraintEqualToAnchor:self.controlBar.trailingAnchor constant:-10.0],
+        controlStackLeadingConstraint,
+        controlStackTrailingConstraint,
         [self.controlStack.topAnchor constraintEqualToAnchor:self.controlBar.topAnchor constant:6.0],
         [self.controlStack.bottomAnchor constraintEqualToAnchor:self.controlBar.bottomAnchor constant:-6.0],
         [stack.centerXAnchor constraintEqualToAnchor:self.emptyStateView.centerXAnchor],
         [stack.centerYAnchor constraintEqualToAnchor:self.emptyStateView.centerYAnchor],
-        [stack.leadingAnchor constraintGreaterThanOrEqualToAnchor:self.emptyStateView.leadingAnchor constant:32.0],
-        [stack.trailingAnchor constraintLessThanOrEqualToAnchor:self.emptyStateView.trailingAnchor constant:-32.0],
+        emptyStackLeadingConstraint,
+        emptyStackTrailingConstraint,
     ]];
+    self.gridPopUpWidthConstraint = [self.gridPopUp.widthAnchor constraintEqualToConstant:64.0];
+    self.renderControlWidthConstraint = [self.renderControl.widthAnchor constraintEqualToConstant:126.0];
+    self.materialPopUpWidthConstraint = [self.materialPopUp.widthAnchor constraintEqualToConstant:184.0];
+    self.toolbarOverflowWidthConstraint = [self.toolbarOverflowControl.widthAnchor constraintEqualToConstant:38.0];
+    self.gridPopUpWidthConstraint.priority = NSLayoutPriorityDefaultLow;
+    self.renderControlWidthConstraint.priority = NSLayoutPriorityDefaultLow;
+    self.materialPopUpWidthConstraint.priority = NSLayoutPriorityDefaultLow;
+    self.toolbarOverflowWidthConstraint.priority = NSLayoutPriorityDefaultLow;
+    self.gridPopUpWidthConstraint.active = YES;
+    self.renderControlWidthConstraint.active = YES;
+    self.materialPopUpWidthConstraint.active = YES;
+    self.toolbarOverflowWidthConstraint.active = YES;
 
-    self.controlBarHeightConstraint = [self.controlBar.heightAnchor constraintEqualToConstant:46.0];
+    self.controlBarHeightConstraint = [self.controlBar.heightAnchor constraintEqualToConstant:50.0];
     self.controlBarHeightConstraint.active = YES;
     [self buildInspectorUI];
     [self updateToolbarLayout];
@@ -634,6 +926,7 @@ static NSAttributedString* material_icon_menu_title(NSString* iconName, NSString
     self.inspectorPanel.hidden = !self.hasDocument;
     self.contentBrowserPanel.hidden = !self.hasDocument;
     self.contentBrowserImportButton.enabled = self.hasDocument;
+    self.contentBrowserModeControl.enabled = self.hasDocument;
     self.contentBrowserBodyView.hidden = self.contentBrowserCollapsed || !self.hasDocument;
     self.contentBrowserBodyView.alphaValue = self.contentBrowserCollapsed || !self.hasDocument ? 0.0 : 1.0;
     self.contentBrowserHeightConstraint.constant = self.hasDocument ? (self.contentBrowserCollapsed ? 42.0 : 330.0) : 0.0;
@@ -644,6 +937,8 @@ static NSAttributedString* material_icon_menu_title(NSString* iconName, NSString
     self.duplicateButton.enabled = self.hasSelection && !pointEntitySelection;
     self.deleteButton.enabled = self.hasSelection;
     self.textureModeButton.state = self.textureApplicationModeActive ? NSControlStateValueOn : NSControlStateValueOff;
+    self.materialTargetModeControl.selectedSegment = self.materialApplicationAppliesToFace ? 0 : 1;
+    self.materialTargetModeControl.enabled = self.textureApplicationModeActive && self.hasDocument;
     self.textureLockButton.state = self.textureLockEnabled ? NSControlStateValueOn : NSControlStateValueOff;
     self.ignoreGroupsButton.state = self.ignoreGroupSelection ? NSControlStateValueOn : NSControlStateValueOff;
     self.applyMaterialButton.enabled = self.textureApplicationModeActive && self.hasSelection && !pointEntitySelection;

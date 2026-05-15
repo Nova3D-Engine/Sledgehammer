@@ -28,6 +28,33 @@ struct RasterData {
     float2 uv;
 };
 
+struct MaterialPreviewVertex {
+    packed_float3 position;
+    packed_float3 normal;
+    packed_float2 uv;
+};
+
+struct ModelPreviewVertex {
+    packed_float3 position;
+    packed_float3 normal;
+    packed_float2 uv;
+};
+
+struct MaterialPreviewUniforms {
+    float4x4 modelViewProjection;
+    float4x4 modelMatrix;
+    float4 keyLightDirection;
+    float4 rimLightDirection;
+    float4 baseColorTint;
+};
+
+struct MaterialPreviewRasterData {
+    float4 position [[position]];
+    float3 worldPosition;
+    float3 normal;
+    float2 uv;
+};
+
 vertex RasterData viewerVertex(uint vertexID [[vertex_id]],
                                const device ViewerVertex* vertices [[buffer(0)]],
                                constant Uniforms& uniforms [[buffer(1)]]) {
@@ -97,4 +124,80 @@ fragment float4 viewerFragment(RasterData in [[stage_in]],
         diffuse = max(dot(normalize(in.normal), lightDir), 0.15);
     }
     return float4(baseColor * litColor * diffuse, alpha);
+}
+
+fragment float4 sledgehammerModelPreviewFragment(RasterData in [[stage_in]],
+                                                 constant Uniforms& uniforms [[buffer(0)]],
+                                                 texture2d<float> colorTexture [[texture(0)]],
+                                                 sampler textureSampler [[sampler(0)]]) {
+    const uint lightingEnabled = uniforms.flags.z;
+    const uint useTexture = uniforms.flags.w;
+    float4 texSample = useTexture != 0 ? colorTexture.sample(textureSampler, in.uv) : float4(1.0);
+    float3 baseColor = texSample.rgb;
+    float alpha = texSample.a;
+    if (lightingEnabled == 0) {
+        return float4(baseColor, alpha);
+    }
+
+    float3 normal = normalize(in.normal);
+    float3 lightDir = normalize(uniforms.lightDirectionIntensity.xyz);
+    float diffuse = max(dot(normal, lightDir), 0.15);
+    float3 viewDir = normalize(uniforms.cameraPosition.xyz - in.worldPosition);
+    float rim = pow(1.0 - max(dot(normal, viewDir), 0.0), 2.4) * 0.14;
+    float3 color = baseColor * (diffuse + 0.18) + float3(rim);
+    return float4(saturate(color), alpha);
+}
+
+vertex MaterialPreviewRasterData sledgehammerMaterialPreviewVertex(
+    uint vertexID [[vertex_id]],
+    const device MaterialPreviewVertex* vertices [[buffer(0)]],
+    constant MaterialPreviewUniforms& uniforms [[buffer(1)]]) {
+    MaterialPreviewVertex inVertex = vertices[vertexID];
+    MaterialPreviewRasterData out;
+    float4 localPosition = float4(float3(inVertex.position), 1.0);
+    float4 worldPosition = uniforms.modelMatrix * localPosition;
+    out.position = uniforms.modelViewProjection * localPosition;
+    out.worldPosition = worldPosition.xyz;
+    out.normal = normalize((uniforms.modelMatrix * float4(float3(inVertex.normal), 0.0)).xyz);
+    out.uv = float2(inVertex.uv);
+    return out;
+}
+
+vertex RasterData sledgehammerModelPreviewVertex(
+    uint vertexID [[vertex_id]],
+    const device ModelPreviewVertex* vertices [[buffer(0)]],
+    constant Uniforms& uniforms [[buffer(1)]]) {
+    ModelPreviewVertex inVertex = vertices[vertexID];
+    RasterData out;
+    float3 position = float3(inVertex.position);
+    float3 normal = float3(inVertex.normal);
+    out.position = uniforms.viewProjection * float4(position, 1.0);
+    out.worldPosition = position;
+    out.normal = normalize(normal);
+    out.color = float3(1.0, 1.0, 1.0);
+    out.uv = float2(inVertex.uv);
+    return out;
+}
+
+fragment float4 sledgehammerMaterialPreviewFragment(
+    MaterialPreviewRasterData in [[stage_in]],
+    constant MaterialPreviewUniforms& uniforms [[buffer(0)]],
+    texture2d<float> colorTexture [[texture(0)]],
+    sampler textureSampler [[sampler(0)]]) {
+    float4 texel = colorTexture.sample(textureSampler, in.uv);
+    float3 baseColor = texel.rgb * uniforms.baseColorTint.rgb;
+    float3 normal = normalize(in.normal);
+    float3 keyLightDir = normalize(uniforms.keyLightDirection.xyz);
+    float3 rimLightDir = normalize(uniforms.rimLightDirection.xyz);
+    float3 viewDir = normalize(float3(0.0, 0.0, 1.0) - in.worldPosition * 0.15);
+    float3 halfVector = normalize(keyLightDir + viewDir);
+
+    float diffuse = max(dot(normal, keyLightDir), 0.0);
+    float fill = pow(max(dot(normal, rimLightDir), 0.0), 2.0) * 0.35;
+    float rim = pow(1.0 - max(dot(normal, viewDir), 0.0), 2.4) * 0.18;
+    float specular = pow(max(dot(normal, halfVector), 0.0), 42.0) * 0.22;
+    float ambient = 0.20;
+
+    float3 color = baseColor * (ambient + diffuse * 0.82 + fill) + float3(specular) + float3(rim);
+    return float4(saturate(color), texel.a * uniforms.baseColorTint.a);
 }

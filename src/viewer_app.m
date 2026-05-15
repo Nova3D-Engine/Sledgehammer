@@ -27,6 +27,7 @@
 @class SledgehammerPluginCommandTarget;
 
 static NSString* const kAppDisplayName = @"Sledgehammer";
+static NSString* const kSledgehammerMaterialAssetSuffix = @".material.json";
 
 static NSString* light_type_label(int lightType) {
     switch (lightType) {
@@ -42,6 +43,38 @@ static NSString* light_type_label(int lightType) {
 
 static float viewer_light_degrees_to_radians(float degrees) {
     return degrees * (float)M_PI / 180.0f;
+}
+
+static BOOL sledgehammer_path_has_material_asset_suffix(NSString* path) {
+    return [path.lowercaseString hasSuffix:kSledgehammerMaterialAssetSuffix];
+}
+
+static NSString* sledgehammer_default_content_directory(void) {
+    NSString* executableDir = [NSBundle.mainBundle.executablePath stringByDeletingLastPathComponent];
+    return [executableDir stringByAppendingPathComponent:@"content"];
+}
+
+static NSDictionary<NSString*, id>* sledgehammer_read_material_definition(NSString* path) {
+    if (path.length == 0) {
+        return nil;
+    }
+    NSData* data = [NSData dataWithContentsOfFile:path];
+    if (data == nil) {
+        return nil;
+    }
+    id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    if (![json isKindOfClass:[NSDictionary class]]) {
+        return nil;
+    }
+    return (NSDictionary<NSString*, id>*)json;
+}
+
+static NSString* sledgehammer_material_name_from_asset_path(NSString* path) {
+    NSString* filename = path.lastPathComponent;
+    if (![filename.lowercaseString hasSuffix:kSledgehammerMaterialAssetSuffix]) {
+        return filename.stringByDeletingPathExtension.lowercaseString;
+    }
+    return [[filename stringByDeletingPathExtension] stringByDeletingPathExtension].lowercaseString;
 }
 
 static void viewer_fill_light_world_matrix(Vec3 position, Vec3 rotationDegrees, float outMatrix[16]) {
@@ -84,6 +117,7 @@ static void viewer_fill_light_world_matrix(Vec3 position, Vec3 rotationDegrees, 
     self.allMaterials = [NSMutableArray array];
     self.filteredMaterials = [NSMutableArray array];
     self.contentBrowserItems = [NSMutableArray array];
+    self.materialApplicationAppliesToFace = YES;
     _sceneWorld = nova_scene_world_create();
     if (_sceneWorld != NULL) {
         nova_scene_world_initialize(_sceneWorld);
@@ -96,6 +130,9 @@ static void viewer_fill_light_world_matrix(Vec3 position, Vec3 rotationDegrees, 
     (void)notification;
     [self createMenu];
     [self createWindow];
+    if (self.materialsDirectory.length == 0) {
+        self.materialsDirectory = sledgehammer_default_content_directory();
+    }
     [self configurePlugins];
     if (self.startupPath.length > 0) {
         [self openPath:self.startupPath];
@@ -125,6 +162,51 @@ static void viewer_fill_light_world_matrix(Vec3 position, Vec3 rotationDegrees, 
 
 - (NSString*)displayHistoryLabel:(NSString*)label fallback:(NSString*)fallback {
     return label.length > 0 ? label : fallback;
+}
+
+- (nullable NSString*)resolvedTexturePathForMaterialName:(NSString*)materialName {
+    if (self.materialsDirectory.length == 0 || materialName.length == 0) {
+        return nil;
+    }
+
+    NSString* normalized = materialName.lowercaseString;
+    if ([normalized isEqualToString:@"grid"]) {
+        normalized = @"dev_grid";
+    }
+
+    NSFileManager* fileManager = [NSFileManager defaultManager];
+    NSArray<NSString*>* directCandidates = @[
+        [[self.materialsDirectory stringByAppendingPathComponent:normalized] stringByAppendingPathExtension:@"png"],
+        [[self.materialsDirectory stringByAppendingPathComponent:@"materials"] stringByAppendingPathComponent:[normalized stringByAppendingPathExtension:@"png"]],
+        [[self.materialsDirectory stringByAppendingPathComponent:@"textures"] stringByAppendingPathComponent:[normalized stringByAppendingPathExtension:@"png"]],
+    ];
+    for (NSString* candidate in directCandidates) {
+        if ([fileManager fileExistsAtPath:candidate]) {
+            return candidate;
+        }
+    }
+
+    NSString* assetPath = [[self.materialsDirectory stringByAppendingPathComponent:@"materials"]
+                           stringByAppendingPathComponent:[normalized stringByAppendingString:kSledgehammerMaterialAssetSuffix]];
+    NSDictionary<NSString*, id>* definition = sledgehammer_read_material_definition(assetPath);
+    NSString* relativeTexturePath = [definition[@"baseColorTexture"] isKindOfClass:[NSString class]] ? definition[@"baseColorTexture"] : nil;
+    if (relativeTexturePath.length == 0) {
+        relativeTexturePath = [definition[@"albedoTexture"] isKindOfClass:[NSString class]] ? definition[@"albedoTexture"] : nil;
+    }
+    if (relativeTexturePath.length > 0) {
+        NSString* resolvedPath = [relativeTexturePath isAbsolutePath]
+            ? relativeTexturePath
+            : [self.materialsDirectory stringByAppendingPathComponent:relativeTexturePath];
+        if ([fileManager fileExistsAtPath:resolvedPath]) {
+            return resolvedPath;
+        }
+        NSString* materialRelativePath = [[assetPath stringByDeletingLastPathComponent] stringByAppendingPathComponent:relativeTexturePath];
+        if ([fileManager fileExistsAtPath:materialRelativePath]) {
+            return materialRelativePath;
+        }
+    }
+
+    return nil;
 }
 
 - (void)updateHistoryMenuTitles {
@@ -583,12 +665,26 @@ static void viewer_fill_light_world_matrix(Vec3 position, Vec3 rotationDegrees, 
     [self.rootView addSubview:self.inspectorPanel];
 
     self.inspectorBottomConstraint = [self.inspectorPanel.bottomAnchor constraintEqualToAnchor:self.contentBrowserPanel.topAnchor constant:-12.0];
+    self.inspectorWidthConstraint = [self.inspectorPanel.widthAnchor constraintEqualToConstant:300.0];
+    self.inspectorWidthConstraint.priority = NSLayoutPriorityDefaultHigh;
+    self.verticalSplitTrailingConstraint.active = NO;
+    self.verticalSplitTrailingConstraint = [self.verticalSplitView.trailingAnchor constraintEqualToAnchor:self.inspectorPanel.leadingAnchor constant:-12.0];
+    self.verticalSplitTrailingConstraint.active = YES;
+    NSLayoutConstraint* inspectorTrailingConstraint = [self.inspectorPanel.trailingAnchor constraintEqualToAnchor:self.rootView.trailingAnchor constant:-12.0];
+    NSLayoutConstraint* inspectorLeadingConstraint = [self.inspectorPanel.leadingAnchor constraintGreaterThanOrEqualToAnchor:self.rootView.leadingAnchor];
+    inspectorLeadingConstraint.priority = NSLayoutPriorityDefaultLow;
+    NSLayoutConstraint* inspectorMinimumWidthConstraint = [self.inspectorPanel.widthAnchor constraintGreaterThanOrEqualToConstant:0.0];
+    inspectorMinimumWidthConstraint.priority = NSLayoutPriorityDefaultLow;
+    NSLayoutConstraint* inspectorMaximumWidthConstraint = [self.inspectorPanel.widthAnchor constraintLessThanOrEqualToConstant:300.0];
 
     [NSLayoutConstraint activateConstraints:@[
-        [self.inspectorPanel.trailingAnchor constraintEqualToAnchor:self.rootView.trailingAnchor constant:-12.0],
+        inspectorTrailingConstraint,
+        inspectorLeadingConstraint,
         [self.inspectorPanel.topAnchor constraintEqualToAnchor:self.verticalSplitView.topAnchor],
         self.inspectorBottomConstraint,
-        [self.inspectorPanel.widthAnchor constraintEqualToConstant:300.0],
+        self.inspectorWidthConstraint,
+        inspectorMinimumWidthConstraint,
+        inspectorMaximumWidthConstraint,
         [self.inspectorStack.leadingAnchor constraintEqualToAnchor:self.inspectorPanel.leadingAnchor],
         [self.inspectorStack.trailingAnchor constraintEqualToAnchor:self.inspectorPanel.trailingAnchor],
         [self.inspectorStack.topAnchor constraintEqualToAnchor:self.inspectorPanel.topAnchor],
@@ -1566,6 +1662,12 @@ static void viewer_fill_light_world_matrix(Vec3 position, Vec3 rotationDegrees, 
     }
 }
 
+- (void)materialTargetModeChanged:(id)sender {
+    (void)sender;
+    self.materialApplicationAppliesToFace = (self.materialTargetModeControl.selectedSegment != 1);
+    [self updateChrome];
+}
+
 - (void)gridSizeChanged:(id)sender {
     (void)sender;
     self.gridSize = self.gridPopUp.selectedItem.title.floatValue;
@@ -1847,6 +1949,7 @@ static void viewer_fill_light_world_matrix(Vec3 position, Vec3 rotationDegrees, 
     char errorBuffer[256] = { 0 };
     BOOL ok = NO;
     BOOL introducedNewMaterial = ![self currentMeshContainsMaterialNamed:self.brushMaterialName];
+    BOOL applyToFace = self.materialApplicationAppliesToFace && self.hasFaceSelection;
     if ([self selectionActsAsGroupedBrushEntity]) {
         ok = YES;
         const VmfEntity* entity = &self.scene.entities[self.selectedEntityIndex];
@@ -1861,7 +1964,7 @@ static void viewer_fill_light_world_matrix(Vec3 position, Vec3 rotationDegrees, 
                 break;
             }
         }
-    } else if (self.hasFaceSelection) {
+    } else if (applyToFace) {
         ok = vmf_scene_set_side_material(&_scene,
                                          self.selectedEntityIndex,
                                          self.selectedSolidIndex,
@@ -1884,7 +1987,7 @@ static void viewer_fill_light_world_matrix(Vec3 position, Vec3 rotationDegrees, 
 
     if ([self selectionActsAsGroupedBrushEntity]) {
         [self applyMaterialToCurrentMeshForEntity:self.selectedEntityIndex materialName:self.brushMaterialName];
-    } else if (self.hasFaceSelection) {
+    } else if (applyToFace) {
         [self applyMaterialToCurrentMesh:self.brushMaterialName
                             entityIndex:self.selectedEntityIndex
                              solidIndex:self.selectedSolidIndex
@@ -1899,7 +2002,7 @@ static void viewer_fill_light_world_matrix(Vec3 position, Vec3 rotationDegrees, 
     }
 
     [self commitMaterialOnlyEditWithEntry:entry
-                                    label:[self selectionActsAsGroupedBrushEntity] ? @"Apply Group Material" : (self.hasFaceSelection ? @"Apply Face Material" : @"Apply Brush Material")
+                                    label:[self selectionActsAsGroupedBrushEntity] ? @"Apply Group Material" : (applyToFace ? @"Apply Face Material" : @"Apply Brush Material")
                     introducedNewMaterial:introducedNewMaterial];
 }
 
@@ -1955,17 +2058,33 @@ static void viewer_fill_light_world_matrix(Vec3 position, Vec3 rotationDegrees, 
 
 - (void)updateMaterialBrowser {
     NSMutableOrderedSet<NSString*>* names = [NSMutableOrderedSet orderedSet];
+    NSFileManager* fileManager = [NSFileManager defaultManager];
 
-    // Scan materials directory for PNG files — each filename (without extension)
-    // becomes a material name, preserving relative subdirectory paths.
     if (self.materialsDirectory) {
-        NSDirectoryEnumerator* enumerator =
-            [[NSFileManager defaultManager] enumeratorAtPath:self.materialsDirectory];
+        NSString* materialAssetDirectory = [self.materialsDirectory stringByAppendingPathComponent:@"materials"];
+        NSString* textureDirectory = [self.materialsDirectory stringByAppendingPathComponent:@"textures"];
         NSMutableArray<NSString*>* found = [NSMutableArray array];
         NSString* filePath;
+        NSDirectoryEnumerator* enumerator = [fileManager enumeratorAtPath:materialAssetDirectory];
         while ((filePath = [enumerator nextObject])) {
-            if ([filePath.pathExtension.lowercaseString isEqualToString:@"png"]) {
-                [found addObject:[filePath stringByDeletingPathExtension]];
+            if ([filePath.lowercaseString hasSuffix:kSledgehammerMaterialAssetSuffix]) {
+                NSString* baseName = [[[filePath lastPathComponent] stringByDeletingPathExtension] stringByDeletingPathExtension];
+                if (baseName.length > 0) {
+                    [found addObject:baseName.lowercaseString];
+                }
+            }
+        }
+        enumerator = [fileManager enumeratorAtPath:textureDirectory];
+        while ((filePath = [enumerator nextObject])) {
+            NSString* ext = filePath.pathExtension.lowercaseString;
+            if ([ext isEqualToString:@"png"] || [ext isEqualToString:@"jpg"] || [ext isEqualToString:@"jpeg"]) {
+                [found addObject:[filePath.lastPathComponent.stringByDeletingPathExtension lowercaseString]];
+            }
+        }
+        enumerator = [fileManager enumeratorAtPath:self.materialsDirectory];
+        while ((filePath = [enumerator nextObject])) {
+            if ([filePath.pathExtension.lowercaseString isEqualToString:@"png"] && ![filePath containsString:@"/"]) {
+                [found addObject:[filePath stringByDeletingPathExtension].lowercaseString];
             }
         }
         [found sortUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
@@ -1995,6 +2114,7 @@ static void viewer_fill_light_world_matrix(Vec3 position, Vec3 rotationDegrees, 
     self.allMaterials = [NSMutableArray arrayWithArray:names.array];
     [self filterMaterials:self.materialSearchField.stringValue];
     [self rebuildMaterialPopup];
+    [self reloadContentBrowser];
 }
 
 - (void)rebuildMaterialPopup {
@@ -2041,25 +2161,12 @@ static void viewer_fill_light_world_matrix(Vec3 position, Vec3 rotationDegrees, 
 
 - (void)browseMaterials:(id)sender {
     (void)sender;
-    if (!self.materialBrowserPanel) {
-        [self buildMaterialBrowserPanel];
+    if (self.contentBrowserModeControl != nil) {
+        self.contentBrowserModeControl.selectedSegment = 1;
     }
-    [self updateMaterialBrowser];
-    // Scroll to currently selected material if present
-    if (self.brushMaterialName) {
-        NSString* lc = self.brushMaterialName.lowercaseString;
-        NSUInteger idx = [self.filteredMaterials indexOfObjectPassingTest:^BOOL(NSString* obj, NSUInteger i, BOOL* stop) {
-            (void)i;
-            BOOL match = [obj.lowercaseString isEqualToString:lc];
-            if (match) *stop = YES;
-            return match;
-        }];
-        if (idx != NSNotFound) {
-            [self.materialTableView selectRowIndexes:[NSIndexSet indexSetWithIndex:idx] byExtendingSelection:NO];
-            [self.materialTableView scrollRowToVisible:(NSInteger)idx];
-        }
-    }
-    [self.materialBrowserPanel makeKeyAndOrderFront:nil];
+    self.contentBrowserCollapsed = NO;
+    [self reloadContentBrowser];
+    [self updateChrome];
 }
 
 - (void)materialBrowserDoubleClicked:(id)sender {
@@ -2139,6 +2246,11 @@ static void viewer_fill_light_world_matrix(Vec3 position, Vec3 rotationDegrees, 
     [self layoutViewportSplitsEqually];
     [self updateToolbarLayout];
     [self updateChrome];
+}
+
+- (NSSize)windowWillResize:(NSWindow*)sender toSize:(NSSize)frameSize {
+    (void)sender;
+    return frameSize;
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)sender {
@@ -2261,8 +2373,89 @@ static BOOL sledgehammer_model_asset_bounds(NSString* path, void* unused, Vec3* 
     [self rebuildMeshFromScene];
 }
 
+- (BOOL)applyCurrentMaterialToEntityIndex:(size_t)entityIndex solidIndex:(size_t)solidIndex sideIndex:(size_t)sideIndex useFace:(BOOL)useFace {
+    SceneHistoryEntry* entry = [self captureHistoryEntry];
+    if (!entry) {
+        return NO;
+    }
+
+    char errorBuffer[256] = { 0 };
+    BOOL introducedNewMaterial = ![self currentMeshContainsMaterialNamed:self.brushMaterialName];
+    BOOL ok = useFace
+        ? vmf_scene_set_side_material(&_scene, entityIndex, solidIndex, sideIndex, self.brushMaterialName.UTF8String, errorBuffer, sizeof(errorBuffer))
+        : vmf_scene_set_solid_material(&_scene, entityIndex, solidIndex, self.brushMaterialName.UTF8String, errorBuffer, sizeof(errorBuffer));
+    if (!ok) {
+        [self showError:[NSString stringWithUTF8String:errorBuffer]];
+        return NO;
+    }
+
+    [self applyMaterialToCurrentMesh:self.brushMaterialName
+                        entityIndex:entityIndex
+                         solidIndex:solidIndex
+                          sideIndex:sideIndex
+                         wholeSolid:!useFace];
+    self.hasSelection = YES;
+    self.selectedEntityIndex = entityIndex;
+    self.selectedSolidIndex = solidIndex;
+    self.hasFaceSelection = useFace;
+    self.selectedSideIndex = sideIndex;
+    [self commitMaterialOnlyEditWithEntry:entry label:(useFace ? @"Paint Face" : @"Paint Brush") introducedNewMaterial:introducedNewMaterial];
+    return YES;
+}
+
+- (BOOL)applyMaterialAssetAtPath:(NSString*)path {
+    if (path.length == 0) {
+        return NO;
+    }
+    self.brushMaterialName = sledgehammer_material_name_from_asset_path(path);
+    BOOL useFace = self.materialApplicationAppliesToFace;
+    if (self.hasHoveredFace) {
+        return [self applyCurrentMaterialToEntityIndex:self.hoveredEntityIndex
+                                            solidIndex:self.hoveredSolidIndex
+                                             sideIndex:self.hoveredSideIndex
+                                               useFace:useFace];
+    }
+    if (self.hasSelection && ![self selectionIsPointEntity]) {
+        return [self applyCurrentMaterialToEntityIndex:self.selectedEntityIndex
+                                            solidIndex:self.selectedSolidIndex
+                                             sideIndex:self.selectedSideIndex
+                                               useFace:(useFace && self.hasFaceSelection)];
+    }
+    [self updateChrome];
+    return YES;
+}
+
+- (void)viewport:(VmfViewport*)viewport didRequestApplyDroppedMaterialPath:(NSString*)path rayOrigin:(Vec3)origin direction:(Vec3)direction {
+    (void)viewport;
+    if (path.length == 0) {
+        return;
+    }
+
+    self.brushMaterialName = sledgehammer_material_name_from_asset_path(path);
+
+    size_t entityIndex = 0;
+    size_t solidIndex = 0;
+    size_t sideIndex = 0;
+    Vec3 hitPoint = vec3_make(0.0f, 0.0f, 0.0f);
+    char errorBuffer[256] = { 0 };
+    if (vmf_scene_pick_ray(&_scene, origin, direction, &entityIndex, &solidIndex, &sideIndex, &hitPoint, errorBuffer, sizeof(errorBuffer))) {
+        BOOL useFace = self.materialApplicationAppliesToFace;
+        [self applyCurrentMaterialToEntityIndex:entityIndex
+                                     solidIndex:solidIndex
+                                      sideIndex:sideIndex
+                                        useFace:useFace];
+        return;
+    }
+
+    [self applyMaterialAssetAtPath:path];
+}
+
 - (void)viewport:(VmfViewport*)viewport didRequestPlaceDroppedPath:(NSString*)path atPoint:(Vec3)point {
     [self setActiveViewport:viewport];
+    if (sledgehammer_path_has_material_asset_suffix(path)) {
+        [self applyMaterialAssetAtPath:path];
+        return;
+    }
     [self placeModelAssetAtPath:path worldPoint:point];
 }
 
@@ -2346,26 +2539,19 @@ static BOOL sledgehammer_model_asset_bounds(NSString* path, void* unused, Vec3* 
     if (!vmf_scene_pick_ray(&_scene, origin, direction, &entityIndex, &solidIndex, &sideIndex, &hitPoint, errorBuffer, sizeof(errorBuffer))) {
         return;
     }
-    SceneHistoryEntry* entry = [self captureHistoryEntry];
-    if (!entry) return;
-    BOOL introducedNewMaterial = ![self currentMeshContainsMaterialNamed:self.brushMaterialName];
-    if (!vmf_scene_set_side_material(&_scene, entityIndex, solidIndex, sideIndex,
-                                      self.brushMaterialName.UTF8String,
-                                      errorBuffer, sizeof(errorBuffer))) {
-        [self showError:[NSString stringWithUTF8String:errorBuffer]];
-        return;
-    }
-    [self applyMaterialToCurrentMesh:self.brushMaterialName
-                        entityIndex:entityIndex
-                         solidIndex:solidIndex
-                          sideIndex:sideIndex
-                         wholeSolid:NO];
-    [self commitMaterialOnlyEditWithEntry:entry label:@"Paint Face" introducedNewMaterial:introducedNewMaterial];
+    [self applyCurrentMaterialToEntityIndex:entityIndex
+                                 solidIndex:solidIndex
+                                  sideIndex:sideIndex
+                                    useFace:self.materialApplicationAppliesToFace];
 }
 
 - (void)viewport:(VmfViewport*)viewport requestPaintAlignRayOrigin:(Vec3)origin direction:(Vec3)direction {
     (void)viewport;
     if (!self.hasDocument || !self.textureApplicationModeActive) return;
+    if (!self.materialApplicationAppliesToFace) {
+        [self viewport:viewport requestPaintRayOrigin:origin direction:direction];
+        return;
+    }
 
     size_t entityIndex = 0, solidIndex = 0, sideIndex = 0;
     Vec3 hitPoint = vec3_make(0.0f, 0.0f, 0.0f);

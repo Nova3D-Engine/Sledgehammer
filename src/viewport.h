@@ -58,6 +58,7 @@ typedef NS_ENUM(NSUInteger, VmfViewportSelectionEdge) {
 - (void)viewportDidBecomeActive:(VmfViewport*)viewport;
 - (void)viewportDidRequestOpenDroppedPath:(NSString*)path;
 - (void)viewport:(VmfViewport*)viewport didRequestPlaceDroppedPath:(NSString*)path atPoint:(Vec3)point;
+- (void)viewport:(VmfViewport*)viewport didRequestApplyDroppedMaterialPath:(NSString*)path rayOrigin:(Vec3)origin direction:(Vec3)direction;
 - (void)viewport:(VmfViewport*)viewport handleKeyDown:(NSEvent*)event;
 - (void)viewport:(VmfViewport*)viewport handleKeyUp:(NSEvent*)event;
 - (void)viewport:(VmfViewport*)viewport requestSelectionAtPoint:(Vec3)point;

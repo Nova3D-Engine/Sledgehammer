@@ -13,9 +13,12 @@
     row.translatesAutoresizingMaskIntoConstraints = NO;
     row.orientation = NSUserInterfaceLayoutOrientationHorizontal;
     row.alignment = NSLayoutAttributeCenterY;
+    row.distribution = NSStackViewDistributionFill;
     row.spacing = 8.0;
 
     NSTextField* field = [self inspectorNumericFieldWithAction:action];
+    [field setContentHuggingPriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [field setContentCompressionResistancePriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
     [row addArrangedSubview:field];
 
     NSSlider* slider = [[NSSlider alloc] initWithFrame:NSZeroRect];
@@ -27,7 +30,9 @@
     slider.translatesAutoresizingMaskIntoConstraints = NO;
     [slider setContentHuggingPriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
     [slider setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [slider.widthAnchor constraintGreaterThanOrEqualToConstant:150.0].active = YES;
     [row addArrangedSubview:slider];
+    [row.widthAnchor constraintGreaterThanOrEqualToConstant:240.0].active = YES;
 
     if (outField != NULL) {
         *outField = field;
@@ -47,6 +52,7 @@
     container.translatesAutoresizingMaskIntoConstraints = NO;
     container.orientation = NSUserInterfaceLayoutOrientationVertical;
     container.alignment = NSLayoutAttributeLeading;
+    container.distribution = NSStackViewDistributionFill;
     container.spacing = 10.0;
 
     [container addArrangedSubview:[self inspectorSectionLabel:@"Light"]];
@@ -112,6 +118,7 @@
     self.lightSpotSettingsView.translatesAutoresizingMaskIntoConstraints = NO;
     self.lightSpotSettingsView.orientation = NSUserInterfaceLayoutOrientationVertical;
     self.lightSpotSettingsView.alignment = NSLayoutAttributeLeading;
+    self.lightSpotSettingsView.distribution = NSStackViewDistributionFill;
     self.lightSpotSettingsView.spacing = 8.0;
 
     [self.lightSpotSettingsView addArrangedSubview:[self inspectorSectionLabel:@"Spot Inner"]];
