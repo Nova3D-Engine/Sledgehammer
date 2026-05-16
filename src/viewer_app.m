@@ -126,6 +126,65 @@ static void viewer_fill_light_world_matrix(Vec3 position, Vec3 rotationDegrees, 
     return self;
 }
 
+- (void)ensureCorridorDemoScene {
+    NSString* scenePath = @"assets/scenes/corridor_demo.slg";
+    if ([[NSFileManager defaultManager] fileExistsAtPath:scenePath]) {
+        return;
+    }
+    char errBuf[512] = {0};
+    VmfScene demoScene;
+    if (!vmf_scene_init_empty(&demoScene, errBuf, sizeof(errBuf))) {
+        NSLog(@"Failed to init demo scene: %s", errBuf);
+        return;
+    }
+
+    size_t entIdx, solidIdx;
+
+    // Floor 1 (South-North)
+    vmf_scene_add_block_brush(&demoScene, (Bounds3){ vec3_make(-100, -300, -20), vec3_make(100, 300, 0) }, "Concrete Ground", &entIdx, &solidIdx, errBuf, sizeof(errBuf));
+    // Ceiling 1
+    vmf_scene_add_block_brush(&demoScene, (Bounds3){ vec3_make(-100, -300, 200), vec3_make(100, 300, 220) }, "Concrete Ground", &entIdx, &solidIdx, errBuf, sizeof(errBuf));
+    // West Wall 1
+    vmf_scene_add_block_brush(&demoScene, (Bounds3){ vec3_make(-120, -300, 0), vec3_make(-100, 300, 200) }, "Concrete Wall", &entIdx, &solidIdx, errBuf, sizeof(errBuf));
+    // South Wall 1
+    vmf_scene_add_block_brush(&demoScene, (Bounds3){ vec3_make(-100, -320, 0), vec3_make(100, -300, 200) }, "Concrete Wall", &entIdx, &solidIdx, errBuf, sizeof(errBuf));
+    // East Wall 1 (stops at Y=100 for bend)
+    vmf_scene_add_block_brush(&demoScene, (Bounds3){ vec3_make(100, -300, 0), vec3_make(120, 100, 200) }, "Concrete Wall", &entIdx, &solidIdx, errBuf, sizeof(errBuf));
+
+    // Floor 2 (West-East bend)
+    vmf_scene_add_block_brush(&demoScene, (Bounds3){ vec3_make(100, 100, -20), vec3_make(500, 300, 0) }, "Concrete Ground", &entIdx, &solidIdx, errBuf, sizeof(errBuf));
+    // Ceiling 2
+    vmf_scene_add_block_brush(&demoScene, (Bounds3){ vec3_make(100, 100, 200), vec3_make(500, 300, 220) }, "Concrete Ground", &entIdx, &solidIdx, errBuf, sizeof(errBuf));
+    // North Wall (spanning both sections)
+    vmf_scene_add_block_brush(&demoScene, (Bounds3){ vec3_make(-100, 300, 0), vec3_make(520, 320, 200) }, "Concrete Wall", &entIdx, &solidIdx, errBuf, sizeof(errBuf));
+    // South Wall 2
+    vmf_scene_add_block_brush(&demoScene, (Bounds3){ vec3_make(100, 80, 0), vec3_make(500, 100, 200) }, "Concrete Wall", &entIdx, &solidIdx, errBuf, sizeof(errBuf));
+    // East Wall 2
+    vmf_scene_add_block_brush(&demoScene, (Bounds3){ vec3_make(500, 100, 0), vec3_make(520, 300, 200) }, "Concrete Wall", &entIdx, &solidIdx, errBuf, sizeof(errBuf));
+
+    // Lights
+    vmf_scene_add_light_entity(&demoScene, "Warm Light 1", vec3_make(0, -150, 150), vec3_make(1.0f, 0.9f, 0.8f), 50.0f, 400.0f, 1, &entIdx, errBuf, sizeof(errBuf));
+    vmf_scene_add_light_entity(&demoScene, "Warm Light 2", vec3_make(0, 200, 150), vec3_make(1.0f, 0.8f, 0.6f), 50.0f, 400.0f, 1, &entIdx, errBuf, sizeof(errBuf));
+    vmf_scene_add_light_entity(&demoScene, "Cool Light 3", vec3_make(450, 200, 150), vec3_make(0.6f, 0.8f, 1.0f), 50.0f, 400.0f, 1, &entIdx, errBuf, sizeof(errBuf));
+
+    // Audio Emitter
+    if (vmf_scene_add_model_entity(&demoScene, "Audio Radio Beacon (Metal)", "assets/audio/counting.wav", vec3_make(450, 200, 50), vec3_make(16, 16, 16), &entIdx, errBuf, sizeof(errBuf))) {
+        strcpy(demoScene.entities[entIdx].classname, "audio_source");
+    }
+
+    NSError* dirError = nil;
+    if (![[NSFileManager defaultManager] createDirectoryAtPath:[scenePath stringByDeletingLastPathComponent] withIntermediateDirectories:YES attributes:nil error:&dirError]) {
+        NSLog(@"Failed to create directory for demo scene: %@", dirError);
+    }
+
+    if (!vmf_scene_save(scenePath.fileSystemRepresentation, &demoScene, errBuf, sizeof(errBuf))) {
+        NSLog(@"Failed to save demo scene: %s", errBuf);
+    } else {
+        NSLog(@"Successfully created corridor demo scene at %@", scenePath);
+    }
+    vmf_scene_free(&demoScene);
+}
+
 - (void)applicationDidFinishLaunching:(NSNotification*)notification {
     (void)notification;
     [self createMenu];
@@ -134,8 +193,11 @@ static void viewer_fill_light_world_matrix(Vec3 position, Vec3 rotationDegrees, 
         self.materialsDirectory = sledgehammer_default_content_directory();
     }
     [self configurePlugins];
+    [self ensureCorridorDemoScene];
     if (self.startupPath.length > 0) {
         [self openPath:self.startupPath];
+    } else {
+        [self openPath:@"assets/scenes/corridor_demo.slg"];
     }
     [NSApp activateIgnoringOtherApps:YES];
 }

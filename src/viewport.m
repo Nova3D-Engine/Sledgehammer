@@ -12,7 +12,10 @@
 
 #include "novamodel_asset.h"
 #include "nova_scene_data.h"
+#include "nova_scene_ecs_internal.h"
 #include "nova_tool_metal.h"
+#include "nova_physics.h"
+#include "nova_audio.h"
 
 #include <imgui.h>
 #include <ImGuizmo.h>
@@ -5494,12 +5497,13 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
             continue;
         }
 
+        if (self.vmfScene != NULL && range.entityIndex < self.vmfScene->entityCount) {
+            sourceEntity = &self.vmfScene->entities[range.entityIndex];
+        }
+
         if (range.modelAssetPath[0] != '\0' && range.sourceMaterialIndex >= 0) {
             isModelRange = YES;
             modelAssetPath = range.modelAssetPath;
-            if (self.vmfScene != NULL && range.entityIndex < self.vmfScene->entityCount) {
-                sourceEntity = &self.vmfScene->entities[range.entityIndex];
-            }
         }
 
         if (range.vertexStart >= mesh->vertexCount) {
@@ -5726,13 +5730,19 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
             }
         }
 
-        snprintf(_importedSceneData.objects[objectCount].name,
-             sizeof(_importedSceneData.objects[objectCount].name),
-             "face_%zu_%zu_%zu_%zu",
-             range.entityIndex,
-             range.solidIndex,
-             range.sideIndex,
-             faceIndex);
+        if (sourceEntity != NULL && sourceEntity->name[0] != '\0') {
+            snprintf(_importedSceneData.objects[objectCount].name, sizeof(_importedSceneData.objects[objectCount].name), "%s", sourceEntity->name);
+        } else if (sourceEntity != NULL && sourceEntity->classname[0] != '\0' && strcmp(sourceEntity->classname, "worldspawn") != 0) {
+            snprintf(_importedSceneData.objects[objectCount].name, sizeof(_importedSceneData.objects[objectCount].name), "%s_%zu", sourceEntity->classname, range.entityIndex);
+        } else {
+            snprintf(_importedSceneData.objects[objectCount].name,
+                 sizeof(_importedSceneData.objects[objectCount].name),
+                 "face_%zu_%zu_%zu_%zu",
+                 range.entityIndex,
+                 range.solidIndex,
+                 range.sideIndex,
+                 faceIndex);
+        }
         _importedSceneData.objects[objectCount].primitiveOffset = (uint32_t)(range.vertexStart / 3u);
         _importedSceneData.objects[objectCount].primitiveCount = (uint32_t)(range.vertexCount / 3u);
         _importedSceneData.objects[objectCount].vertexOffset = (uint32_t)range.vertexStart;
@@ -6771,8 +6781,57 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
         }
     }
 
+    // Audio source management: only the first viewport to sync should clear and recreate
+    // audio sources. Subsequent viewports only need to re-add static meshes.
+    static uint32_t s_lastAudioSyncObjectCount = UINT32_MAX;
+    bool audioNeedsSourceSync = (objectCount != s_lastAudioSyncObjectCount);
+    
+    if (audioNeedsSourceSync) {
+        nova_audio_clear_sources();
+        s_lastAudioSyncObjectCount = objectCount;
+    }
+    nova_audio_clear_scene();
     nova_scene_world_sync_objects(self.sceneWorld, objectRecords, objectCount);
+
+    for (uint32_t objectIndex = 0u; objectIndex < objectCount; ++objectIndex) {
+        ecs_entity_t entity = self.sceneWorld->objectEntities[objectIndex];
+        const float* vertices = (const float*)&_importedSceneData.vertices[objectRecords[objectIndex].vertexOffset].position[0];
+        uint32_t vertexCount = objectRecords[objectIndex].vertexCount;
+        size_t vertexStride = sizeof(NovaSceneVertex);
+        int materialId = nova_physics_infer_material(objectRecords[objectIndex].name);
+
+        if (vertexCount >= 3u) {
+            uint32_t* tempIndices = (uint32_t*)malloc(vertexCount * sizeof(uint32_t));
+            if (tempIndices != NULL) {
+                for (uint32_t v = 0u; v < vertexCount; ++v) {
+                    tempIndices[v] = v;
+                }
+                nova_physics_add_mesh_collider(self.sceneWorld->world, entity, vertices, vertexCount, vertexStride, tempIndices, vertexCount, materialId, objectRecords[objectIndex].worldMatrix);
+                nova_audio_add_static_mesh(vertices, vertexCount, vertexStride, tempIndices, vertexCount, materialId, objectRecords[objectIndex].worldMatrix);
+                free(tempIndices);
+            }
+            nova_physics_add_convex_hull_collider(self.sceneWorld->world, entity, vertices, vertexCount, vertexStride, materialId, 0, objectRecords[objectIndex].worldMatrix);
+        }
+    }
+
     [self applyModelTransformsToSceneWorld];
+
+    // Only create audio sources on the initial sync (not for subsequent viewport refreshes)
+    if (self.vmfScene != NULL && !nova_audio_has_sources()) {
+        for (uint32_t entIdx = 0; entIdx < self.vmfScene->entityCount; ++entIdx) {
+            const VmfEntity* vmfEnt = &self.vmfScene->entities[entIdx];
+            if (strstr(vmfEnt->name, "Radio") != NULL || strstr(vmfEnt->name, "Audio") != NULL || strstr(vmfEnt->name, "Speaker") != NULL || strstr(vmfEnt->classname, "audio_source") != NULL) {
+                NSString* rootPath = [[NSBundle.mainBundle.executablePath stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"../../"];
+                NSString* relAudio = (vmfEnt->modelAssetPath[0] != '\0' ? [NSString stringWithUTF8String:vmfEnt->modelAssetPath] : @"assets/audio/counting.wav");
+                NSString* absAudioPath = [[rootPath stringByAppendingPathComponent:relAudio] stringByStandardizingPath];
+                float pos[3] = { vmfEnt->position.raw[0], vmfEnt->position.raw[1], vmfEnt->position.raw[2] };
+                nova_scene_world_create_standalone_audio_source(self.sceneWorld, vmfEnt->name, absAudioPath.UTF8String, pos, 1.0f, 1);
+            }
+        }
+    }
+
+    nova_audio_commit_scene();
+
     _fullRendererUiState.importedSceneActive = objectCount > 0u ? 1 : 0;
     free(objectRecords);
     free(objectBakedLightmapIndices);
@@ -7807,6 +7866,20 @@ static int viewport_encode_overlay(void* commandBufferHandle, void* drawableHand
     [self updateFreeLookWithDeltaTime:deltaTime];
     [self updateOrbitTargetLerpWithDeltaTime:deltaTime];
     self.lastFrameTime = now;
+
+    if (self.dimension == VmfViewportDimension3D && self.sceneWorld != NULL) {
+        Vec3 eye = [self cameraPosition];
+        Vec3 target = [self cameraTarget];
+        Vec3 forward = vec3_sub(target, eye);
+        float heavyYaw = self.yaw;
+        float heavyPitch = self.pitch;
+        if (vec3_length(forward) > 0.0001f) {
+            forward = vec3_normalize(forward);
+            heavyYaw = atan2f(forward.raw[0], -forward.raw[1]);
+            heavyPitch = asinf(fmaxf(fminf(forward.raw[2], 1.0f), -1.0f));
+        }
+        nova_audio_step(self.sceneWorld, (float)deltaTime, eye.raw, heavyYaw, heavyPitch);
+    }
 
     if (self.dimension == VmfViewportDimension3D &&
         self.renderMode != VmfViewportRenderModeWireframe &&

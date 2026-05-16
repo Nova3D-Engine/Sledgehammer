@@ -682,7 +682,7 @@ static int parse_entity_block(Parser* parser, VmfEntity* outEntity, int isWorld)
                 if (outEntity->sourceSize < 0.53f) {
                     outEntity->sourceSize = 0.53f;
                 }
-            } else if (strcmp(valueBuffer, "prop_static") == 0 || strcmp(valueBuffer, "prop_dynamic") == 0) {
+            } else if (strcmp(valueBuffer, "prop_static") == 0 || strcmp(valueBuffer, "prop_dynamic") == 0 || strcmp(valueBuffer, "audio_source") == 0) {
                 outEntity->kind = VmfEntityKindModel;
                 outEntity->isWorld = 0;
             }

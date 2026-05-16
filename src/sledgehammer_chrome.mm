@@ -684,7 +684,7 @@ static NSAttributedString* material_icon_menu_title(NSString* iconName, NSString
     self.controlStack = [[NSStackView alloc] initWithFrame:NSZeroRect];
     self.controlStack.translatesAutoresizingMaskIntoConstraints = NO;
     self.controlStack.orientation = NSUserInterfaceLayoutOrientationHorizontal;
-    self.controlStack.alignment = NSLayoutAttributeCenterY;
+    self.controlStack.alignment = NSLayoutAttributeFirstBaseline;
     self.controlStack.spacing = 8.0;
     self.controlStack.detachesHiddenViews = YES;
     self.controlStack.distribution = NSStackViewDistributionFill;
@@ -705,24 +705,24 @@ static NSAttributedString* material_icon_menu_title(NSString* iconName, NSString
     [[self.renderControl itemAtIndex:2] setTag:VmfViewportRenderModePathTraced];
     self.renderControl.target = self;
     self.renderControl.action = @selector(renderControlChanged:);
-    self.renderControl.controlSize = NSControlSizeSmall;
-    self.renderControl.font = [NSFont systemFontOfSize:12.0 weight:NSFontWeightMedium];
+    self.renderControl.controlSize = NSControlSizeRegular;
+    self.renderControl.font = [NSFont systemFontOfSize:13.0 weight:NSFontWeightMedium];
     self.renderControl.translatesAutoresizingMaskIntoConstraints = NO;
 
     self.materialPopUp = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
     [self.materialPopUp addItemsWithTitles:@[ @"dev_grid", @"nodraw", @"clip" ]];
     self.materialPopUp.target = self;
     self.materialPopUp.action = @selector(materialPresetChanged:);
-    self.materialPopUp.controlSize = NSControlSizeSmall;
-    self.materialPopUp.font = [NSFont systemFontOfSize:12.0 weight:NSFontWeightMedium];
+    self.materialPopUp.controlSize = NSControlSizeRegular;
+    self.materialPopUp.font = [NSFont systemFontOfSize:13.0 weight:NSFontWeightMedium];
     self.materialPopUp.translatesAutoresizingMaskIntoConstraints = NO;
 
     self.gridPopUp = [[NSPopUpButton alloc] initWithFrame:NSZeroRect pullsDown:NO];
     [self.gridPopUp addItemsWithTitles:@[ @"1", @"2", @"4", @"8", @"16", @"32", @"64", @"128", @"256" ]];
     self.gridPopUp.target = self;
     self.gridPopUp.action = @selector(gridSizeChanged:);
-    self.gridPopUp.controlSize = NSControlSizeSmall;
-    self.gridPopUp.font = [NSFont systemFontOfSize:12.0 weight:NSFontWeightMedium];
+    self.gridPopUp.controlSize = NSControlSizeRegular;
+    self.gridPopUp.font = [NSFont systemFontOfSize:13.0 weight:NSFontWeightMedium];
     self.gridPopUp.translatesAutoresizingMaskIntoConstraints = NO;
     [self.gridPopUp setContentCompressionResistancePriority:NSLayoutPriorityDefaultLow forOrientation:NSLayoutConstraintOrientationHorizontal];
 
@@ -738,20 +738,20 @@ static NSAttributedString* material_icon_menu_title(NSString* iconName, NSString
     self.materialTargetModeControl.trackingMode = NSSegmentSwitchTrackingSelectOne;
     self.materialTargetModeControl.target = self;
     self.materialTargetModeControl.action = @selector(materialTargetModeChanged:);
-    self.materialTargetModeControl.controlSize = NSControlSizeSmall;
+    self.materialTargetModeControl.controlSize = NSControlSizeRegular;
     self.materialTargetModeControl.selectedSegment = 0;
     self.materialTargetModeControl.translatesAutoresizingMaskIntoConstraints = NO;
-    NSLayoutConstraint* materialTargetWidthConstraint = [self.materialTargetModeControl.widthAnchor constraintEqualToConstant:108.0];
+    NSLayoutConstraint* materialTargetWidthConstraint = [self.materialTargetModeControl.widthAnchor constraintEqualToConstant:116.0];
     materialTargetWidthConstraint.priority = NSLayoutPriorityDefaultLow;
     materialTargetWidthConstraint.active = YES;
 
     self.toolbarOverflowControl = [NSButton buttonWithTitle:@"" target:self action:@selector(showToolbarOverflowMenu:)];
     self.toolbarOverflowControl.translatesAutoresizingMaskIntoConstraints = NO;
     self.toolbarOverflowControl.bordered = YES;
-    self.toolbarOverflowControl.controlSize = NSControlSizeSmall;
+    self.toolbarOverflowControl.controlSize = NSControlSizeRegular;
     self.toolbarOverflowControl.hidden = YES;
     self.toolbarOverflowControl.bezelStyle = NSBezelStyleTexturedRounded;
-    self.toolbarOverflowControl.font = [NSFont systemFontOfSize:12.0 weight:NSFontWeightMedium];
+    self.toolbarOverflowControl.font = [NSFont systemFontOfSize:13.0 weight:NSFontWeightMedium];
     self.toolbarOverflowControl.attributedTitle = [self toolbarAttributedTitleWithIconOnly:@"more_horiz"];
     self.toolbarOverflowMenu = [[NSMenu alloc] initWithTitle:@"Toolbar Overflow"];
     self.toolbarOverflowSpacer = [[NSView alloc] initWithFrame:NSZeroRect];
@@ -817,11 +817,9 @@ static NSAttributedString* material_icon_menu_title(NSString* iconName, NSString
         self.browseMaterialButton,
         self.toolbarOverflowControl,
     ];
-    for (NSView* view in toolbarControlViews) {
-        NSLayoutConstraint* heightConstraint = [view.heightAnchor constraintEqualToConstant:32.0];
-        heightConstraint.priority = NSLayoutPriorityDefaultHigh;
-        heightConstraint.active = YES;
-    }
+    // Removed fixed 32.0 height constraints to allow standard controls to use their intrinsic sizes,
+    // which fixes vertical alignment differences between NSButton, NSPopUpButton, and NSSegmentedControl.
+
 
     self.emptyStateView = [[NSVisualEffectView alloc] initWithFrame:self.rootView.bounds];
     self.emptyStateView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
